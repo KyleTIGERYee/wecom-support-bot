@@ -21,7 +21,11 @@ const ALLOWED_COMMANDS = new Set([
   "file",
   "stat",
   "python3",
+  "node",
 ]);
+
+/** 唯一允许用 node 执行的脚本：只读的经验检索工具。 */
+const ALLOWED_NODE_SCRIPT = "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js";
 
 /**
  * 能改变数据流向或串联命令的 shell 元字符。
@@ -67,6 +71,20 @@ export function isCommandAllowed(command, roots, options = {}) {
   const dangerousFlag = tokens.find((token) => DANGEROUS_FLAGS.test(token));
   if (dangerousFlag) {
     return { allowed: false, reason: `参数 ${dangerousFlag} 会让只读命令变成写操作` };
+  }
+
+  if (executable === "node") {
+    const script = tokens.slice(1).find((token) => token.endsWith(".js")) ?? "";
+    if (script !== ALLOWED_NODE_SCRIPT) {
+      return { allowed: false, reason: `脚本 ${script || "(未指定)"} 不在白名单内` };
+    }
+    for (const token of tokens.slice(1)) {
+      if (token === ALLOWED_NODE_SCRIPT) continue;
+      if (token.startsWith("/") && !isInsideRoots(token, roots)) {
+        return { allowed: false, reason: `路径越界：${token}` };
+      }
+    }
+    return { allowed: true };
   }
 
   if (executable === "python3") {

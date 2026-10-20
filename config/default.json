@@ -4,7 +4,7 @@
     "agentDir": "/Users/kyle/.pi-support/agent",
     "provider": "安居集团",
     "model": "DeepSeek-V4-Flash-0731",
-    "timeoutMs": 180000
+    "timeoutMs": 90000
   },
   "roots": {
     "knowledgeBase": "/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
@@ -18,8 +18,11 @@
     "maxRounds": 3
   },
   "surface": {
-    "progressText": "🔍 正在查知识库…",
+    "progressText": "正在查，稍等一下…",
+    "slowProgressText": "这个查得有点慢，我再看看，马上就好。",
+    "slowProgressAfterMs": 25000,
     "fallbackText": "这条涉及生产数据，我没法直接确认。建议直接问虎老师。",
-    "errorText": "刚才处理出错了，请稍后再试一次。"
+    "timeoutText": "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找虎老师更快。",
+    "errorText": "刚才没处理好，你再问一次？"
   }
 }

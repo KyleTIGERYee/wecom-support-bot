@@ -27,7 +27,14 @@ const ALLOWED_COMMANDS = new Set([
 	"file",
 	"stat",
 	"python3",
+	"node",
 ]);
+
+/**
+ * 唯一允许用 node 执行的脚本：只读的经验检索工具。
+ * 这个路径在项目目录下，不在 ROOTS 里，所以单独放行（脚本本身不接受写操作）。
+ */
+const ALLOWED_NODE_SCRIPT = "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js";
 
 /** 改变数据流向或串联命令的元字符；`$` 单独列出以拦住 $HOME 之类的变量展开。 */
 const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
@@ -85,6 +92,22 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 	);
 	if (dangerousFlag) {
 		return { allowed: false, reason: `参数 ${dangerousFlag} 会让只读命令变成写操作` };
+	}
+
+	if (executable === "node") {
+		// 只放行经验检索脚本，且第一个非选项参数必须正好是它
+		const script = tokens.slice(1).find((token) => token.endsWith(".js")) ?? "";
+		if (script !== ALLOWED_NODE_SCRIPT) {
+			return { allowed: false, reason: `脚本 ${script || "(未指定)"} 不在白名单内` };
+		}
+		// 其余参数（wiki 目录与检索词）不得是路径形式以外的可疑内容，交给下面的路径检查
+		for (const token of tokens.slice(1)) {
+			if (token === ALLOWED_NODE_SCRIPT) continue;
+			if (token.startsWith("/") && !isInsideRoots(token)) {
+				return { allowed: false, reason: `路径越界：${token}` };
+			}
+		}
+		return { allowed: true };
 	}
 
 	if (executable === "python3") {

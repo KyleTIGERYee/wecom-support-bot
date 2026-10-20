@@ -78,16 +78,47 @@ python3 <dbwiki目录>/scripts/search_queries.py "关键词"   # 搜 235 个历�
 
 **这两个都搜不到 `metrics/` 目录**，指标口径必须自己去看（见 2.2）。
 
-## 2.2 问数据前必须先读指标口径 ⚠️ 最重要
+## 2.2 查数三步走 ⚠️ 顺序不能颠倒
+
+### 第一步：先读历史经验（最容易跳过，跳过必错）
+
+每个 db-wiki 都有一个 `.<名字>-db-wiki-evolution/` 目录，里面是之前踩过的坑。**查任何数据之前先跑这个**：
+
+```
+node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js <db-wiki目录> "问题的关键词"
+```
+
+比如：
+
+```
+node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki "机构数量"
+```
+
+它会返回「判断标准」和「与问题相关的历史经验」。**这些是用真实事故换来的教训，看到就必须照做。**
+
+已知的例子：问"有多少家机构"，经验里明确写着 `system_tenant` 才是业务机构，`ajly_flow_organization` 是门店品牌配置的空表，**查机构数绝不能查它**。不读这条，就会答成"3 家"。
+
+### 第二步：再确定指标口径
 
 每个 db-wiki 都有 `metrics/` 目录：
 
 - `数据库/ajly-db-wiki/metrics/` —— 48 个指标
 - `数据库/lzz-db-wiki/metrics/` —— 61 个指标
 
-**同事问任何带指标名词的问题（出租率、退租率、续约率、人房比、空置率、GMV、线索转化率…），第一步必须读对应的 `metrics/<指标>.md`。**
+**问题里出现指标名词（出租率、退租率、续约率、人房比、空置率、GMV、线索转化率…），必须读对应的 `metrics/<指标>.md`。**
 
-先 `read` 一下 `metrics/_overview.md` 拿到全表，按名字找文件。
+**"有多少 X"这种问法也算。** 先 `ls` 一下 `metrics/` 目录，看有没有对应的指标卡。常见的对应：
+
+| 同事这么问 | 该读 |
+|---|---|
+| 多少家机构、入驻机构、机构数量、机构总数 | `metrics/机构总数及类型分布.md` |
+| 多少租客、承租人、服务了多少人 | `metrics/承租人规模.md` |
+| 出租率、入住率 | `metrics/出租率.md` |
+| 退租率、退房率 | `metrics/退租率.md` |
+| 续约率、续租率 | `metrics/续约率.md` |
+| 线索多少条、线索转化 | `metrics/线索转化率.md`、`metrics/新增线索量.md` |
+
+找不到对应的指标卡，再走搜表的老路。
 
 口径文件里有这些，缺一条 SQL 就是错的：
 
@@ -96,17 +127,30 @@ python3 <dbwiki目录>/scripts/search_queries.py "关键词"   # 搜 235 个历�
 - 过滤条件该取什么值（`company_id`、`housing_type`、`approval_state`）
 - 涉及哪几张表、怎么 JOIN
 
-**不读口径就写 SQL，答案一定是错的。** 同一个"出租率"读没读口径能差 7 个百分点——剔不剔寓见安居、算不算代出，都有明确业务约定。
+**不读口径就写 SQL，答案一定是错的。** 同一个"出租率"读没读口径能差 7 个百分点。
+
+### 第三步：搜到语焉不详的表文档时，停下来核口径
+
+如果 `search_db.py` 搜到的表文档只写"XX 表"没有业务说明，**不要直接照着建 SQL**。
+
+特别是命中这些情况：
+
+- 表名和问题里的词几乎一样（问"机构"，搜到 `ajly_flow_organization`）
+- 表文档的预估行数小得不合理（比如机构表只有 3 行）
+- 同义词库把多个表指向同一个概念
+
+**这时必须回 `metrics/` 里确认哪个才是业务口径说的那张表**，或者两种都查出来比对量级。
 
 ## 2.3 查数据的完整顺序
 
-1. **读 `metrics/<指标>.md`** —— 拿口径（必须）
-2. **读 `references/index/bridge_index.json`** —— 用 `trigger_words` 匹配，它给出该指标对应的 metric 文件、概念页、和**相关现成 SQL**
-3. **跑 `search_queries.py`** —— 235 个历史 SQL，优先看头部标 `✅ 已验证` 的
-4. **读表文档** —— `search_db.py` 找到表后，**必须实际打开 `tables/<库>/<表>.md`**，看字段清单（类型/注释/业务含义）、关联关系、状态枚举
-5. **组装 SQL**
-6. **跑 `bi_query.py` 验证**
-7. **交付** —— 用业务语言说清"这个数算不算某些店"，不写 SQL、不写表名
+1. **跑 `read-evolution.js` 读历史经验**（必须，见 2.2 第一步）
+2. **读 `metrics/<指标>.md`** —— 拿口径（必须，见 2.2 第二步）
+3. **读 `references/index/bridge_index.json`** —— 用 `trigger_words` 匹配，它给出该指标对应的 metric 文件、概念页、和**相关现成 SQL**
+4. **跑 `search_queries.py`** —— 235 个历史 SQL，优先看头部标 `✅ 已验证` 的
+5. **读表文档** —— `search_db.py` 找到表后，**必须实际打开 `tables/<库>/<表>.md`**，看字段清单（类型/注释/业务含义）、关联关系、状态枚举
+6. **组装 SQL**
+7. **跑 `bi_query.py` 验证**
+8. **交付** —— 用业务语言说清"这个数算不算某些店"，不写 SQL、不写表名
 
 ### SQL 参考的校验标记
 

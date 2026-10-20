@@ -151,3 +151,29 @@ test("拒绝把路径当 grep 搜索模式", () => {
 
   assert.equal(result.allowed, false);
 });
+
+test("允许运行经验检索脚本", () => {
+  const result = isCommandAllowed(
+    `node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js ${AJLY_WIKI_ROOT} "机构数量"`,
+    ROOTS,
+  );
+
+  assert.equal(result.allowed, true);
+});
+
+test("拒绝运行其他 node 脚本", () => {
+  const result = isCommandAllowed("node /tmp/evil.js", ROOTS);
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason ?? "", /不在白名单/);
+});
+
+test("拒绝用经验脚本读取白名单外的目录", () => {
+  const result = isCommandAllowed(
+    "node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js /Users/kyle/.pi/agent 机构",
+    ROOTS,
+  );
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason ?? "", /路径越界/);
+});

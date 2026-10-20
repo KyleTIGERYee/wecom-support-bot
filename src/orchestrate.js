@@ -7,7 +7,8 @@
 
 const DEFAULT_MAX_ROUNDS = 3;
 const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
-const DEFAULT_ERROR_TEXT = "刚才处理出错了，请稍后再试一次。";
+const DEFAULT_ERROR_TEXT = "刚才没处理好，你再问一次？";
+const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找虎老师更快。";
 
 /**
  * @param {{
@@ -19,14 +20,15 @@ const DEFAULT_ERROR_TEXT = "刚才处理出错了，请稍后再试一次。";
  *     review: (options: {question: string, answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>
  *   },
  *   maxRounds?: number,
- *   messages?: {fallbackText?: string, errorText?: string}
+ *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
  * }} options
- * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, lastDenyReason?: string}>}
+ * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, lastDenyReason?: string}>}
  */
 export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
   const fallbackText = messages.fallbackText ?? DEFAULT_FALLBACK_TEXT;
   const errorText = messages.errorText ?? DEFAULT_ERROR_TEXT;
+  const timeoutText = messages.timeoutText ?? DEFAULT_TIMEOUT_TEXT;
 
   let prompt = question;
   let lastDenyReason = "";
@@ -39,7 +41,11 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
 
     const turn = await runAgent({ prompt, sessionId: sessionKey, isRework });
 
-    if (turn.failed || turn.timedOut) {
+    // 超时和失败给不同的话术：超时说明查得太久，失败说明出了岔子
+    if (turn.timedOut) {
+      return { finalText: timeoutText, rounds, guarded: needGuard, exhausted: false, timedOut: true };
+    }
+    if (turn.failed) {
       return { finalText: errorText, rounds, guarded: needGuard, exhausted: false };
     }
 

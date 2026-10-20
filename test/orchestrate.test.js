@@ -121,19 +121,7 @@ test("agent 失败时返回错误话术", async () => {
 
   const result = await handleTurn({ question: "问", sessionKey: "wx-abc", deps });
 
-  assert.match(result.finalText, /出错/);
-});
-
-test("agent 超时时返回错误话术", async () => {
-  const deps = {
-    state: fakeState(false),
-    runAgent: async () => ({ text: "", biTouched: false, timedOut: true, failed: false }),
-    review: async () => ({ verdict: "ALLOW" }),
-  };
-
-  const result = await handleTurn({ question: "问", sessionKey: "wx-abc", deps });
-
-  assert.match(result.finalText, /出错/);
+  assert.match(result.finalText, /没处理好/);
 });
 
 test("deny 时不把原始答复泄漏给调用方", async () => {
@@ -146,4 +134,17 @@ test("deny 时不把原始答复泄漏给调用方", async () => {
   const result = await handleTurn({ question: "问", sessionKey: "wx-abc", deps, maxRounds: 1 });
 
   assert.equal(result.finalText.includes("13800138000"), false);
+});
+
+test("超时给超时话术而不是通用错误话术", async () => {
+  const deps = {
+    state: fakeState(false),
+    runAgent: async () => ({ text: "", biTouched: false, timedOut: true, failed: false }),
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "问", sessionKey: "wx-abc", deps });
+
+  assert.equal(result.timedOut, true);
+  assert.match(result.finalText, /查得有点久/);
 });

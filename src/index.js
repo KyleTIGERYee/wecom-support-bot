@@ -84,6 +84,11 @@ async function main() {
       await log.warn("占位消息发送失败", { message: String(error) });
     }
 
+    // 查得久时补一句进度，避免同事以为掉线了
+    const slowTimer = setTimeout(() => {
+      client.replyStream(frame, streamId, config.surface.slowProgressText, false).catch(() => {});
+    }, config.surface.slowProgressAfterMs);
+
     try {
       const result = await handleTurn({
         question,
@@ -95,9 +100,14 @@ async function main() {
           review: ({ question: asked, answer }) => reviewReply({ question: asked, answer, callModel }),
         },
         maxRounds: config.guard.maxRounds,
-        messages: { fallbackText: config.surface.fallbackText, errorText: config.surface.errorText },
+        messages: {
+          fallbackText: config.surface.fallbackText,
+          errorText: config.surface.errorText,
+          timeoutText: config.surface.timeoutText,
+        },
       });
 
+      clearTimeout(slowTimer);
       const finalText = result.finalText || config.surface.errorText;
       await client.replyStream(frame, streamId, finalText, true);
 
@@ -106,9 +116,11 @@ async function main() {
         rounds: result.rounds,
         guarded: result.guarded,
         exhausted: result.exhausted,
+        timedOut: Boolean(result.timedOut),
         outLength: finalText.length,
       });
     } catch (error) {
+      clearTimeout(slowTimer);
       await log.error("处理提问失败", { sessionKey, message: String(/** @type {any} */ (error)?.stack ?? error) });
       try {
         await client.replyStream(frame, streamId, config.surface.errorText, true);
