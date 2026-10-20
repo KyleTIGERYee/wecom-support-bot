@@ -79,3 +79,52 @@ test("flush 写出的文件是可解析的 JSON", async () => {
   const parsed = JSON.parse(raw);
   assert.deepEqual(Object.keys(parsed.touched), ["wx-abc"]);
 });
+
+test("新会话生成新的会话 ID", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath });
+
+  const first = state.resolveSessionId("wx-abc");
+  const second = state.startNewSession("wx-abc");
+
+  assert.notEqual(first, second);
+});
+
+test("新会话后粘性标记被清除", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath });
+  state.markBiTouched("wx-abc-g1");
+
+  state.startNewSession("wx-abc");
+
+  assert.equal(state.isBiTouched("wx-abc-g1"), false);
+});
+
+test("新会话的代号跨重启保留", async () => {
+  const storePath = await tempStore();
+  const first = createSessionState({ storePath });
+  const id = first.startNewSession("wx-abc");
+  await first.flush();
+
+  const second = createSessionState({ storePath });
+  await second.load();
+
+  assert.equal(second.resolveSessionId("wx-abc"), id);
+});
+
+test("从未开过新会话时用默认代号", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath });
+
+  assert.equal(state.resolveSessionId("wx-abc"), "wx-abc-g1");
+});
+
+test("多次开新会话代号递增", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath });
+
+  state.startNewSession("wx-abc");
+  const third = state.startNewSession("wx-abc");
+
+  assert.equal(third, "wx-abc-g3");
+});

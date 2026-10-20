@@ -8,7 +8,7 @@
  * 把企微消息帧归一化成网关需要的形状；无法提取文本时返回 null。
  *
  * @param {any} frame
- * @returns {{text: string, userId: string} | null}
+ * @returns {{text: string, userId: string, chatType: string, chatId: string} | null}
  */
 export function normalizeMessage(frame) {
   const body = frame?.body;
@@ -18,7 +18,38 @@ export function normalizeMessage(frame) {
   const userId = body.from?.userid;
   if (!text || !userId) return null;
 
-  return { text, userId };
+  return {
+    text,
+    userId,
+    chatType: body.chattype === "group" ? "group" : "single",
+    chatId: body.chatid ?? "",
+  };
+}
+
+/**
+ * 判断这条消息是不是想开新会话。
+ *
+ * 同事不用记命令，日常说法都认；也可以直接用 /new。
+ * 只认完整的短句，避免把正常提问里的"重来""重新开始"误判成指令。
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isNewSessionRequest(text) {
+  const normalized = text.trim().toLowerCase().replace(/[\s。！!，,？?]/g, "");
+  if (!normalized) return false;
+  return new Set([
+    "/new",
+    "新会话",
+    "开个新会话",
+    "开新会话",
+    "重新开始",
+    "重开一个",
+    "清空对话",
+    "清除上下文",
+    "忘掉之前的",
+    "换个话题",
+  ]).has(normalized);
 }
 
 /**

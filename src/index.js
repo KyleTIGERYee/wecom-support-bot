@@ -10,7 +10,7 @@ import { createGuardClient } from "./model-client.js";
 import { runAgentTurn } from "./agent.js";
 import { reviewReply } from "./guard.js";
 import { handleTurn } from "./orchestrate.js";
-import { normalizeMessage, toSessionKey, stripMention } from "./wecom.js";
+import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -43,7 +43,10 @@ async function main() {
   client.on("event.enter_chat", (frame) => {
     client.replyWelcome(frame, {
       msgtype: "text",
-      text: { content: "你好，我是技术支持助手。可以问我业务规则、表结构、数据口径，或者让我查具体的数据和代码。" },
+      text: {
+        content:
+          "你好，我是技术支持助手。业务上的问题、想查个数、或者想确认某个流程怎么走，都可以问我。想重新开始聊的时候说一句「新会话」就行。",
+      },
     });
   });
 
@@ -54,8 +57,24 @@ async function main() {
     const question = stripMention(message.text);
     if (!question) return;
 
-    const sessionKey = toSessionKey(message.userId);
-    await log.info("收到提问", { user: message.userId, sessionKey, length: question.length });
+    const userKey = toSessionKey(message.userId);
+
+    // 开新会话：抬一代代号，上一轮的上下文和粘性标记一并作废
+    if (isNewSessionRequest(question)) {
+      const sessionId = state.startNewSession(userKey);
+      await state.flush();
+      await log.info("开新会话", { user: message.userId, sessionId });
+      await client.reply(frame, { msgtype: "text", text: { content: "好，之前的聊的我先忘了，咱们重新开始。" } });
+      return;
+    }
+
+    const sessionKey = state.resolveSessionId(userKey);
+    await log.info("收到提问", {
+      user: message.userId,
+      sessionKey,
+      chatType: message.chatType,
+      length: question.length,
+    });
 
     // 先占位，满足企微 5 秒内必须有响应的要求
     const streamId = AiBot.generateReqId("stream");
