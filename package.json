@@ -7,13 +7,14 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/",
+    "test": "node --test \"test/**/*.test.js\"",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7"
   },
   "devDependencies": {
+    "@types/node": "^26.6.5",
     "typescript": "^5.9.2"
   },
   "engines": {
