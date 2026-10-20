@@ -59,3 +59,18 @@ test("会话 key 只含合法字符", () => {
 test("去掉 @机器人 占位符", () => {
   assert.equal(stripMention("@技术支持机器人 退租怎么算"), "退租怎么算");
 });
+
+test("群聊里 @机器人 后说新会话能识别", () => {
+  for (const raw of ["@技术支持助手 新会话", "@技术支持助手  新会话", "@RobotA /new", "@技术支持助手 @同事 新会话"]) {
+    assert.equal(isNewSessionRequest(stripMention(raw)), true, `应识别：${raw}`);
+  }
+});
+
+test("去掉开头的 @提及但不破坏正文邮箱", () => {
+  assert.equal(stripMention("这个租客邮箱是 zhangsan@szajyy.com 对吗"), "这个租客邮箱是 zhangsan@szajyy.com 对吗");
+  assert.equal(stripMention("@技术支持助手 邮箱 zhangsan@szajyy.com 是什么情况"), "邮箱 zhangsan@szajyy.com 是什么情况");
+});
+
+test("正文中间的 @ 不被当作提及", () => {
+  assert.equal(stripMention("我在 @ 他的时候说过了"), "我在 @ 他的时候说过了");
+});

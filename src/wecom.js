@@ -85,11 +85,15 @@ export function toSessionKey(userId) {
 }
 
 /**
- * 去掉企微 @机器人 时附带的占位符。
+ * 去掉消息开头 @机器人 的提及部分。
+ *
+ * 群聊里企微把提及拼成纯文本放在正文前面（如「@技术支持助手 退租怎么算」），
+ * 需要剥掉才能识别指令。只处理**开头连续出现的** @提及，
+ * 不能全局替换：正文里的邮箱（zhangsan@szajyy.com）会被截断。
  *
  * @param {string} text
  * @returns {string}
  */
 export function stripMention(text) {
-  return text.replace(/@\S+\s*/g, "").trim();
+  return text.replace(/^(?:@[^\s@]+\s+)+/, "").trim();
 }
