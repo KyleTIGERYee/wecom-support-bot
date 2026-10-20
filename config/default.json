@@ -1,0 +1,28 @@
+{
+  "pi": {
+    "binary": "/Users/kyle/.pi-support/bin/pi",
+    "agentDir": "/Users/kyle/.pi-support/agent",
+    "provider": "安居集团",
+    "model": "DeepSeek-V4-Flash-0731",
+    "timeoutMs": 180000
+  },
+  "roots": {
+    "ajlyWiki": "/Users/kyle/Desktop/PM/.agents/skills/ajly-wiki",
+    "lzzWiki": "/Users/kyle/Desktop/归档资料/王董的目录/lzz-wiki",
+    "ajlyDbWiki": "/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki",
+    "lzzDbWiki": "/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki",
+    "ajlyCode": "/Users/kyle/Desktop/VIBECODING/ajly",
+    "lzzCode": "/Users/kyle/Desktop/VIBECODING/lezuzu"
+  },
+  "guard": {
+    "baseUrl": "http://172.25.120.168:3000/v1",
+    "model": "DeepSeek-V4-Flash-0731",
+    "timeoutMs": 30000,
+    "maxRounds": 3
+  },
+  "surface": {
+    "progressText": "🔍 正在查知识库…",
+    "fallbackText": "这条涉及生产数据，我没法直接确认。建议直接问虎老师。",
+    "errorText": "刚才处理出错了，请稍后再试一次。"
+  }
+}

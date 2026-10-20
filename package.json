@@ -1,0 +1,22 @@
+{
+  "name": "wecom-support-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "企业微信技术支持机器人：基于隔离的 pi 实例查询四个 wiki、BI 生产数据与代码",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "1.0.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
