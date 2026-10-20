@@ -1,15 +1,14 @@
 /**
- * 企微智能机器人封装。
+ * 企微消息帧的归一化与输出整形。
  *
- * 只做三件事：连上长连接、把消息归一化成网关需要的形状、把最终答复写回。
- * 业务判断一律不放这里。
+ * 连接与收发的编排在 index.js；这里只做纯数据变换，便于单测。
  */
 
 /**
- * 把企微消息帧归一化。
+ * 把企微消息帧归一化成网关需要的形状；无法提取文本时返回 null。
  *
  * @param {any} frame
- * @returns {{text: string, userId: string, chatId: string, chatType: string, msgId: string} | null}
+ * @returns {{text: string, userId: string} | null}
  */
 export function normalizeMessage(frame) {
   const body = frame?.body;
@@ -19,13 +18,7 @@ export function normalizeMessage(frame) {
   const userId = body.from?.userid;
   if (!text || !userId) return null;
 
-  return {
-    text,
-    userId,
-    chatId: body.chatid ?? userId,
-    chatType: body.chattype ?? "single",
-    msgId: body.msgid ?? "",
-  };
+  return { text, userId };
 }
 
 /**
@@ -49,14 +42,15 @@ function extractText(body) {
  * 生成稳定的 pi 会话 ID。
  *
  * pi 的 --session-id 只接受 [A-Za-z0-9._-]，而企微 userid 可能含其他字符，
- * 因此做一次哈希；前缀用于人眼区分。
+ * 所以做一次 base64url 编码保证可逆（不会让两个不同 userid 撞到同一会话），
+ * 并截断到 pi 允许的长度。前缀用于人眼区分来源。
  *
  * @param {string} userId
  * @returns {string}
  */
 export function toSessionKey(userId) {
-  const sanitized = userId.replace(/[^A-Za-z0-9._-]/g, "_");
-  return `wx-${sanitized}`.slice(0, 64);
+  const encoded = Buffer.from(userId, "utf8").toString("base64url").replace(/[^A-Za-z0-9_-]/g, "");
+  return `wx-${encoded}`.slice(0, 64);
 }
 
 /**

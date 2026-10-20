@@ -6,9 +6,8 @@
  */
 
 const DEFAULT_MAX_ROUNDS = 3;
-
-const FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
-const ERROR_TEXT = "刚才处理出错了，请稍后再试一次。";
+const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
+const DEFAULT_ERROR_TEXT = "刚才处理出错了，请稍后再试一次。";
 
 /**
  * @param {{
@@ -19,12 +18,15 @@ const ERROR_TEXT = "刚才处理出错了，请稍后再试一次。";
  *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, failed: boolean}>,
  *     review: (options: {question: string, answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>
  *   },
- *   maxRounds?: number
+ *   maxRounds?: number,
+ *   messages?: {fallbackText?: string, errorText?: string}
  * }} options
  * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, lastDenyReason?: string}>}
  */
-export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS }) {
+export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
+  const fallbackText = messages.fallbackText ?? DEFAULT_FALLBACK_TEXT;
+  const errorText = messages.errorText ?? DEFAULT_ERROR_TEXT;
 
   let prompt = question;
   let lastDenyReason = "";
@@ -38,7 +40,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     const turn = await runAgent({ prompt, sessionId: sessionKey, isRework });
 
     if (turn.failed || turn.timedOut) {
-      return { finalText: ERROR_TEXT, rounds, guarded: needGuard, exhausted: false };
+      return { finalText: errorText, rounds, guarded: needGuard, exhausted: false };
     }
 
     if (turn.biTouched && !needGuard) {
@@ -61,7 +63,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
   }
 
   return {
-    finalText: FALLBACK_TEXT,
+    finalText: fallbackText,
     rounds,
     guarded: true,
     exhausted: true,

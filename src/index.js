@@ -76,6 +76,7 @@ async function main() {
           review: ({ question: asked, answer }) => reviewReply({ question: asked, answer, callModel }),
         },
         maxRounds: config.guard.maxRounds,
+        messages: { fallbackText: config.surface.fallbackText, errorText: config.surface.errorText },
       });
 
       const finalText = result.finalText || config.surface.errorText;

@@ -94,3 +94,34 @@ test("拒绝相对路径跳转到根外", () => {
 
   assert.equal(result.allowed, false);
 });
+
+test("拒绝变量展开逃逸（$HOME）", () => {
+  const result = isCommandAllowed("cat $HOME/.pi/agent/models.json", ROOTS);
+
+  assert.equal(result.allowed, false);
+});
+
+test("拒绝波浪号展开（~kyle）", () => {
+  const result = isCommandAllowed("cat ~kyle/.pi/agent/models.json", ROOTS);
+
+  assert.equal(result.allowed, false);
+});
+
+test("允许绝对路径下带 .. 但最终仍在根内", () => {
+  const result = isCommandAllowed(`cat ${AJLY_WIKI_ROOT}/wiki/../SKILL.md`, ROOTS);
+
+  assert.equal(result.allowed, true);
+});
+
+test("拒绝 find -delete（只读命令变写操作）", () => {
+  const result = isCommandAllowed(`find ${AJLY_WIKI_ROOT} -delete`, ROOTS);
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason ?? "", /写操作/);
+});
+
+test("拒绝 rg --pre（任意执行）", () => {
+  const result = isCommandAllowed(`rg --pre "sh -c id" x ${AJLY_WIKI_ROOT}`, ROOTS);
+
+  assert.equal(result.allowed, false);
+});

@@ -1,11 +1,14 @@
 /**
- * bash 白名单扩展。
+ * 文件系统访问白名单扩展。
  *
- * pi 的 `--tools "read,bash"` 只限制工具种类，bash 本身能读写文件、外传数据。
- * 这个扩展在 tool_call 阶段拦下所有不在白名单内的命令，是 agent 的实际权限边界。
+ * pi 的 `--tools "read,bash"` 只限制工具种类，两个工具本身都没有路径沙箱：
+ *   - `read` 能读任意文件，包括 ~/.pi/agent/models.json 里的 API Key
+ *   - `bash` 能读写文件、外传数据
+ * 这个扩展在 tool_call 阶段同时拦下这两条路径，是 agent 的实际权限边界。
  *
- * 判定逻辑与 src/command-whitelist.js 一致，但扩展独立运行在 pi 进程里，
- * 不能 import 项目源码（pi 的扩展加载器不解析项目模块路径），因此这里内联实现。
+ * 判定逻辑与 src/command-whitelist.js 语义一致，但扩展独立运行在 pi 进程里
+ * （pi 的扩展加载器不解析项目模块路径），因此这里内联实现。
+ * 根目录清单在 ROOTS 维护，与 config/default.json 的 roots 保持一致。
  */
 
 /** 允许被 python3 执行的检索脚本。 */
@@ -26,8 +29,8 @@ const ALLOWED_COMMANDS = new Set([
 	"python3",
 ]);
 
-/** 改变数据流向或串联命令的元字符。 */
-const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$(", "${", "\n"];
+/** 改变数据流向或串联命令的元字符；`$` 单独列出以拦住 $HOME 之类的变量展开。 */
+const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
 
 /** 允许访问的文件系统根。与 config/default.json 的 roots 保持一致。 */
 const ROOTS = [
@@ -39,27 +42,30 @@ const ROOTS = [
 	"/Users/kyle/Desktop/VIBECODING/lezuzu",
 ];
 
-function stripQuotes(token: string): string {
-	if (token.length >= 2) {
-		const first = token[0];
-		const last = token[token.length - 1];
-		if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-			return token.slice(1, -1);
+/** 解析成规范化的绝对路径；无法判定时返回 null。 */
+function toAbsolute(token: string): string | null {
+	if (!token.startsWith("/")) return null;
+	const segments: string[] = [];
+	for (const segment of token.split("/")) {
+		if (segment === "" || segment === ".") continue;
+		if (segment === "..") {
+			if (segments.length === 0) return null;
+			segments.pop();
+			continue;
 		}
+		segments.push(segment);
 	}
-	return token;
+	return `/${segments.join("/")}`;
 }
 
+/** 路径是否落在白名单根内。 */
 function isInsideRoots(token: string): boolean {
-	const HOME = "/Users/kyle";
-	let absolute: string;
-	if (token.startsWith("~/")) absolute = `${HOME}/${token.slice(2)}`;
-	else if (token.startsWith("/")) absolute = token;
-	else return false;
+	const absolute = toAbsolute(token);
+	if (!absolute) return false;
+	return ROOTS.some((root) => absolute === root || absolute.startsWith(`${root}/`));
+}
 
-	const normalized = absolute.replace(/\/+/g, "/");
-	return ROOTS.some((root) => normalized === root || normalized.startsWith(`${root}/`));
-}/** 判断命令是否允许。理由会写进 block 的 reason，显示给模型。 */
+/** 判断 bash 命令是否允许。 */
 export function checkCommand(command: string): { allowed: boolean; reason?: string } {
 	const trimmed = (command ?? "").trim();
 	if (!trimmed) return { allowed: false, reason: "空命令" };
@@ -75,13 +81,21 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 		return { allowed: false, reason: `命令 ${executable} 不在白名单内` };
 	}
 
+	// `find -delete` / `rg --pre` 等参数能把只读命令变成写操作或任意执行
+	const dangerousFlag = tokens.find((token) =>
+		/^(-delete|-exec|-execdir|-fprint|-fprintf|-fls|-ok|--pre|--pre-glob)$/.test(token),
+	);
+	if (dangerousFlag) {
+		return { allowed: false, reason: `参数 ${dangerousFlag} 会让只读命令变成写操作` };
+	}
+
 	if (executable === "python3") {
 		const script = tokens.find((t, i) => i > 0 && t.endsWith(".py")) ?? "";
 		const scriptName = script.split("/").pop() ?? "";
 		if (!ALLOWED_SCRIPTS.has(scriptName)) {
 			return { allowed: false, reason: `脚本 ${scriptName} 不在白名单内` };
 		}
-		if (!script.startsWith("/") || !isInsideRoots(script)) {
+		if (!isInsideRoots(script)) {
 			return { allowed: false, reason: `路径越界：${script}` };
 		}
 		return { allowed: true };
@@ -90,14 +104,17 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 	for (const token of tokens.slice(1)) {
 		if (token.startsWith("-")) continue;
 		const looksLikePath =
-			token.startsWith("/") || token.startsWith("~/") || token.startsWith("./") || token.startsWith("../");
-		// 非路径 token（如 grep 的搜索词）放行；裸的相对路径 "." 一律按越界处理，
-		// 否则 agent 可以用 `find .` 扫描整个项目目录读到凭证。
+			token.startsWith("/") || token.startsWith("~") || token.startsWith("./") || token.startsWith("../");
 		if (!looksLikePath) {
 			if (token === "." || token === "..") {
 				return { allowed: false, reason: `路径越界：${token}` };
 			}
 			continue;
+		}
+		// 相对路径与 ~ 展开一律拒绝：判定它最终落在哪里需要解析 cwd 与 HOME，
+		// 这个成本换来的收益不值得，直接要求 agent 使用绝对路径。
+		if (!token.startsWith("/")) {
+			return { allowed: false, reason: `只接受绝对路径：${token}` };
 		}
 		if (!isInsideRoots(token)) {
 			return { allowed: false, reason: `路径越界：${token}` };
@@ -107,15 +124,45 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 	return { allowed: true };
 }
 
-export default function bashWhitelist(pi: any) {
+/** 判断 read 工具的目标路径是否允许。 */
+export function checkReadPath(path: string): { allowed: boolean; reason?: string } {
+	if (!path) return { allowed: false, reason: "未指定路径" };
+	if (!path.startsWith("/")) {
+		return { allowed: false, reason: `只接受绝对路径：${path}` };
+	}
+	if (!isInsideRoots(path)) {
+		return { allowed: false, reason: `路径越界：${path}，只能读取知识库与代码仓库` };
+	}
+	return { allowed: true };
+}
+
+function stripQuotes(token: string): string {
+	if (token.length >= 2) {
+		const first = token[0];
+		const last = token[token.length - 1];
+		if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+			return token.slice(1, -1);
+		}
+	}
+	return token;
+}
+
+export default function filesystemWhitelist(pi: any) {
 	pi.on("tool_call", async (event: any) => {
-		if (event.toolName !== "bash") return;
-		const command = event.input?.command;
-		if (typeof command !== "string") return;
+		if (event.toolName === "read") {
+			const verdict = checkReadPath(event.input?.path ?? "");
+			if (verdict.allowed) return;
+			return { block: true, reason: `${verdict.reason}。请只读取知识库与代码仓库里的文件。` };
+		}
 
-		const verdict = checkCommand(command);
-		if (verdict.allowed) return;
+		if (event.toolName === "bash") {
+			const command = event.input?.command;
+			if (typeof command !== "string") return;
+			const verdict = checkCommand(command);
+			if (verdict.allowed) return;
+			return { block: true, reason: `${verdict.reason}。请改用知识库检索脚本或读取文档。` };
+		}
 
-		return { block: true, reason: `${verdict.reason}。请改用知识库检索脚本或读取文档。` };
+		return;
 	});
 }

@@ -24,7 +24,7 @@ function fakeRunner(lines, { exitCode = 0, ending = true } = {}) {
 
     queueMicrotask(() => {
       for (const line of lines) child.stdout.emit("data", `${line}\n`);
-      if (ending) child.emit("exit", exitCode);
+      if (ending) child.emit("close", exitCode);
     });
 
     return child;
@@ -135,7 +135,7 @@ test("超时时杀掉进程并标记 timedOut", async () => {
     child.killed = false;
     child.kill = () => {
       child.killed = true;
-      queueMicrotask(() => child.emit("exit", null));
+      queueMicrotask(() => child.emit("close", null));
       return true;
     };
     return child;
@@ -163,7 +163,7 @@ test("把 prompt 与 sessionId 传给 runner", async () => {
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.kill = () => true;
-    queueMicrotask(() => child.emit("exit", 0));
+    queueMicrotask(() => child.emit("close", 0));
     return child;
   };
 

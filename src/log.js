@@ -2,7 +2,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
 /**
- * 简易日志：同时写 stdout（launchd 收集）与按天滚动的文件。
+ * 简易日志：同时写 stdout（launchd 收集）与固定日志文件。
  *
  * @param {{logPath: string}} options
  */

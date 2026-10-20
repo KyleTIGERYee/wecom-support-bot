@@ -105,7 +105,8 @@ export async function runAgentTurn({ prompt, sessionId, runner, timeoutMs = 1800
     }
 
     child.on("error", () => finish({ failed: true }));
-    child.on("exit", (/** @type {number|null} */ code) => {
+    // 用 close 而非 exit：close 保证 stdout 已完全读空，避免丢掉末尾的答复
+    child.on("close", (/** @type {number|null} */ code) => {
       if (timedOut) return;
       finish({ failed: code !== 0 });
     });

@@ -26,42 +26,12 @@ const ALLOWED_COMMANDS = new Set([
 /**
  * 能改变数据流向或串联命令的 shell 元字符。
  * 出现任意一个即拒绝：重定向可写文件，管道与反引号可外传，分号与 & 可串联。
+ * `$` 单独列出，用于拦住 `$HOME` 这类变量展开绕过路径检查。
  */
-const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$(", "${", "\n"];
+const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
 
-/**
- * @param {string} token
- * @returns {boolean}
- */
-function looksLikePath(token) {
-  return token.startsWith("/") || token.startsWith("./") || token.startsWith("../") || token.startsWith("~/");
-}
-
-/**
- * 把路径 token 解析为绝对路径，判断是否落在白名单根内。
- * 相对路径按 cwd 与各根目录依次尝试解析（agent 通常用绝对路径，这里做兜底）。
- *
- * @param {string} token
- * @param {string[]} roots
- * @param {string} cwd
- * @returns {boolean}
- */
-function isInsideRoots(token, roots, cwd) {
-  /** @type {string[]} */
-  const candidates = [];
-  if (token.startsWith("~/")) {
-    candidates.push(resolve(process.env.HOME ?? "/Users/kyle", token.slice(2)));
-  } else if (token.startsWith("/")) {
-    candidates.push(resolve(token));
-  } else {
-    candidates.push(resolve(cwd, token));
-    for (const root of roots) candidates.push(resolve(root, token));
-  }
-
-  return candidates.some((candidate) =>
-    roots.some((root) => candidate === root || candidate.startsWith(root.endsWith(sep) ? root : root + sep)),
-  );
-}
+/** 能把只读命令变成写操作或任意执行的参数。 */
+const DANGEROUS_FLAGS = /^(-delete|-exec|-execdir|-fprint|-fprintf|-fls|-ok|--pre|--pre-glob)$/;
 
 /**
  * 判断一条 bash 命令是否允许执行。
@@ -94,6 +64,11 @@ export function isCommandAllowed(command, roots, options = {}) {
     return { allowed: false, reason: `命令 ${executable} 不在白名单内` };
   }
 
+  const dangerousFlag = tokens.find((token) => DANGEROUS_FLAGS.test(token));
+  if (dangerousFlag) {
+    return { allowed: false, reason: `参数 ${dangerousFlag} 会让只读命令变成写操作` };
+  }
+
   if (executable === "python3") {
     const scriptIndex = tokens.findIndex((token, index) => index > 0 && token.endsWith(".py"));
     if (scriptIndex === -1) {
@@ -107,7 +82,7 @@ export function isCommandAllowed(command, roots, options = {}) {
     if (!script.startsWith("/")) {
       return { allowed: false, reason: "脚本必须使用绝对路径" };
     }
-    if (!isInsideRoots(script, roots, cwd)) {
+    if (!isInsideRoots(script, roots)) {
       return { allowed: false, reason: `路径越界：${script}` };
     }
     return { allowed: true };
@@ -115,13 +90,42 @@ export function isCommandAllowed(command, roots, options = {}) {
 
   for (const token of tokens.slice(1)) {
     if (token.startsWith("-")) continue;
-    if (!looksLikePath(token)) continue;
-    if (!isInsideRoots(token, roots, cwd)) {
+    const looksLikePath =
+      token.startsWith("/") || token.startsWith("~") || token.startsWith("./") || token.startsWith("../");
+    if (!looksLikePath) {
+      // 裸的相对路径会让 agent 扫描整个工作目录
+      if (token === "." || token === "..") {
+        return { allowed: false, reason: `路径越界：${token}` };
+      }
+      continue;
+    }
+    // 相对路径与 ~ 展开一律拒绝：判定它最终落在哪里要解析 cwd 与 HOME，
+    // 直接要求绝对路径更安全也更好排查。
+    if (!token.startsWith("/")) {
+      return { allowed: false, reason: `只接受绝对路径：${token}` };
+    }
+    if (!isInsideRoots(token, roots)) {
       return { allowed: false, reason: `路径越界：${token}` };
     }
   }
 
   return { allowed: true };
+}
+
+/**
+ * 判断路径是否落在白名单根内。
+ *
+ * @param {string} token 绝对路径
+ * @param {string[]} roots
+ * @returns {boolean}
+ */
+export function isInsideRoots(token, roots) {
+  if (!token.startsWith("/")) return false;
+  const normalized = resolve(token);
+  return roots.some((root) => {
+    const normalizedRoot = resolve(root);
+    return normalized === normalizedRoot || normalized.startsWith(normalizedRoot + sep);
+  });
 }
 
 /**

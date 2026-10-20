@@ -31,8 +31,8 @@ cat > "$AGENT_DIR/settings.json" <<'JSON'
 JSON
 
 echo "==> 验证隔离"
-echo -n "    agent dir: "
-PI_CODING_AGENT_DIR="$AGENT_DIR" "$PREFIX/bin/pi" doctor 2>/dev/null | head -2 | tr '\n' ' '
+echo -n "    agent dir 内容: "
+ls "$AGENT_DIR" | tr '\n' ' '
 echo
 echo -n "    coding pi 未受影响: "
 command -v pi && pi --version
