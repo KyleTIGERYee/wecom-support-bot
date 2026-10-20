@@ -24,6 +24,8 @@ export function spawnPi({ prompt, sessionId, config, projectDir }) {
     config.pi.provider,
     "--model",
     config.pi.model,
+    "--thinking",
+    config.pi.thinkingLevel,
     "--session-id",
     sessionId,
     "--append-system-prompt",

@@ -4,7 +4,8 @@
     "agentDir": "/Users/kyle/.pi-support/agent",
     "provider": "安居集团",
     "model": "DeepSeek-V4-Flash-0731",
-    "timeoutMs": 90000
+    "timeoutMs": 90000,
+    "thinkingLevel": "max"
   },
   "roots": {
     "knowledgeBase": "/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
