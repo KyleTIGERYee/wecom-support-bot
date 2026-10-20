@@ -18,6 +18,7 @@ const ALLOWED_SCRIPTS = new Set(["search_db.py", "search_queries.py", "search_wi
 const ALLOWED_COMMANDS = new Set([
 	"grep",
 	"rg",
+
 	"find",
 	"ls",
 	"cat",
@@ -31,13 +32,38 @@ const ALLOWED_COMMANDS = new Set([
 ]);
 
 /**
- * 唯一允许用 node 执行的脚本：只读的经验检索工具。
- * 这个路径在项目目录下，不在 ROOTS 里，所以单独放行（脚本本身不接受写操作）。
+ * 允许用 node 执行的只读脚本：经验检索与指标路由。
+ * 这些路径在项目目录下，不在 ROOTS 里，所以单独放行（脚本本身不接受写操作）。
  */
-const ALLOWED_NODE_SCRIPT = "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js";
+const ALLOWED_NODE_SCRIPTS = new Set([
+	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js",
+	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js",
+]);
 
 /** 改变数据流向或串联命令的元字符；`$` 单独列出以拦住 $HOME 之类的变量展开。 */
 const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
+
+/**
+ * 找出引号外的 shell 元字符。
+ *
+ * 必须区分引号内外：`bi_query.py "SELECT ... WHERE t <> ''"` 里的 `<>` 是 SQL
+ * 比较运算符，不是 shell 重定向。只扫引号外的字符。
+ */
+function findUnquotedMetachar(command: string): string | null {
+	let quote: string | null = null;
+	for (const ch of command) {
+		if (quote) {
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (FORBIDDEN_METACHARS.includes(ch)) return ch;
+	}
+	return null;
+}
 
 /** 允许访问的文件系统根。与 config/default.json 的 roots 保持一致。 */
 const ROOTS = [
@@ -74,7 +100,7 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 	const trimmed = (command ?? "").trim();
 	if (!trimmed) return { allowed: false, reason: "空命令" };
 
-	const meta = FORBIDDEN_METACHARS.find((m) => trimmed.includes(m));
+	const meta = findUnquotedMetachar(trimmed);
 	if (meta) {
 		return { allowed: false, reason: `命令里出现 ${JSON.stringify(meta)}，只允许单条只读命令` };
 	}
@@ -97,12 +123,12 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 	if (executable === "node") {
 		// 只放行经验检索脚本，且第一个非选项参数必须正好是它
 		const script = tokens.slice(1).find((token) => token.endsWith(".js")) ?? "";
-		if (script !== ALLOWED_NODE_SCRIPT) {
+		if (!ALLOWED_NODE_SCRIPTS.has(script)) {
 			return { allowed: false, reason: `脚本 ${script || "(未指定)"} 不在白名单内` };
 		}
 		// 其余参数（wiki 目录与检索词）不得是路径形式以外的可疑内容，交给下面的路径检查
 		for (const token of tokens.slice(1)) {
-			if (token === ALLOWED_NODE_SCRIPT) continue;
+			if (ALLOWED_NODE_SCRIPTS.has(token)) continue;
 			if (token.startsWith("/") && !isInsideRoots(token)) {
 				return { allowed: false, reason: `路径越界：${token}` };
 			}

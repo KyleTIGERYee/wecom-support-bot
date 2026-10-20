@@ -61,6 +61,30 @@ function scoreEntry(entry, terms) {
 }
 
 /**
+ * 把检索词拆开。
+ *
+ * 中文整句必须切分，否则"现在有多少家机构"整串拿去 includes 匹配什么都命中不了。
+ * 长中文按二元切分（和 wiki 自带 preflight 的做法一致）。
+ *
+ * @param {string} query
+ * @returns {string[]}
+ */
+function tokenize(query) {
+  return (query ?? "")
+    .split(/[\s,，、]+/)
+    .flatMap((token) => {
+      if (/^[\u4e00-\u9fff]{4,}$/.test(token)) {
+        const bigrams = [];
+        for (let i = 0; i < token.length - 1; i += 1) bigrams.push(token.slice(i, i + 2));
+        return [token, ...bigrams];
+      }
+      return [token];
+    })
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+/**
  * @param {string} wikiRoot
  * @param {string} query
  * @returns {Promise<string>} 可直接拼进提示词的纯文本
@@ -93,10 +117,7 @@ export async function readEvolution(wikiRoot, query) {
   }
 
   // 经验索引：按关键词取最相关的几条
-  const terms = (query ?? "")
-    .split(/[\s,，、]+/)
-    .map((term) => term.trim())
-    .filter(Boolean);
+  const terms = tokenize(query);
 
   if (terms.length > 0) {
     const hits = [];
@@ -109,6 +130,8 @@ export async function readEvolution(wikiRoot, query) {
         if (!trimmed) continue;
         try {
           const entry = JSON.parse(trimmed);
+          // 已归档的经验是被正式标准覆盖或明确废弃的，不能再喂给模型
+          if (entry.status === "archived_candidate") continue;
           const score = scoreEntry(entry, terms);
           if (score > 0) hits.push({ score, entry });
         } catch {
@@ -122,7 +145,8 @@ export async function readEvolution(wikiRoot, query) {
     if (top.length > 0) {
       const lines = top.map(({ score, entry }) => {
         const text = entry.candidate ?? entry.key ?? "";
-        return `- （相关度 ${score}）${text.slice(0, MAX_EXCERPT)}`;
+        const status = entry.status && entry.status !== "candidate" ? `（${entry.status}）` : "";
+        return `- （相关度 ${score}${status}）${text.slice(0, MAX_EXCERPT)}`;
       });
       sections.push(`【与「${query}」相关的历史经验】\n${lines.join("\n")}`);
     }
@@ -139,7 +163,15 @@ if (process.argv[1]?.endsWith("read-evolution.js")) {
     console.error('用法：node scripts/read-evolution.js <db-wiki 目录> "<检索词>"');
     process.exit(1);
   }
+
+  const evolutionDir = await findEvolutionDir(wikiRoot);
+  if (!evolutionDir) {
+    // 明确区分"路径错了"和"确实没经验"，否则 agent 会以为查过了
+    console.error(`未找到经验目录：${wikiRoot} 下没有 *-evolution 目录`);
+    process.exit(2);
+  }
+
   const output = await readEvolution(wikiRoot, query ?? "");
-  process.stdout.write(output || "（暂无经验记录）");
+  process.stdout.write(output || "（这个库暂时没有可用的经验记录）");
   process.stdout.write("\n");
 }

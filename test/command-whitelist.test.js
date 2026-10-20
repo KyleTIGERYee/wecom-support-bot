@@ -177,3 +177,34 @@ test("拒绝用经验脚本读取白名单外的目录", () => {
   assert.equal(result.allowed, false);
   assert.match(result.reason ?? "", /路径越界/);
 });
+
+test("引号内的 SQL 比较运算符不应被当成 shell 重定向", () => {
+  const cases = [
+    `python3 ${AJLY_WIKI_ROOT}/scripts/bi_query.py "SELECT * FROM t WHERE create_time >= '2026-10-01'"`,
+    `python3 ${AJLY_WIKI_ROOT}/scripts/bi_query.py "SELECT * FROM t WHERE id < 100"`,
+    `python3 ${AJLY_WIKI_ROOT}/scripts/bi_query.py "SELECT * FROM t WHERE phone <> ''"`,
+  ];
+
+  for (const command of cases) {
+    const result = isCommandAllowed(command, ROOTS);
+    assert.equal(result.allowed, true, `应放行：${command}，实际：${result.reason}`);
+  }
+});
+
+test("引号外的重定向仍然要拦", () => {
+  const result = isCommandAllowed(`grep x ${AJLY_WIKI_ROOT}/a.md > /tmp/out.txt`, ROOTS);
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason ?? "", /元字符/);
+});
+
+test("引号内的分号不算命令串联", () => {
+  const result = isCommandAllowed(
+    `python3 ${AJLY_WIKI_ROOT}/scripts/bi_query.py "SELECT 1; DROP TABLE x"`,
+    ROOTS,
+  );
+
+  // SELECT 1; DROP 是危险的，但 bi_query 只放行单条 SELECT，这里放行到脚本层判断；
+  // 关键是引号内的 `;` 不应触发 shell 元字符判定
+  assert.equal(result.allowed, true);
+});
