@@ -11,7 +11,6 @@ import { runAgentTurn } from "./agent.js";
 import { reviewReply } from "./guard.js";
 import { handleTurn } from "./orchestrate.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
-import { createTurnQueue } from "./turn-queue.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -23,7 +22,6 @@ async function main() {
   await state.load();
 
   const callModel = await createGuardClient({ config, agentDir: config.pi.agentDir });
-  const queue = createTurnQueue();
 
   const client = new AiBot.WSClient({
     botId: config.wecom.botId,
@@ -86,15 +84,9 @@ async function main() {
       await log.warn("占位消息发送失败", { message: String(error) });
     }
 
-    // 同一会话串行执行：pi 的 session 文件是整文件重写的，并发跑会互相覆盖
-    const result = await queue.run(sessionKey, () => runTurn({ question, sessionKey, frame, streamId }));
-
-    if (result === null) {
-      await log.warn("会话忙，跳过这条", { sessionKey, length: question.length });
-      await client
-        .replyStream(frame, streamId, "上一条我还在查，这条稍等一下，我马上接着看。", true)
-        .catch(() => {});
-    }
+    // 并发执行：不同人的请求互不影响；同一个人的连问也允许并行
+    // （实测 pi 同 session 并发写入不会互锁，模型端并发也正常）
+    await runTurn({ question, sessionKey, frame, streamId });
   });
 
   /**
@@ -103,6 +95,13 @@ async function main() {
    * @param {{question: string, sessionKey: string, frame: any, streamId: string}} turn
    */
   async function runTurn({ question, sessionKey, frame, streamId }) {
+    const startedAt = Date.now();
+    /** @type {Array<{step: string, ms: number}>} */
+    const timings = [];
+    const mark = (/** @type {string} */ step, /** @type {number} */ from) => {
+      timings.push({ step, ms: Date.now() - from });
+    };
+
     // 查得久时补一句进度，避免同事以为掉线了
     const slowTimer = setTimeout(() => {
       client.replyStream(frame, streamId, config.surface.slowProgressText, false).catch(() => {});
@@ -114,9 +113,24 @@ async function main() {
         sessionKey,
         deps: {
           state,
-          runAgent: ({ prompt, sessionId }) =>
-            runAgentTurn({ prompt, sessionId, config, projectDir, timeoutMs: config.pi.timeoutMs }),
-          review: ({ question: asked, answer }) => reviewReply({ question: asked, answer, callModel }),
+          runAgent: async ({ prompt, sessionId }) => {
+            const t = Date.now();
+            const turn = await runAgentTurn({
+              prompt,
+              sessionId,
+              config,
+              projectDir,
+              timeoutMs: config.pi.timeoutMs,
+            });
+            mark("agent", t);
+            return turn;
+          },
+          review: async ({ question: asked, answer }) => {
+            const t = Date.now();
+            const verdict = await reviewReply({ question: asked, answer, callModel });
+            mark("guard", t);
+            return verdict;
+          },
         },
         maxRounds: config.guard.maxRounds,
         messages: {
@@ -127,8 +141,10 @@ async function main() {
       });
 
       clearTimeout(slowTimer);
+      const t = Date.now();
       const finalText = result.finalText || config.surface.errorText;
       await client.replyStream(frame, streamId, finalText, true);
+      mark("send", t);
 
       await log.info("答复完成", {
         sessionKey,
@@ -137,6 +153,8 @@ async function main() {
         exhausted: result.exhausted,
         timedOut: Boolean(result.timedOut),
         outLength: finalText.length,
+        totalMs: Date.now() - startedAt,
+        timings,
       });
     } catch (error) {
       clearTimeout(slowTimer);
