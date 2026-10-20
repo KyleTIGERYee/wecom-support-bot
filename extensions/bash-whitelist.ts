@@ -34,10 +34,7 @@ const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
 
 /** 允许访问的文件系统根。与 config/default.json 的 roots 保持一致。 */
 const ROOTS = [
-	"/Users/kyle/Desktop/PM/.agents/skills/ajly-wiki",
-	"/Users/kyle/Desktop/归档资料/王董的目录/lzz-wiki",
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki",
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki",
+	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
 	"/Users/kyle/Desktop/VIBECODING/ajly",
 	"/Users/kyle/Desktop/VIBECODING/lezuzu",
 ];
