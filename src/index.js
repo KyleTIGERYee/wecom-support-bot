@@ -11,6 +11,7 @@ import { runAgentTurn } from "./agent.js";
 import { reviewReply } from "./guard.js";
 import { handleTurn } from "./orchestrate.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
+import { createTurnQueue } from "./turn-queue.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -22,6 +23,7 @@ async function main() {
   await state.load();
 
   const callModel = await createGuardClient({ config, agentDir: config.pi.agentDir });
+  const queue = createTurnQueue();
 
   const client = new AiBot.WSClient({
     botId: config.wecom.botId,
@@ -84,6 +86,23 @@ async function main() {
       await log.warn("占位消息发送失败", { message: String(error) });
     }
 
+    // 同一会话串行执行：pi 的 session 文件是整文件重写的，并发跑会互相覆盖
+    const result = await queue.run(sessionKey, () => runTurn({ question, sessionKey, frame, streamId }));
+
+    if (result === null) {
+      await log.warn("会话忙，跳过这条", { sessionKey, length: question.length });
+      await client
+        .replyStream(frame, streamId, "上一条我还在查，这条稍等一下，我马上接着看。", true)
+        .catch(() => {});
+    }
+  });
+
+  /**
+   * 执行一轮完整问答：跑 agent → guard 校验 → 回写结果。
+   *
+   * @param {{question: string, sessionKey: string, frame: any, streamId: string}} turn
+   */
+  async function runTurn({ question, sessionKey, frame, streamId }) {
     // 查得久时补一句进度，避免同事以为掉线了
     const slowTimer = setTimeout(() => {
       client.replyStream(frame, streamId, config.surface.slowProgressText, false).catch(() => {});
@@ -128,7 +147,7 @@ async function main() {
         // 已经尽力
       }
     }
-  });
+  }
 
   process.on("SIGTERM", () => {
     log.info("收到 SIGTERM，断开连接");
