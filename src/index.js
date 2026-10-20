@@ -41,13 +41,15 @@ async function main() {
   });
 
   client.on("event.enter_chat", (frame) => {
-    client.replyWelcome(frame, {
-      msgtype: "text",
-      text: {
-        content:
-          "你好，我是技术支持助手。业务上的问题、想查个数、或者想确认某个流程怎么走，都可以问我。想重新开始聊的时候说一句「新会话」就行。",
-      },
-    });
+    client
+      .replyWelcome(frame, {
+        msgtype: "text",
+        text: {
+          content:
+            "你好，我是技术支持助手。业务上的问题、想查个数、或者想确认某个流程怎么走，都可以问我。想重新开始聊的时候说一句「新会话」就行。",
+        },
+      })
+      .catch((error) => log.warn("欢迎语发送失败", { message: String(error?.message ?? error) }));
   });
 
   client.on("message", async (frame) => {
@@ -64,7 +66,15 @@ async function main() {
       const sessionId = state.startNewSession(userKey);
       await state.flush();
       await log.info("开新会话", { user: message.userId, sessionId });
-      await client.reply(frame, { msgtype: "text", text: { content: "好，之前的聊的我先忘了，咱们重新开始。" } });
+      // 群聊里 reply 的 text 类型会被企微拒收（40008），走流式通道
+      const newSessionText = "好，之前的聊的我先忘了，咱们重新开始。";
+      const streamId = AiBot.generateReqId("stream");
+      try {
+        await client.replyStream(frame, streamId, newSessionText, false);
+        await client.replyStream(frame, streamId, newSessionText, true);
+      } catch (error) {
+        await log.warn("新会话确认发送失败", { message: String(/** @type {any} */ (error)?.message ?? error) });
+      }
       return;
     }
 
@@ -102,10 +112,15 @@ async function main() {
       timings.push({ step, ms: Date.now() - from });
     };
 
-    // 查得久时补一句进度，避免同事以为掉线了
-    const slowTimer = setTimeout(() => {
-      client.replyStream(frame, streamId, config.surface.slowProgressText, false).catch(() => {});
-    }, config.surface.slowProgressAfterMs);
+    // 查得久时补进度并周期刷新：安抚等待的同时保活流式消息（超时上限 180s，不能只发一次）
+    const progressTexts = [config.surface.slowProgressText, config.surface.keepAliveText];
+    let progressIndex = 0;
+    const sendProgress = () => {
+      const text = progressTexts[progressIndex++ % progressTexts.length];
+      client.replyStream(frame, streamId, text, false).catch(() => {});
+    };
+    const slowTimer = setTimeout(sendProgress, config.surface.slowProgressAfterMs);
+    const keepAliveTimer = setInterval(sendProgress, config.surface.keepAliveIntervalMs);
 
     try {
       const result = await handleTurn({
@@ -141,6 +156,7 @@ async function main() {
       });
 
       clearTimeout(slowTimer);
+      clearInterval(keepAliveTimer);
       const t = Date.now();
       const finalText = result.finalText || config.surface.errorText;
       await client.replyStream(frame, streamId, finalText, true);
@@ -158,6 +174,7 @@ async function main() {
       });
     } catch (error) {
       clearTimeout(slowTimer);
+      clearInterval(keepAliveTimer);
       await log.error("处理提问失败", { sessionKey, message: String(/** @type {any} */ (error)?.stack ?? error) });
       try {
         await client.replyStream(frame, streamId, config.surface.errorText, true);
