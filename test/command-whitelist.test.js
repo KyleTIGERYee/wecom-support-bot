@@ -125,3 +125,29 @@ test("拒绝 rg --pre（任意执行）", () => {
 
   assert.equal(result.allowed, false);
 });
+
+test("拒绝裸相对文件名（cwd 下有密钥）", () => {
+  const result = isCommandAllowed("cat config/secrets.json", ROOTS);
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason ?? "", /绝对路径/);
+});
+
+test("拒绝 --pre=命令 等号写法", () => {
+  const result = isCommandAllowed(`rg --pre=sh x ${AJLY_WIKI_ROOT}`, ROOTS);
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason ?? "", /写操作/);
+});
+
+test("grep 的搜索模式可以是普通词", () => {
+  const result = isCommandAllowed(`grep 退租 ${AJLY_WIKI_ROOT}/SKILL.md`, ROOTS);
+
+  assert.equal(result.allowed, true);
+});
+
+test("拒绝把路径当 grep 搜索模式", () => {
+  const result = isCommandAllowed("grep /etc/passwd /tmp", ROOTS);
+
+  assert.equal(result.allowed, false);
+});

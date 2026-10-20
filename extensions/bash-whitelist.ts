@@ -81,9 +81,10 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 		return { allowed: false, reason: `命令 ${executable} 不在白名单内` };
 	}
 
-	// `find -delete` / `rg --pre` 等参数能把只读命令变成写操作或任意执行
+	// `find -delete` / `rg --pre` 等参数能把只读命令变成写操作或任意执行。
+	// 同时匹配 `-flag` 与 `-flag=value` 两种写法（rg 的 --pre=cmd 曾可绕过）。
 	const dangerousFlag = tokens.find((token) =>
-		/^(-delete|-exec|-execdir|-fprint|-fprintf|-fls|-ok|--pre|--pre-glob)$/.test(token),
+		/^(?:-delete|-exec|-execdir|-fprint|-fprintf|-fls|-ok|--pre|--pre-glob)(?:=|$)/.test(token),
 	);
 	if (dangerousFlag) {
 		return { allowed: false, reason: `参数 ${dangerousFlag} 会让只读命令变成写操作` };
@@ -101,23 +102,26 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 		return { allowed: true };
 	}
 
-	for (const token of tokens.slice(1)) {
-		if (token.startsWith("-")) continue;
-		const looksLikePath =
-			token.startsWith("/") || token.startsWith("~") || token.startsWith("./") || token.startsWith("../");
-		if (!looksLikePath) {
-			if (token === "." || token === "..") {
-				return { allowed: false, reason: `路径越界：${token}` };
-			}
-			continue;
-		}
-		// 相对路径与 ~ 展开一律拒绝：判定它最终落在哪里需要解析 cwd 与 HOME，
-		// 这个成本换来的收益不值得，直接要求 agent 使用绝对路径。
+	const operands = tokens.slice(1).filter((token) => !token.startsWith("-"));
+	// grep/rg 的第一个非选项参数是搜索模式，不是路径
+	const patternCount = executable === "grep" || executable === "rg" ? 1 : 0;
+	const pathOperands = operands.slice(patternCount);
+
+	for (const token of pathOperands) {
 		if (!token.startsWith("/")) {
+			// 相对路径、~ 展开、裸文件名都以 cwd（项目根）为基准，
+			// 而项目根下就有 config/secrets.json，因此一律要求绝对路径。
 			return { allowed: false, reason: `只接受绝对路径：${token}` };
 		}
 		if (!isInsideRoots(token)) {
 			return { allowed: false, reason: `路径越界：${token}` };
+		}
+	}
+
+	// 搜索模式本身也不能带路径语义，否则 `grep /etc/passwd` 会被当成模式去读文件
+	for (const pattern of operands.slice(0, patternCount)) {
+		if (pattern.startsWith("/") || pattern.startsWith("~")) {
+			return { allowed: false, reason: `搜索模式不能是路径：${pattern}` };
 		}
 	}
 
