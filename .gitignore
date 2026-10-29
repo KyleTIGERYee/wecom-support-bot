@@ -3,3 +3,4 @@ logs/
 config/secrets.json
 data/
 *.log
+config/secrets.dev.json

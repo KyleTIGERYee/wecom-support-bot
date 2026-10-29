@@ -71,9 +71,21 @@ launchctl unload ~/Library/LaunchAgents/com.kyle.wecom-support-bot.plist
 npm test
 ```
 
-**单实例约束**：企微同一个机器人同时只能有一条长连接，新连接会踢掉旧的。不要同时在前台和 launchd 里各跑一份。
+**单实例约束**：企微同一个机器人同时只能有一条长连接，新连接会踢掉旧的。代码里有单实例锁（`data/<botId 前 8 位>.lock`，记 pid 并探活），前台和 launchd 各跑一份时第二份会直接拒绝启动。
 
 **重置 Guard 状态**：删掉 `data/session-state.json`，所有会话回到「未碰过 BI」状态。
+
+## 开发与生产隔离
+
+生产机器人靠 launchd 常驻，**不要在它身上调试**：重启会杀掉正在处理的问题，而且任何人此刻在问都会断线。
+
+调试请另建一个企微智能机器人（API 模式），凭证放 `config/secrets.dev.json`，然后：
+
+```bash
+WECOM_BOT_SECRETS=config/secrets.dev.json npm start
+```
+
+`WECOM_BOT_SECRETS` 支持绝对路径与相对项目目录的路径，缺省仍是 `config/secrets.json`。两个机器人是两条独立长连接，互不踢线。
 
 ## 配置
 

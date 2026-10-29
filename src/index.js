@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import AiBot from "@wecom/aibot-node-sdk";
 
 import { loadConfig } from "./config.js";
+import { acquireLock, releaseLock } from "./lock.js";
 import { createLogger } from "./log.js";
 import { createSessionState } from "./session-state.js";
 import { createGuardClient } from "./model-client.js";
@@ -17,6 +18,15 @@ const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 async function main() {
   const config = await loadConfig(projectDir);
   const log = createLogger({ logPath: join(projectDir, "logs/bot.log") });
+
+  // 企微同一个机器人只能有一条长连接，两份进程会互相踢线，所以先拿锁
+  const lockPath = join(projectDir, `data/${config.wecom.botId.slice(0, 8)}.lock`);
+  const lock = await acquireLock({ lockPath });
+  if (!lock.acquired) {
+    process.stderr.write(`已有实例在运行（pid ${lock.holder}），拒绝启动。\n`);
+    process.exit(2);
+  }
+  await log.info("已获取单实例锁", { lockPath });
 
   const state = createSessionState({ storePath: join(projectDir, "data/session-state.json") });
   await state.load();
@@ -187,7 +197,7 @@ async function main() {
   process.on("SIGTERM", () => {
     log.info("收到 SIGTERM，断开连接");
     client.disconnect();
-    process.exit(0);
+    releaseLock({ lockPath }).finally(() => process.exit(0));
   });
 
   client.connect();
