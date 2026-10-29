@@ -29,7 +29,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
     "--session-id",
     sessionId,
     "--append-system-prompt",
-    `${projectDir}/prompts/agent.md`,
+    `${projectDir}/prompts/core.md`,
     prompt,
   ];
 

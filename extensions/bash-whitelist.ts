@@ -11,6 +11,12 @@
  * 根目录清单在 ROOTS 维护，与 config/default.json 的 roots 保持一致。
  */
 
+/**
+ * 允许 read 读取的项目内文件：不在 ROOTS 里，但 agent 必须先读它才能正确查数。
+ * 只放行这一个绝对路径，其它项目内文件（config/secrets.json）依旧读不到。
+ */
+const ALLOWED_FILES = ["/Users/kyle/Desktop/VIBECODING/wecom-support-bot/prompts/data-playbook.md"];
+
 /** 允许被 python3 执行的检索脚本。 */
 const ALLOWED_SCRIPTS = new Set(["search_db.py", "search_queries.py", "search_wiki.py", "bi_query.py"]);
 
@@ -179,6 +185,9 @@ export function checkReadPath(path: string): { allowed: boolean; reason?: string
 	if (!path) return { allowed: false, reason: "未指定路径" };
 	if (!path.startsWith("/")) {
 		return { allowed: false, reason: `只接受绝对路径：${path}` };
+	}
+	if (ALLOWED_FILES.includes(toAbsolute(path) ?? "")) {
+		return { allowed: true };
 	}
 	if (!isInsideRoots(path)) {
 		return { allowed: false, reason: `路径越界：${path}，只能读取知识库与代码仓库` };

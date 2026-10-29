@@ -47,6 +47,8 @@ async function main() {
 
   /** @type {Set<Promise<void>>} 在途轮次，优雅退出时等它们答完 */
   const inFlight = new Set();
+  /** @type {Map<string, number>} 每个同事还没答完的问题数，用来决定占位文案 */
+  const pendingByUser = new Map();
   let shuttingDown = false;
 
   const client = new AiBot.WSClient({
@@ -56,7 +58,13 @@ async function main() {
     maxReconnectAttempts: -1,
   });
 
-  client.on("authenticated", () => log.info("企微长连接已就绪"));
+  let recoveryStarted = false;
+  client.on("authenticated", () => {
+    void log.info("企微长连接已就绪");
+    if (recoveryStarted) return;
+    recoveryStarted = true;
+    void runRecovery();
+  });
   client.on("reconnecting", (attempt) => log.warn("正在重连企微", { attempt }));
   client.on("error", (error) => log.error("企微连接异常", { message: String(error?.message ?? error) }));
 
@@ -137,19 +145,25 @@ async function main() {
     const streamId = AiBot.generateReqId("stream");
     const sessionKey = state.resolveSessionId(turn.userKey, Date.now());
 
-    const queued = turn.frame && queue.isBusy(turn.userKey);
+    const queued = (pendingByUser.get(turn.userKey) ?? 0) > 0;
     const placeholder = turn.frame
       ? client
           .replyStream(turn.frame, streamId, queued ? config.surface.queuedProgressText : config.surface.progressText, false)
           .catch((error) => log.warn("占位消息发送失败", { message: String(error?.message ?? error) }))
       : Promise.resolve();
 
+    pendingByUser.set(turn.userKey, (pendingByUser.get(turn.userKey) ?? 0) + 1);
     const task = placeholder.then(async () => {
       await queue.run(turn.userKey, () => runTurn({ ...turn, sessionKey, streamId }));
     });
     inFlight.add(task);
-    task.finally(() => inFlight.delete(task));
-    return task;
+    const done = task.finally(() => {
+      inFlight.delete(task);
+      const left = (pendingByUser.get(turn.userKey) ?? 1) - 1;
+      if (left <= 0) pendingByUser.delete(turn.userKey);
+      else pendingByUser.set(turn.userKey, left);
+    });
+    return done;
   }
 
   /**
@@ -310,9 +324,14 @@ async function main() {
     });
   }
 
-  // 启动补跑：上次没答完的问题重跑一遍，用主动推送送达
-  const pending = inbox.recoverable(Date.now(), config.inbox.recoveryWindowMs);
-  if (pending.length > 0) {
+  /**
+   * 启动补跑：上次没答完的问题重跑一遍，用主动推送送达。
+   *
+   * 必须等长连接认证之后才能跑 —— 主动推送走的是同一条通道。
+   */
+  async function runRecovery() {
+    const pending = inbox.recoverable(Date.now(), config.inbox.recoveryWindowMs);
+    if (pending.length === 0) return;
     await log.info("启动补跑", { count: pending.length });
     await Promise.all(
       pending.map((entry) =>

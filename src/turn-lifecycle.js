@@ -30,6 +30,8 @@ export async function runTurnLifecycle({
 }) {
   let settled = false;
   let handedOff = false;
+  /** @type {Promise<void>} 收尾话术的发送，转后台时要等它先送到 */
+  let handoffPromise = Promise.resolve();
 
   const slowTimer = setTimeout(() => {
     if (settled || handedOff) return;
@@ -39,12 +41,13 @@ export async function runTurnLifecycle({
   const handoffTimer = setTimeout(() => {
     if (settled) return;
     handedOff = true;
-    surface.handoff(messages.handoffText ?? "").catch(() => {});
+    handoffPromise = surface.handoff(messages.handoffText ?? "").catch(() => {});
   }, handoffAfterMs);
 
   try {
     const result = await execute();
     settled = true;
+    if (handedOff) await handoffPromise;
     return { mode: handedOff ? "handoff" : "inline", text: result.finalText, result };
   } finally {
     settled = true;

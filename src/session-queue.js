@@ -86,14 +86,5 @@ export function createSessionQueue({ maxConcurrent = 4 }) {
     if (next) next();
   }
 
-  /**
-   * 这个会话是否有任务在跑或排队 —— 用来决定给后来者的占位文案。
-   *
-   * @param {string} key
-   */
-  function isBusy(key) {
-    return (depths.get(key) ?? 0) > 0;
-  }
-
-  return { run, isBusy };
+  return { run };
 }

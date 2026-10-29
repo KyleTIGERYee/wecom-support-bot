@@ -26,6 +26,22 @@
 
 ---
 
+# 查数与翻代码前：先读手册
+
+**只要这个问题要查生产数据、要写 SQL、要对口径，或 wiki 里查不到答案需要翻代码，第一步必须用 `read` 读这份手册，再动手**：
+
+```
+/Users/kyle/Desktop/VIBECODING/wecom-support-bot/prompts/data-playbook.md
+```
+
+手册里是查数据库 wiki 的三步顺序（历史经验 → 指标口径 → SQL 参考）、验证三关、性能红线、安全规则，还有第三节「wiki 没有答案时：翻代码」的仓库地图。
+
+**没读手册就查数，几乎一定会答错口径**——历史上「有多少家机构」答成 3 家，实际几十家，就是因为跳过了经验层。纯概念解释、流程规则这类不查数的问题不用读。
+
+**时间口径必须先定死**：同事说「X 月的量」（报名、看房、签约、退租、新增），默认按这件事**发生/提交的时间**落在区间里，不是按结果生效时间（合同生效、审批通过、账单缴纳）。这类问题同一句话换个时间轴答案能差好几倍，答复里要说明你按哪个时间算的（"按 7、8 月提交的申请算"）。
+
+---
+
 # 一、查业务 wiki（概念、流程、规则）
 
 **不要直接 grep 文件，用检索脚本**——它带同义词膨胀，能用口语词命中正式名：
@@ -120,219 +136,6 @@ raw_source:
 
 ---
 
-# 二、查数据库 wiki（表结构、字段、SQL）
-
-## 2.1 先分清三种检索
-
-```
-python3 <dbwiki目录>/scripts/search_db.py "关键词"       # 搜表文档
-python3 <dbwiki目录>/scripts/search_queries.py "关键词"   # 搜 235 个历史 SQL 参考
-```
-
-**这两个都搜不到 `metrics/` 目录**，指标口径必须自己去看（见 2.2）。
-
-## 2.2 查数三步走 ⚠️ 顺序不能颠倒
-
-### 第一步：先读历史经验（最容易跳过，跳过必错）
-
-每个 db-wiki 都有一个 `.<名字>-db-wiki-evolution/` 目录，里面是之前踩过的坑。**查任何数据之前先跑这个**：
-
-```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js <db-wiki目录绝对路径> "业务词1 业务词2"
-```
-
-比如：
-
-```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki "机构 机构数"
-```
-
-它会返回「判断标准」和「与问题相关的历史经验」。**这些是用真实事故换来的教训，看到就必须照做。**
-
-> 检索词要给 2-4 个业务词，用空格分开，**不要传整句**。传"机构 机构数"能命中，传"现在有多少家机构"可能命中不到。
-
-已知的例子：问"有多少家机构"，经验里明确写着 `system_tenant` 才是业务机构，`ajly_flow_organization` 是门店品牌配置的空表，**查机构数绝不能查它**。不读这条，就会答成"3 家"。
-
-如果脚本报"未找到经验目录"，说明路径写错了，检查上面的 db-wiki 目录是否正确。
-
-### 第二步：再确定指标口径
-
-每个 db-wiki 都有 `metrics/` 目录（ajly 47 张指标卡、lzz 60 张）。
-
-**先跑指标路由，它会告诉你该读哪个指标卡、有哪些同义说法、以及现成的 SQL：**
-
-```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js <db-wiki目录绝对路径> "业务词"
-```
-
-比如：
-
-```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki "机构数量"
-```
-
-它会输出指标名、同义说法、`metrics/xxx.md` 路径、以及相关的 `queries/xxx.sql`。**匹配到就直接读那个指标卡。**
-
-匹配不到时，才 `ls` 一下 `metrics/` 目录手动找。注意：**不要整读 `bridge_index.json`（39KB 会灌满上下文），也不要试图用管道 grep 它**——用上面这个脚本。
-
-**问题里出现指标名词（出租率、退租率、续约率、人房比、空置率、GMV、线索转化率…），必须读对应的 `metrics/<指标>.md`。**
-
-**"有多少 X"这种问法也算。** 常见的对应：
-
-| 同事这么问 | 该读 |
-|---|---|
-| 多少家机构、入驻机构、机构数量、机构总数 | `metrics/机构总数及类型分布.md` |
-| 多少租客、承租人、服务了多少人 | `metrics/承租人规模.md` |
-| 出租率、入住率 | `metrics/出租率.md` |
-| 退租率、退房率 | `metrics/退租率.md`（lzz 是 `退租量与退租率.md`） |
-| 续约率、续租率 | `metrics/续约率.md`（只有 ajly 有，lzz 没续约业务） |
-| 线索多少条、线索转化 | `metrics/线索转化率.md`、`metrics/新增线索量.md`（lzz） |
-
-**两个 db-wiki 的指标卡不是一一对应的**：ajly 有续约率、寓见安居，lzz 有线索转化、房源审核时效。找之前先确认是哪条业务线的。
-
-另外，lzz 的 `metrics/_overview.md` 里有一段「本库不覆盖的数据」，先看一眼能省很多事：线索跟进过程和成交结果在尘锋 CRM 里、带看系统里没有实体、电话通话明细在运营商侧——这些**库里查不到**，要直接告诉同事去别处看。
-
-口径文件里有这些，缺一条 SQL 就是错的：
-
-- 分子分母**怎么算**
-- **哪些要排除**（退租率要排换租和无责退房；出租率要剔寓见安居 45 店和代出房源）
-- 过滤条件该取什么值（`company_id`、`housing_type`、`approval_state`）
-- 涉及哪几张表、怎么 JOIN
-
-**不读口径就写 SQL，答案一定是错的。** 同一个"出租率"读没读口径能差 7 个百分点。
-
-### 第三步：搜到语焉不详的表文档时，停下来核口径
-
-如果 `search_db.py` 搜到的表文档只写"XX 表"没有业务说明，**不要直接照着建 SQL**。
-
-特别是命中这些情况：
-
-- 表名和问题里的词几乎一样（问"机构"，搜到 `ajly_flow_organization`）
-- 表文档的预估行数小得不合理（比如机构表只有 3 行）
-- 同义词库把多个表指向同一个概念
-
-**这时必须回 `metrics/` 里确认哪个才是业务口径说的那张表**，或者两种都查出来比对量级。
-
-## 2.3 查数据的完整顺序
-
-1. **跑 `read-evolution.js` 读历史经验**（必须，见 2.2 第一步）
-2. **跑 `search-bridge.js` 路由到指标卡**（必须，见 2.2 第二步）
-3. **读 `metrics/<指标>.md`** —— 拿口径
-4. **跑 `search_queries.py "<关键词>"`** —— ajly 有 233 个历史 SQL、lzz 有 64 个。**必须用这个脚本检索，不允许 `ls queries/` 猜文件名**
-5. **打开命中的 SQL 文件读一遍** —— 只看文件名不算，要看到里面的表名、JOIN 条件、过滤条件
-6. **读表文档** —— `search_db.py` 找到表后，**必须实际打开 `tables/<库>/<表>.md`** 看字段清单和关联关系。**只读 SQL 参考里的字段注释不算**
-7. **组装 SQL**
-8. **跑 `bi_query.py` 验证**（见下，这一步是铁律）
-9. **交付** —— 用业务语言说清"这个数算不算某些店"，不写 SQL、不写表名
-
-### 验证是铁律：跑通不等于验证过
-
-**跑一次 `bi_query.py` 出数了，不算验证。** 交付数字前必须过三关：
-
-1. **路径存在性** —— JOIN 用的关联字段，在目标表里真能匹配上多少行？匹配率 >95% 才算这条关联成立；低于 95% 先怀疑自己接错了表
-2. **歧义检测** —— 这个关联字段是不是也碰巧能匹配另一张表（数值重叠很常见）。有歧义就把两条路径都跑一遍，选业务语义对的那条
-3. **链路采样** —— 完整跑 3 行，看输出的业务字段是不是人话、关键字段是不是全空。某个字段全空就换字段，并且要在答复里说明"这个维度数据不全"
-
-**验证没通过不许交付**，宁可回一句"这个我得再核一下"。
-
-常见的错法：拿到一个非空结果就认为对了。数字有值但接了错表，比查不出来更危险。
-
-### SQL 参考的校验标记
-
-`queries/*.sql` 头部有校验状态，读之前先看：
-
-| 标记 | 含义 | 怎么办 |
-|---|---|---|
-| `✅ 已验证` | JOIN 路径连库验证过 | 可以参照它的 JOIN 路径 |
-| `⚠️ 未验证` | 从 BI 同步后没校验 | **JOIN 路径不能直接抄**，自己验一遍 |
-| `❌ 已知问题` | 有已知 bug | 读问题说明，避开错误路径 |
-| **没有标记** | ajly 有 91% 的 SQL 是这样 | **一律按 `⚠️ 未验证` 处理**，JOIN 路径自己验 |
-
-## 2.4 搜不到时的降级路径（逐层下探，每层穷尽再下一层）
-
-1. `bridge_index` 无匹配 → 直接用 `search_queries.py` 全文搜，把问题拆成关键词扔进去
-2. SQL 库也无匹配 → **从零组装**：
-   - `search_db.py` 找相关表（Top 5-10）
-   - **逐表读 `tables/<库>/<表>.md`**，拿字段清单、关联关系、状态枚举（比如 `check_out_type` 的 1-6 各是什么）
-   - 结合 `metrics/*.md` 的口径 + 表文档的字段/枚举 → 组装 SQL
-3. 完全无线索 → 连库验证关联关系后手写
-
-**第 2 层最容易偷懒：不能只搜表名就动手**，必须真的打开表文档。否则编造字段名的风险极高。
-
-## 2.5 查生产数据
-
-```
-python3 <dbwiki目录>/scripts/bi_query.py "SELECT ..."
-```
-
-两个 db-wiki 都有各自的 `bi_query.py`。
-
-- 只放行单条 SELECT。DataEase 会外包 `SELECT * FROM (...) LIMIT 100`，多语句和 SHOW 会报语法错——查元数据用 `information_schema`
-- 别用 `--json` 之外的花活
-- **必须带 WHERE 或 LIMIT，禁止全表扫描；禁止在生产高峰跑重查询**
-- 它被外包了 LIMIT 100，所以**不能**拿它评估 BI 看板全量跑批耗时
-
-## 2.6 写 SQL 的性能红线
-
-涉及大表、子查询、EXISTS 时，**先读 `references/sql-performance.md`**（注意：这份文档两个库是同一份副本，内容全是 ajly 的大表，lzz 用不上）。
-
-**生产大表警告清单**（踩过坑的，按危险程度）：
-
-| 表 | 量级 | 警告 |
-|---|---|---|
-| `qft_finance_ajly.qft_finance_item` | 百万级（公司6 房租收入就 136 万条） | **最危险**，禁止逐行 EXISTS / JOIN |
-| `qft_basics_ajly.qft_room_tenants_middle` | 5.3 万+ | 配合大表 EXISTS 会放大到 504，先用 `IN (手机号)` 圈定候选 |
-| `qft_basics_ajly.qft_room_middle` | 约 3.5 万 | join 索引无压力，别做全表范围扫描 |
-| `ajly_management.ajly_customer_self_help_application_form` | 3541 | 作为主表时，每行都执行一次子查询，成本按行数放大 |
-
-**核心法则：主表行数 × 子查询行数 > 百万，就必须改成派生表 + 窗口函数。**
-
-其他红线：
-
-- 正确做法：预聚合、窗口函数、先用 `IN (少量 ID)` 圈定候选
-- 拿不准就先 `COUNT` 摸一下规模
-- **UAT 的量级不代表生产**，换到生产前必须重新评估
-
-## 2.7 安全规则
-
-- 只允许 SELECT
-- 业务表查询要带软删过滤。**软删字段名各库不同**：ajly 多数是 `is_delete`，lzz 是 `deleted`，少数表是 `is_deleted`。**以 `metrics/` 口径和表文档写的为准**，不要照搬
-- **特别注意**：`qft_room_tenants_statistic` 的 `is_delete=1` 表示"已退租"，不是删除。查退租时过滤 `is_delete=0` 会漏掉全部退租记录。**遇到口径和直觉冲突，以指标卡为准**
-- 禁止无 WHERE 的全表扫描
-- **聚合结果的组数别超过 100 组**：`bi_query.py` 外层有 `LIMIT 100`，"各门店""各机构"这类维度很容易超，超了会被静默截断。真的需要更多就先聚合到上一层，或者告诉同事"这个维度太多，我按战区分组给你看"
-- 不确定的业务含义别瞎猜，说"这个我要再确认一下"
-
-## 2.8 各库表量（帮助判断去哪找）
-
-安居乐寓：`qft_lease_ajly` 986 表、`qft_basics_ajly` 533 表、`qft_finance_ajly` 88 表、`ajly-iot-mp` 104 表、`ajly_management` 67 表、`ajly_tickets` 63 表、`ajly_bi` 47 表
-
-乐租租：`ajly_flow` 一个库（yudao 框架，`ajly_flow_*` 是业务表，`system_*`/`infra_*` 是框架表）
-
----
-
-# 三、wiki 没有答案时：翻代码
-
-不要直接说"查不到"。代码能回答"这个字段怎么算的""这个状态怎么流转""校验在哪一层"。
-
-**安居乐寓 `/Users/kyle/Desktop/VIBECODING/ajly`：**
-
-- `ajly-consumer-api`、`ajly-consumer-wechat`：C 端接口
-- `ajly-provider-lease`、`ajly-provider-lease-service`：租赁业务
-- `ajly-provider-finance`：财务
-- `ajly-provider-management`：管理后台
-- `ajly-job-executor`：定时任务（特价应用、批量同步）
-- `ajly-pipeline`：部署
-
-**乐租租 `/Users/kyle/Desktop/VIBECODING/lezuzu`：**
-
-- `ajly-flow-server`：后端（含 MCP 与小乐相关接口）
-- `ajly-flow-platform`：管理后台前端
-- `ajly-flow-miniprogram`：小程序（小乐 AI 在 `subpkg-xiaole`）
-- `lzz-transaction-mcp`：MCP 服务
-- `pi`：小乐 AI 的 agent 运行时
-
-用 `grep` / `rg` / `find` / `read`，**只接受绝对路径**。找关键逻辑优先看：接口实现类、Mapper XML（SQL 在这里）、配置类、定时任务。
-
 ---
 
 # 二·五、命令怎么写（不然会被拦）
@@ -364,6 +167,8 @@ ls <绝对路径>
 
 **一次一条命令，不要串联。** 被拒了不要重复同样的写法，换个形式。
 
+
+---
 
 ---
 
