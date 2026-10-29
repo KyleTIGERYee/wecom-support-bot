@@ -128,3 +128,81 @@ test("多次开新会话代号递增", async () => {
 
   assert.equal(third, "wx-abc-g3");
 });
+
+const ROTATION = { idleMs: 4 * 60 * 60 * 1000, maxInputTokens: 60000 };
+
+test("闲置超过阈值时自动换下一代会话", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath, rotation: ROTATION });
+  const startedAt = Date.parse("2026-10-29T09:00:00.000Z");
+
+  const first = state.resolveSessionId("wx-abc", startedAt);
+  state.recordActivity("wx-abc", { at: startedAt, inputTokens: 1000 });
+  const later = state.resolveSessionId("wx-abc", startedAt + ROTATION.idleMs + 1);
+
+  assert.equal(first, "wx-abc-g1");
+  assert.equal(later, "wx-abc-g2");
+});
+
+test("闲置未超阈值时沿用同一会话", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath, rotation: ROTATION });
+  const startedAt = Date.parse("2026-10-29T09:00:00.000Z");
+
+  const first = state.resolveSessionId("wx-abc", startedAt);
+  state.recordActivity("wx-abc", { at: startedAt, inputTokens: 1000 });
+  const soon = state.resolveSessionId("wx-abc", startedAt + ROTATION.idleMs - 1000);
+
+  assert.equal(soon, first);
+});
+
+test("上下文超过 token 阈值时自动换会话", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath, rotation: ROTATION });
+  const now = Date.parse("2026-10-29T09:00:00.000Z");
+
+  const first = state.resolveSessionId("wx-abc", now);
+  state.recordActivity("wx-abc", { at: now, inputTokens: ROTATION.maxInputTokens + 1 });
+  const next = state.resolveSessionId("wx-abc", now + 1000);
+
+  assert.equal(first, "wx-abc-g1");
+  assert.equal(next, "wx-abc-g2");
+});
+
+test("自动换代也会作废旧代粘性标记", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath, rotation: ROTATION });
+  const now = Date.parse("2026-10-29T09:00:00.000Z");
+  state.markBiTouched("wx-abc-g1");
+
+  state.recordActivity("wx-abc", { at: now, inputTokens: ROTATION.maxInputTokens + 1 });
+  state.resolveSessionId("wx-abc", now + 1000);
+
+  assert.equal(state.isBiTouched("wx-abc-g1"), false);
+});
+
+test("换代之后不会因为同一份旧活动重复换代", async () => {
+  const storePath = await tempStore();
+  const state = createSessionState({ storePath, rotation: ROTATION });
+  const now = Date.parse("2026-10-29T09:00:00.000Z");
+
+  state.recordActivity("wx-abc", { at: now, inputTokens: ROTATION.maxInputTokens + 1 });
+  const second = state.resolveSessionId("wx-abc", now + 1000);
+  const again = state.resolveSessionId("wx-abc", now + 2000);
+
+  assert.equal(second, "wx-abc-g2");
+  assert.equal(again, "wx-abc-g2");
+});
+
+test("活动记录跨重启保留", async () => {
+  const storePath = await tempStore();
+  const now = Date.parse("2026-10-29T09:00:00.000Z");
+  const first = createSessionState({ storePath, rotation: ROTATION });
+  first.recordActivity("wx-abc", { at: now, inputTokens: ROTATION.maxInputTokens + 1 });
+  await first.flush();
+
+  const second = createSessionState({ storePath, rotation: ROTATION });
+  await second.load();
+
+  assert.equal(second.resolveSessionId("wx-abc", now + 1000), "wx-abc-g2");
+});
