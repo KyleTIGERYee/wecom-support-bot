@@ -4,6 +4,36 @@ import { spawn } from "node:child_process";
 const BI_SCRIPT = "bi_query.py";
 
 /**
+ * 在跑的 pi 子进程。父进程退出不会自动带走子进程，强杀场景下它们会变成孤儿继续占着会话，
+ * 所以这里登记一份，正常退出时一并清掉。
+ *
+ * @type {Set<import("node:child_process").ChildProcess>}
+ */
+const runningChildren = new Set();
+let exitHookInstalled = false;
+
+/** @param {import("node:child_process").ChildProcess} child */
+function trackChild(child) {
+  runningChildren.add(child);
+  child.once("close", () => runningChildren.delete(child));
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on("exit", () => killAllChildren());
+}
+
+/** 杀掉所有在跑的 pi 子进程（优雅退出超时后调用）。 */
+export function killAllChildren() {
+  for (const child of runningChildren) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // 已经退出
+    }
+  }
+  runningChildren.clear();
+}
+
+/**
  * 默认的进程启动器：调用隔离的 pi 实例，输出 JSONL 事件流。
  *
  * @param {{prompt: string, sessionId: string, config: any, projectDir: string, thinkingLevel?: string}} options
@@ -33,7 +63,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
     prompt,
   ];
 
-  return spawn(config.pi.binary, args, {
+  const child = spawn(config.pi.binary, args, {
     cwd: projectDir,
     env: {
       ...process.env,
@@ -42,6 +72,8 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  trackChild(child);
+  return child;
 }
 
 /**
@@ -49,7 +81,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
  *
  * 只消费 pi 的 JSONL 事件流，不解析人类可读文本，也不信任 stdout 之外的任何东西。
  *
- * 两个时限分工不同：
+ * 看门狗的两个时限分工不同：
  *   - `idleTimeoutMs`：事件流静默多久算卡住。模型通道间歇停摆时，进程还活着但一个
  *     字节都不吐，只有这个能发现；有 thinking 增量也算进展，不会被误杀。
  *   - `hardTimeoutMs`：单轮总上限，防止一个真在干活但永远干不完的任务占着会话。

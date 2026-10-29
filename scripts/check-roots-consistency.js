@@ -33,7 +33,7 @@ if (missingInExtension.length || missingInConfig.length) {
   process.exit(1);
 }
 
-const filesMatch = extensionSource.match(/const ALLOWED_FILES = \[([\s\S]*?)\];/);
+const filesMatch = extensionSource.match(/const ALLOWED_READ_FILES = \[([\s\S]*?)\];/);
 const allowedFiles = filesMatch ? [...filesMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
 const corePrompt = await readFile(join(projectDir, "prompts/core.md"), "utf8");
 

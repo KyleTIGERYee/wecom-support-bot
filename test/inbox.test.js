@@ -136,3 +136,16 @@ test("清理会丢掉过期的已答记录，保留最近的", async () => {
   assert.deepEqual(restarted.accept(makeMessage({ msgid: "fresh" })), { isNew: false });
   assert.deepEqual(restarted.accept(makeMessage({ msgid: "old" })), { isNew: true });
 });
+
+test("超出窗口的未答问题可以通过 stale 查出来（只记日志用）", async () => {
+  const storePath = await tempStore();
+  const inbox = createInbox({ storePath });
+  await inbox.load();
+  inbox.accept(makeMessage({ msgid: "old-open", receivedAt: "2026-10-28T20:00:00.000Z" }));
+  inbox.accept(makeMessage({ msgid: "fresh-open" }));
+
+  const stale = inbox.stale(NOW, WINDOW).map((entry) => entry.msgid);
+
+  assert.deepEqual(stale, ["old-open"]);
+  assert.deepEqual(inbox.recoverable(NOW, WINDOW).map((entry) => entry.msgid), ["fresh-open"]);
+});

@@ -22,7 +22,7 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
  * }} options
- * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, lastDenyReason?: string}>}
+ * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string}>}
  */
 export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
@@ -33,13 +33,15 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
   let prompt = question;
   let lastDenyReason = "";
   let rounds = 0;
+  let stallRetries = 0;
   let needGuard = state.isBiTouched(sessionKey);
 
   while (rounds < maxRounds) {
     rounds += 1;
     const isRework = rounds > 1;
 
-    const turn = await runWithStallRetry(runAgent, { prompt, sessionId: sessionKey, isRework });
+    const { turn, retries } = await runWithStallRetry(runAgent, { prompt, sessionId: sessionKey, isRework });
+    stallRetries += retries;
 
     // 超时和失败给不同的话术：超时说明查得太久，失败说明出了岔子
     // 卡住（事件流静默）也算超时，因为已经重试过一次还是没动静
@@ -51,6 +53,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
         exhausted: false,
         timedOut: true,
         stalled: Boolean(turn.stalled),
+        stallRetries,
       };
     }
     if (turn.failed) {
@@ -64,12 +67,12 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     }
 
     if (!needGuard) {
-      return { finalText: turn.text, rounds, guarded: false, exhausted: false };
+      return { finalText: turn.text, rounds, guarded: false, exhausted: false, stallRetries };
     }
 
     const verdict = await review({ question, answer: turn.text });
     if (verdict.verdict === "ALLOW") {
-      return { finalText: turn.text, rounds, guarded: true, exhausted: false };
+      return { finalText: turn.text, rounds, guarded: true, exhausted: false, stallRetries };
     }
 
     lastDenyReason = verdict.reason ?? "答复包含敏感个人信息";
@@ -96,8 +99,8 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
  */
 async function runWithStallRetry(runAgent, options) {
   const first = await runAgent(options);
-  if (!first.stalled) return first;
-  return await runAgent(options);
+  if (!first.stalled) return { turn: first, retries: 0 };
+  return { turn: await runAgent(options), retries: 1 };
 }
 
 /**

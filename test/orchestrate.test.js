@@ -186,3 +186,15 @@ test("重试仍然卡住时给超时话术", async () => {
   assert.equal(result.finalText, "这个我查得有点久");
   assert.equal(result.stalled, true);
 });
+
+test("卡住重试次数回传给调用方（供上线后统计）", async () => {
+  const deps = {
+    state: fakeState(false),
+    runAgent: async () => ({ text: "", biTouched: false, timedOut: false, stalled: true, failed: false }),
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "问", sessionKey: "wx-abc", deps });
+
+  assert.equal(result.stallRetries, 1);
+});

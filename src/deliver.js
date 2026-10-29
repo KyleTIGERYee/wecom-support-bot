@@ -36,7 +36,7 @@ export async function deliverFinal({ text, stream, push, retries = 3, wait = sle
 }
 
 /**
- * 退避：1s、3s、9s。重试只发生在连接抖动时，拉长间隔比连续打更有效。
+ * 退避：1s、3s（3 次尝试之间的两段等待）。重试只发生在连接抖动时，拉长间隔比连续打更有效。
  *
  * @param {number} attempt 从 1 开始
  */

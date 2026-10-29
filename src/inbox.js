@@ -87,12 +87,22 @@ export function createInbox({ storePath }) {
    * @returns {any[]}
    */
   function recoverable(now, windowMs) {
-    return [...entries.values()].filter((entry) => {
-      if (entry.state !== "received" && entry.state !== "running") return false;
-      const receivedAt = Date.parse(entry.receivedAt);
-      if (Number.isNaN(receivedAt)) return false;
-      return now - receivedAt <= windowMs;
-    });
+    return unanswered().filter((entry) => withinWindow(entry, now, windowMs));
+  }
+
+  /**
+   * 还没答完、但已经超出补跑窗口的记录：不补跑，只记日志（隔很久突然冒出旧答案更奇怪）。
+   *
+   * @param {number} now
+   * @param {number} windowMs
+   * @returns {any[]}
+   */
+  function stale(now, windowMs) {
+    return unanswered().filter((entry) => !withinWindow(entry, now, windowMs));
+  }
+
+  function unanswered() {
+    return [...entries.values()].filter((entry) => entry.state === "received" || entry.state === "running");
   }
 
   /**
@@ -102,10 +112,7 @@ export function createInbox({ storePath }) {
    * @param {number} retentionMs
    */
   async function compact(now, retentionMs) {
-    const kept = [...entries.values()].filter((entry) => {
-      const receivedAt = Date.parse(entry.receivedAt);
-      return !Number.isNaN(receivedAt) && now - receivedAt <= retentionMs;
-    });
+    const kept = [...entries.values()].filter((entry) => withinWindow(entry, now, retentionMs));
     entries = new Map(kept.map((entry) => [entry.msgid, entry]));
     seen = new Set(entries.keys());
 
@@ -153,7 +160,20 @@ export function createInbox({ storePath }) {
       });
   }
 
-  return { load, accept, markRunning, markAnswered, markFailed, recoverable, compact, flush };
+  return { load, accept, markRunning, markAnswered, markFailed, recoverable, stale, compact, flush };
+}
+
+/**
+ * 收到时刻是否还在窗口内；时间解析不了的按「不在窗口内」处理。
+ *
+ * @param {any} entry
+ * @param {number} now
+ * @param {number} windowMs
+ */
+function withinWindow(entry, now, windowMs) {
+  const receivedAt = Date.parse(entry.receivedAt);
+  if (Number.isNaN(receivedAt)) return false;
+  return now - receivedAt <= windowMs;
 }
 
 /**

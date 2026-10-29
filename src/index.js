@@ -10,7 +10,7 @@ import { createSessionState } from "./session-state.js";
 import { createInbox } from "./inbox.js";
 import { createSessionQueue } from "./session-queue.js";
 import { createGuardClient } from "./model-client.js";
-import { runAgentTurn } from "./agent.js";
+import { runAgentTurn, killAllChildren } from "./agent.js";
 import { reviewReply } from "./guard.js";
 import { classifyQuestion } from "./route.js";
 import { handleTurn } from "./orchestrate.js";
@@ -19,6 +19,20 @@ import { deliverFinal } from "./deliver.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
+
+/**
+ * 一条待处理的提问。收件箱记录与排队的任务共用这个形状。
+ *
+ * @typedef {{
+ *   question: string,
+ *   userKey: string,
+ *   msgid: string,
+ *   userId: string,
+ *   chatId: string,
+ *   frame?: any,
+ *   recoveryPrefix?: string
+ * }} TurnJob
+ */
 
 async function main() {
   const config = await loadConfig(projectDir);
@@ -111,14 +125,13 @@ async function main() {
     }
 
     // 问题先落到收件箱，再考虑执行：企微重推靠 msgid 去重，进程重启靠它补跑
-    const msgid = message.msgid ?? fallbackMsgid(userKey, question);
+    const msgid = message.msgid ?? fallbackMsgid();
     const { isNew } = inbox.accept({
       msgid,
       userId: message.userId,
       chatId: message.chatId,
       chatType: message.chatType,
       question,
-      sessionKey: state.resolveSessionId(userKey, Date.now()),
       receivedAt: new Date().toISOString(),
     });
     if (!isNew) {
@@ -139,7 +152,7 @@ async function main() {
   /**
    * 占位 + 排队 + 执行。同一个同事的连发按顺序跑，不同人并行。
    *
-   * @param {{question: string, userKey: string, msgid: string, userId: string, chatId: string, frame?: any, recoveryPrefix?: string}} turn
+   * @param {TurnJob} turn
    */
   function enqueueTurn(turn) {
     const streamId = AiBot.generateReqId("stream");
@@ -169,13 +182,14 @@ async function main() {
   /**
    * 执行一轮完整问答：分级 → 跑 agent → guard 校验 → 投递 → 记状态。
    *
-   * @param {{question: string, userKey: string, sessionKey: string, msgid: string, userId: string, chatId: string, streamId: string, frame?: any, recoveryPrefix?: string}} turn
+   * @param {TurnJob & {sessionKey: string, streamId: string}} turn
    */
   async function runTurn({ question, userKey, sessionKey, msgid, userId, chatId, streamId, frame, recoveryPrefix = "" }) {
     const startedAt = Date.now();
     /** @type {Array<{step: string, ms: number}>} */
     const timings = [];
-    const mark = (/** @type {string} */ step, /** @type {number} */ from) => {
+    // 记一段耗时：从 from 到此刻，归到 step 名下
+    const lap = (/** @type {string} */ step, /** @type {number} */ from) => {
       timings.push({ step, ms: Date.now() - from });
     };
 
@@ -187,7 +201,7 @@ async function main() {
     if (config.routing.enabled) {
       const t = Date.now();
       route = await classifyQuestion({ question, callModel });
-      mark("route", t);
+      lap("route", t);
     }
     const thinkingLevel = config.pi.thinkingLevels[route];
 
@@ -210,13 +224,13 @@ async function main() {
               thinkingLevel,
             });
             lastInputTokens = agentTurn.inputTokens || lastInputTokens;
-            mark("agent", agentStartedAt);
+            lap("agent", agentStartedAt);
             return agentTurn;
           },
           review: async ({ question: asked, answer }) => {
             const guardStartedAt = Date.now();
             const verdict = await reviewReply({ question: asked, answer, callModel });
-            mark("guard", guardStartedAt);
+            lap("guard", guardStartedAt);
             return verdict;
           },
         },
@@ -227,7 +241,7 @@ async function main() {
           timeoutText: config.surface.timeoutText,
         },
       });
-      mark("turn", t);
+      lap("turn", t);
       return result;
     };
 
@@ -296,6 +310,7 @@ async function main() {
       exhausted: outcome.result.exhausted,
       timedOut: Boolean(outcome.result.timedOut),
       stalled: Boolean(outcome.result.stalled),
+      stallRetries: outcome.result.stallRetries ?? 0,
       inputTokens: lastInputTokens,
       outLength: text.length,
       totalMs: Date.now() - startedAt,
@@ -318,7 +333,8 @@ async function main() {
         await client.replyStream(frame, streamId, text, true);
       },
       push: async (/** @type {string} */ body) => {
-        const context = recoveryPrefix || (question ? `关于「${question.slice(0, 20)}」：` : "");
+        // 群里人多，推送要带一句「关于哪条」；单聊只有对话双方，不用加
+        const context = recoveryPrefix || (chatId && question ? `关于「${question.slice(0, 20)}」：` : "");
         await client.sendMessage(target, { msgtype: "markdown", markdown: { content: `${context}${body}` } });
       },
     });
@@ -330,7 +346,13 @@ async function main() {
    * 必须等长连接认证之后才能跑 —— 主动推送走的是同一条通道。
    */
   async function runRecovery() {
-    const pending = inbox.recoverable(Date.now(), config.inbox.recoveryWindowMs);
+    const now = Date.now();
+    const pending = inbox.recoverable(now, config.inbox.recoveryWindowMs);
+    const overdue = inbox.stale(now, config.inbox.recoveryWindowMs);
+    if (overdue.length > 0) {
+      // 隔太久不补：突然冒出一条旧答案比不答更让人困惑
+      await log.info("超窗未答问题不补跑", { count: overdue.length, msgids: overdue.map((entry) => entry.msgid) });
+    }
     if (pending.length === 0) return;
     await log.info("启动补跑", { count: pending.length });
     await Promise.all(
@@ -376,6 +398,7 @@ async function main() {
     drain
       .then(async () => {
         await inbox.flush();
+        killAllChildren();
         client.disconnect();
         await releaseLock({ lockPath });
         process.exit(0);
@@ -395,14 +418,11 @@ async function main() {
 }
 
 /**
- * 企微偶尔不给 msgid；用「人 + 问题 + 分钟」兜底，同一分钟内的重推仍能去重。
- *
- * @param {string} userKey
- * @param {string} question
+ * 企微偶尔不给 msgid。这时宁可不去重，也不能把两条内容相同的提问当成重复吞掉：
+ * 用时刻 + 随机后缀造一个唯一标识。
  */
-function fallbackMsgid(userKey, question) {
-  const minute = Math.floor(Date.now() / 60000);
-  return `anon-${userKey}-${Buffer.from(question, "utf8").toString("base64url").slice(0, 16)}-${minute}`;
+function fallbackMsgid() {
+  return `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 main().catch((error) => {
