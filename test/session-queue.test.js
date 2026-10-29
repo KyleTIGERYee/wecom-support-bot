@@ -100,3 +100,20 @@ test("任务抛异常时队列继续工作，异常传给调用方", async () =>
 
   assert.equal(await queue.run("a", async () => "ok"), "ok");
 });
+
+test("isBusy 反映该会话是否正在跑", async () => {
+  const queue = createSessionQueue({ maxConcurrent: 4 });
+  const gate = deferred();
+
+  assert.equal(queue.isBusy("a"), false);
+  const one = queue.run("a", async () => {
+    await gate.promise;
+  });
+  await tick();
+  assert.equal(queue.isBusy("a"), true);
+
+  gate.resolve();
+  await one;
+  await tick();
+  assert.equal(queue.isBusy("a"), false);
+});

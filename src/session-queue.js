@@ -13,6 +13,8 @@
 export function createSessionQueue({ maxConcurrent = 4 }) {
   /** @type {Map<string, Promise<void>>} 每个会话的队尾 */
   const tails = new Map();
+  /** @type {Map<string, number>} 每个会话未完成的任务数（含排队中） */
+  const depths = new Map();
   /** 等待全局名额的任务 */
   /** @type {Array<() => void>} */
   const waiters = [];
@@ -27,6 +29,7 @@ export function createSessionQueue({ maxConcurrent = 4 }) {
    * @returns {Promise<T>}
    */
   function run(key, task) {
+    depths.set(key, (depths.get(key) ?? 0) + 1);
     const previous = tails.get(key) ?? Promise.resolve();
     const result = previous.then(
       () => execute(task),
@@ -38,9 +41,15 @@ export function createSessionQueue({ maxConcurrent = 4 }) {
       () => {},
     ));
     const tail = tails.get(key);
-    if (tail) tail.then(() => {
-      if (tails.get(key) === tail) tails.delete(key);
-    });
+    if (tail) {
+      tail.then(() => {
+        depths.set(key, (depths.get(key) ?? 1) - 1);
+        if ((depths.get(key) ?? 0) <= 0) {
+          depths.delete(key);
+          if (tails.get(key) === tail) tails.delete(key);
+        }
+      });
+    }
     return result;
   }
 
@@ -77,5 +86,14 @@ export function createSessionQueue({ maxConcurrent = 4 }) {
     if (next) next();
   }
 
-  return { run };
+  /**
+   * 这个会话是否有任务在跑或排队 —— 用来决定给后来者的占位文案。
+   *
+   * @param {string} key
+   */
+  function isBusy(key) {
+    return (depths.get(key) ?? 0) > 0;
+  }
+
+  return { run, isBusy };
 }

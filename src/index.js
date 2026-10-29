@@ -7,10 +7,15 @@ import { loadConfig } from "./config.js";
 import { acquireLock, releaseLock } from "./lock.js";
 import { createLogger } from "./log.js";
 import { createSessionState } from "./session-state.js";
+import { createInbox } from "./inbox.js";
+import { createSessionQueue } from "./session-queue.js";
 import { createGuardClient } from "./model-client.js";
 import { runAgentTurn } from "./agent.js";
 import { reviewReply } from "./guard.js";
+import { classifyQuestion } from "./route.js";
 import { handleTurn } from "./orchestrate.js";
+import { runTurnLifecycle } from "./turn-lifecycle.js";
+import { deliverFinal } from "./deliver.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -26,12 +31,23 @@ async function main() {
     process.stderr.write(`已有实例在运行（pid ${lock.holder}），拒绝启动。\n`);
     process.exit(2);
   }
-  await log.info("已获取单实例锁", { lockPath });
 
-  const state = createSessionState({ storePath: join(projectDir, "data/session-state.json") });
+  const state = createSessionState({
+    storePath: join(projectDir, "data/session-state.json"),
+    rotation: config.rotation,
+  });
   await state.load();
 
+  const inbox = createInbox({ storePath: join(projectDir, "data/inbox.jsonl") });
+  await inbox.load();
+  await inbox.compact(Date.now(), config.inbox.retentionMs);
+
   const callModel = await createGuardClient({ config, agentDir: config.pi.agentDir });
+  const queue = createSessionQueue({ maxConcurrent: config.queue.maxConcurrent });
+
+  /** @type {Set<Promise<void>>} 在途轮次，优雅退出时等它们答完 */
+  const inFlight = new Set();
+  let shuttingDown = false;
 
   const client = new AiBot.WSClient({
     botId: config.wecom.botId,
@@ -62,7 +78,7 @@ async function main() {
       .catch((error) => log.warn("欢迎语发送失败", { message: String(error?.message ?? error) }));
   });
 
-  client.on("message", async (frame) => {
+  client.on("message", (frame) => {
     const message = normalizeMessage(frame);
     if (!message) return;
 
@@ -74,47 +90,74 @@ async function main() {
     // 开新会话：抬一代代号，上一轮的上下文和粘性标记一并作废
     if (isNewSessionRequest(question)) {
       const sessionId = state.startNewSession(userKey);
-      await state.flush();
-      await log.info("开新会话", { user: message.userId, sessionId });
+      void state.flush();
+      void log.info("开新会话", { user: message.userId, sessionId });
       // 群聊里 reply 的 text 类型会被企微拒收（40008），走流式通道
       const newSessionText = "好，之前的聊的我先忘了，咱们重新开始。";
       const streamId = AiBot.generateReqId("stream");
-      try {
-        await client.replyStream(frame, streamId, newSessionText, false);
-        await client.replyStream(frame, streamId, newSessionText, true);
-      } catch (error) {
-        await log.warn("新会话确认发送失败", { message: String(/** @type {any} */ (error)?.message ?? error) });
-      }
+      client
+        .replyStream(frame, streamId, newSessionText, false)
+        .then(() => client.replyStream(frame, streamId, newSessionText, true))
+        .catch((error) => log.warn("新会话确认发送失败", { message: String(error?.message ?? error) }));
       return;
     }
 
-    const sessionKey = state.resolveSessionId(userKey);
-    await log.info("收到提问", {
-      user: message.userId,
-      sessionKey,
+    // 问题先落到收件箱，再考虑执行：企微重推靠 msgid 去重，进程重启靠它补跑
+    const msgid = message.msgid ?? fallbackMsgid(userKey, question);
+    const { isNew } = inbox.accept({
+      msgid,
+      userId: message.userId,
+      chatId: message.chatId,
       chatType: message.chatType,
-      length: question.length,
+      question,
+      sessionKey: state.resolveSessionId(userKey, Date.now()),
+      receivedAt: new Date().toISOString(),
     });
+    if (!isNew) {
+      void log.info("重复消息，忽略", { msgid, user: message.userId });
+      return;
+    }
+    void inbox.flush();
 
-    // 先占位，满足企微 5 秒内必须有响应的要求
-    const streamId = AiBot.generateReqId("stream");
-    try {
-      await client.replyStream(frame, streamId, config.surface.progressText, false);
-    } catch (error) {
-      await log.warn("占位消息发送失败", { message: String(error) });
+    if (shuttingDown) {
+      void log.warn("正在退出，该问题留待重启后补跑", { msgid });
+      return;
     }
 
-    // 并发执行：不同人的请求互不影响；同一个人的连问也允许并行
-    // （实测 pi 同 session 并发写入不会互锁，模型端并发也正常）
-    await runTurn({ question, sessionKey, frame, streamId });
+    void log.info("收到提问", { msgid, user: message.userId, chatType: message.chatType, length: question.length });
+    void enqueueTurn({ question, userKey, msgid, userId: message.userId, chatId: message.chatId, frame });
   });
 
   /**
-   * 执行一轮完整问答：跑 agent → guard 校验 → 回写结果。
+   * 占位 + 排队 + 执行。同一个同事的连发按顺序跑，不同人并行。
    *
-   * @param {{question: string, sessionKey: string, frame: any, streamId: string}} turn
+   * @param {{question: string, userKey: string, msgid: string, userId: string, chatId: string, frame?: any, recoveryPrefix?: string}} turn
    */
-  async function runTurn({ question, sessionKey, frame, streamId }) {
+  function enqueueTurn(turn) {
+    const streamId = AiBot.generateReqId("stream");
+    const sessionKey = state.resolveSessionId(turn.userKey, Date.now());
+
+    const queued = turn.frame && queue.isBusy(turn.userKey);
+    const placeholder = turn.frame
+      ? client
+          .replyStream(turn.frame, streamId, queued ? config.surface.queuedProgressText : config.surface.progressText, false)
+          .catch((error) => log.warn("占位消息发送失败", { message: String(error?.message ?? error) }))
+      : Promise.resolve();
+
+    const task = placeholder.then(async () => {
+      await queue.run(turn.userKey, () => runTurn({ ...turn, sessionKey, streamId }));
+    });
+    inFlight.add(task);
+    task.finally(() => inFlight.delete(task));
+    return task;
+  }
+
+  /**
+   * 执行一轮完整问答：分级 → 跑 agent → guard 校验 → 投递 → 记状态。
+   *
+   * @param {{question: string, userKey: string, sessionKey: string, msgid: string, userId: string, chatId: string, streamId: string, frame?: any, recoveryPrefix?: string}} turn
+   */
+  async function runTurn({ question, userKey, sessionKey, msgid, userId, chatId, streamId, frame, recoveryPrefix = "" }) {
     const startedAt = Date.now();
     /** @type {Array<{step: string, ms: number}>} */
     const timings = [];
@@ -122,38 +165,44 @@ async function main() {
       timings.push({ step, ms: Date.now() - from });
     };
 
-    // 查得久时补进度并周期刷新：安抚等待的同时保活流式消息（超时上限 180s，不能只发一次）
-    const progressTexts = [config.surface.slowProgressText, config.surface.keepAliveText];
-    let progressIndex = 0;
-    const sendProgress = () => {
-      const text = progressTexts[progressIndex++ % progressTexts.length];
-      client.replyStream(frame, streamId, text, false).catch(() => {});
-    };
-    const slowTimer = setTimeout(sendProgress, config.surface.slowProgressAfterMs);
-    const keepAliveTimer = setInterval(sendProgress, config.surface.keepAliveIntervalMs);
+    inbox.markRunning(msgid);
+    let lastInputTokens = 0;
 
-    try {
+    // 先分诊：闲聊与概念题没必要最高思考强度（试运行里连「你好」都要 9–52 秒）
+    let route = "deep";
+    if (config.routing.enabled) {
+      const t = Date.now();
+      route = await classifyQuestion({ question, callModel });
+      mark("route", t);
+    }
+    const thinkingLevel = config.pi.thinkingLevels[route];
+
+    const execute = async () => {
+      const t = Date.now();
       const result = await handleTurn({
         question,
         sessionKey,
         deps: {
           state,
           runAgent: async ({ prompt, sessionId }) => {
-            const t = Date.now();
-            const turn = await runAgentTurn({
+            const agentStartedAt = Date.now();
+            const agentTurn = await runAgentTurn({
               prompt,
               sessionId,
               config,
               projectDir,
-              timeoutMs: config.pi.timeoutMs,
+              idleTimeoutMs: config.pi.idleTimeoutMs,
+              hardTimeoutMs: config.pi.timeoutMs,
+              thinkingLevel,
             });
-            mark("agent", t);
-            return turn;
+            lastInputTokens = agentTurn.inputTokens || lastInputTokens;
+            mark("agent", agentStartedAt);
+            return agentTurn;
           },
           review: async ({ question: asked, answer }) => {
-            const t = Date.now();
+            const guardStartedAt = Date.now();
             const verdict = await reviewReply({ question: asked, answer, callModel });
-            mark("guard", t);
+            mark("guard", guardStartedAt);
             return verdict;
           },
         },
@@ -164,44 +213,177 @@ async function main() {
           timeoutText: config.surface.timeoutText,
         },
       });
+      mark("turn", t);
+      return result;
+    };
 
-      clearTimeout(slowTimer);
-      clearInterval(keepAliveTimer);
-      const t = Date.now();
-      const finalText = result.finalText || config.surface.errorText;
-      await client.replyStream(frame, streamId, finalText, true);
-      mark("send", t);
-
-      await log.info("答复完成", {
-        sessionKey,
-        rounds: result.rounds,
-        guarded: result.guarded,
-        exhausted: result.exhausted,
-        timedOut: Boolean(result.timedOut),
-        outLength: finalText.length,
-        totalMs: Date.now() - startedAt,
-        timings,
+    /** @type {Awaited<ReturnType<typeof runTurnLifecycle>>} */
+    let outcome;
+    try {
+      outcome = await runTurnLifecycle({
+        execute,
+        surface: {
+          progress: async (text) => {
+            if (!frame) return;
+            await client.replyStream(frame, streamId, text, false);
+          },
+          handoff: async (text) => {
+            if (!frame) return;
+            await client.replyStream(frame, streamId, text, true);
+          },
+        },
+        messages: { slowText: config.surface.slowProgressText, handoffText: config.surface.handoffText },
+        slowAfterMs: config.surface.slowProgressAfterMs,
+        // 补跑没有流式通道可收尾，全程后台跑完再推送
+        handoffAfterMs: frame ? config.pi.handoffTimeoutMs : Number.POSITIVE_INFINITY,
       });
     } catch (error) {
-      clearTimeout(slowTimer);
-      clearInterval(keepAliveTimer);
-      await log.error("处理提问失败", { sessionKey, message: String(/** @type {any} */ (error)?.stack ?? error) });
-      try {
-        await client.replyStream(frame, streamId, config.surface.errorText, true);
-      } catch {
-        // 已经尽力
-      }
+      await log.error("处理提问失败", {
+        msgid,
+        sessionKey,
+        message: String(/** @type {any} */ (error)?.stack ?? error),
+      });
+      inbox.markFailed(msgid);
+      await sendAnswer({ text: config.surface.errorText, frame, streamId, userId, chatId, recoveryPrefix });
+      state.recordActivity(userKey, { at: Date.now(), inputTokens: lastInputTokens });
+      await state.flush();
+      return;
     }
+
+    const text = outcome.text || config.surface.errorText;
+    const delivery = await sendAnswer({
+      // 转后台后流式消息已收尾，只能主动推送
+      text,
+      frame: outcome.mode === "inline" ? frame : undefined,
+      streamId,
+      userId,
+      chatId,
+      recoveryPrefix,
+      question,
+    });
+
+    if (delivery.channel === "none") inbox.markFailed(msgid);
+    else inbox.markAnswered(msgid);
+    await inbox.flush();
+
+    state.recordActivity(userKey, { at: Date.now(), inputTokens: lastInputTokens });
+    await state.flush();
+
+    await log.info("答复完成", {
+      msgid,
+      sessionKey,
+      route,
+      thinkingLevel,
+      mode: outcome.mode,
+      channel: delivery.channel,
+      sendFailure: delivery.reason,
+      rounds: outcome.result.rounds,
+      guarded: outcome.result.guarded,
+      exhausted: outcome.result.exhausted,
+      timedOut: Boolean(outcome.result.timedOut),
+      stalled: Boolean(outcome.result.stalled),
+      inputTokens: lastInputTokens,
+      outLength: text.length,
+      totalMs: Date.now() - startedAt,
+      timings,
+    });
   }
 
-  process.on("SIGTERM", () => {
-    log.info("收到 SIGTERM，断开连接");
-    client.disconnect();
-    releaseLock({ lockPath }).finally(() => process.exit(0));
+  /**
+   * 投递最终答复：能收尾流式消息就收尾，否则主动推送（群聊带问题摘要，认得出是哪条）。
+   *
+   * @param {{text: string, frame?: any, streamId: string, userId: string, chatId: string, recoveryPrefix: string, question?: string}} options
+   */
+  function sendAnswer({ text, frame, streamId, userId, chatId, recoveryPrefix, question = "" }) {
+    // 群聊发到群，单聊发到人的 userid —— 企微的主动推送接口两种都收在同一个参数里
+    const target = chatId || userId;
+    return deliverFinal({
+      text,
+      stream: async () => {
+        if (!frame) throw new Error("无流式通道");
+        await client.replyStream(frame, streamId, text, true);
+      },
+      push: async (/** @type {string} */ body) => {
+        const context = recoveryPrefix || (question ? `关于「${question.slice(0, 20)}」：` : "");
+        await client.sendMessage(target, { msgtype: "markdown", markdown: { content: `${context}${body}` } });
+      },
+    });
+  }
+
+  // 启动补跑：上次没答完的问题重跑一遍，用主动推送送达
+  const pending = inbox.recoverable(Date.now(), config.inbox.recoveryWindowMs);
+  if (pending.length > 0) {
+    await log.info("启动补跑", { count: pending.length });
+    await Promise.all(
+      pending.map((entry) =>
+        enqueueTurn({
+          question: entry.question,
+          userKey: toSessionKey(entry.userId),
+          msgid: entry.msgid,
+          userId: entry.userId,
+          chatId: entry.chatId ?? "",
+          recoveryPrefix: "刚才那条我补上：",
+        }),
+      ),
+    );
+  }
+
+  /**
+   * 优雅退出：不再接新活（新问题仍落收件箱），等在途轮次答完再断开。
+   *
+   * 直接退出的代价是：正在跑的问题被丢在半路，同事只看到「正在查」永不更新。
+   * 等不下去了（超过 30 秒）也照常退出，收件箱会把它交给下次启动补跑。
+   *
+   * @param {string} signal
+   */
+  function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void log.info(`收到 ${signal}，停止接新活`, { inFlight: inFlight.size });
+
+    const drain = new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (inFlight.size === 0) settle();
+      }, 500);
+      const force = setTimeout(settle, 30000);
+
+      function settle() {
+        clearInterval(check);
+        clearTimeout(force);
+        resolve(undefined);
+      }
+    });
+
+    drain
+      .then(async () => {
+        await inbox.flush();
+        client.disconnect();
+        await releaseLock({ lockPath });
+        process.exit(0);
+      })
+      .catch(() => process.exit(0));
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("unhandledRejection", (reason) => {
+    // 一次发送失败不该把整个机器人带走
+    log.error("未处理的 Promise 拒绝", { reason: String(reason) });
   });
 
   client.connect();
   await log.info("机器人启动", { botId: config.wecom.botId.slice(0, 8) });
+}
+
+/**
+ * 企微偶尔不给 msgid；用「人 + 问题 + 分钟」兜底，同一分钟内的重推仍能去重。
+ *
+ * @param {string} userKey
+ * @param {string} question
+ */
+function fallbackMsgid(userKey, question) {
+  const minute = Math.floor(Date.now() / 60000);
+  return `anon-${userKey}-${Buffer.from(question, "utf8").toString("base64url").slice(0, 16)}-${minute}`;
 }
 
 main().catch((error) => {

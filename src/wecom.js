@@ -8,7 +8,7 @@
  * 把企微消息帧归一化成网关需要的形状；无法提取文本时返回 null。
  *
  * @param {any} frame
- * @returns {{text: string, userId: string, chatType: string, chatId: string} | null}
+ * @returns {{text: string, userId: string, chatType: string, chatId: string, msgid: string | null} | null}
  */
 export function normalizeMessage(frame) {
   const body = frame?.body;
@@ -23,6 +23,8 @@ export function normalizeMessage(frame) {
     userId,
     chatType: body.chattype === "group" ? "group" : "single",
     chatId: body.chatid ?? "",
+    // 去重要用的消息唯一标识；缺了它退化成「按内容去重」，由上层兜底
+    msgid: typeof body.msgid === "string" && body.msgid ? body.msgid : null,
   };
 }
 

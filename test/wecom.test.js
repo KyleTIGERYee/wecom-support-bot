@@ -74,3 +74,21 @@ test("去掉开头的 @提及但不破坏正文邮箱", () => {
 test("正文中间的 @ 不被当作提及", () => {
   assert.equal(stripMention("我在 @ 他的时候说过了"), "我在 @ 他的时候说过了");
 });
+
+test("归一化带上 msgid 供去重", () => {
+  const frame = {
+    body: { text: { content: "退租怎么算" }, from: { userid: "zhangsan" }, msgtype: "text", msgid: "MSG-001" },
+  };
+
+  const message = normalizeMessage(frame);
+
+  assert.equal(message.msgid, "MSG-001");
+});
+
+test("没有 msgid 时归一化成 null（交给上层兜底）", () => {
+  const frame = { body: { text: { content: "退租怎么算" }, from: { userid: "zhangsan" }, msgtype: "text" } };
+
+  const message = normalizeMessage(frame);
+
+  assert.equal(message.msgid, null);
+});
