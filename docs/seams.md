@@ -5,7 +5,7 @@
 | 缝 | 模块 | 公开签名 | 验证的行为 |
 |---|---|---|---|
 | S1 命令白名单 | `src/command-whitelist.js` | `isCommandAllowed(command, roots) → {allowed, reason}` | 合法脚本放行；写入、外传、越界路径、读凭证全部拒绝 |
-| S2 Agent 调用 | `src/agent.js` | `runAgentTurn({prompt, sessionId, runner, timeoutMs, idleTimeoutMs, hardTimeoutMs, thinkingLevel}) → {text, biTouched, timedOut, stalled, failed, inputTokens}` | 从事件流提取最终答复；识别 bi_query.py；事件流持续吐时不超时；静默超过 idle 判 stalled；超过 hard 判 timedOut；回传输入 token 数；思考强度透传给 runner |
+| S2 Agent 调用 | `src/agent.js` | `runAgentTurn({prompt, sessionId, runner, timeoutMs, idleTimeoutMs, hardTimeoutMs, thinkingLevel, config, projectDir}) → {text, biTouched, timedOut, stalled, failed, inputTokens}` | 从事件流提取最终答复；识别 bi_query.py；事件流持续吐时不超时；静默超过 idle 判 stalled；超过 hard 判 timedOut；回传输入 token 数；思考强度透传给 runner |
 | S3 守卫判定 | `src/guard.js` | `reviewReply({question, answer, callModel}) → {verdict, reason}` | ALLOW/DENY 解析；模型故障时 fail-closed |
 | S4 轮次编排 | `src/orchestrate.js` | `handleTurn({question, sessionKey, deps}) → {finalText, rounds, guarded, exhausted, timedOut, stalled}` | DENY 后重写一次即通过；连续 3 次 DENY 走兜底；未碰 BI 时不调用 guard；卡住自动重试一次，仍卡住给超时话术 |
 | S5 会话标记 | `src/session-state.js` | `createSessionState({storePath, rotation}) → {resolveSessionId(userKey, now), recordActivity, startNewSession, markBiTouched, isBiTouched, flush}` | 跨进程重启保留；文件损坏时保守地全量过 guard；闲置过久或上下文超阈值自动换代，旧代粘性标记随之作废 |
