@@ -94,7 +94,7 @@ async function main() {
         msgtype: "text",
         text: {
           content:
-            "你好，我是技术支持助手。业务上的问题、想查个数、或者想确认某个流程怎么走，都可以问我。想重新开始聊的时候说一句「新会话」就行。",
+            "我是赛博阿虎。我拥有安居乐寓和乐租租几乎所有的知识库，你可以找我排查问题，查询数据，了解功能等等。有什么事情不要找阿虎，请找我。",
         },
       })
       .catch((error) => log.warn("欢迎语发送失败", { message: String(error?.message ?? error) }));
