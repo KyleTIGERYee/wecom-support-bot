@@ -227,9 +227,9 @@ async function main() {
             lap("agent", agentStartedAt);
             return agentTurn;
           },
-          review: async ({ question: asked, answer }) => {
+          review: async ({ answer }) => {
             const guardStartedAt = Date.now();
-            const verdict = await reviewReply({ question: asked, answer, callModel });
+            const verdict = await reviewReply({ answer, callModel });
             lap("guard", guardStartedAt);
             return verdict;
           },

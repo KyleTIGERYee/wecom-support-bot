@@ -17,7 +17,7 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   deps: {
  *     state: {isBiTouched: (key: string) => boolean, markBiTouched: (key: string) => void, flush: () => Promise<void>},
  *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean}>,
- *     review: (options: {question: string, answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>
+ *     review: (options: {answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>
  *   },
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
@@ -70,7 +70,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
       return { finalText: turn.text, rounds, guarded: false, exhausted: false, stallRetries };
     }
 
-    const verdict = await review({ question, answer: turn.text });
+    const verdict = await review({ answer: turn.text });
     if (verdict.verdict === "ALLOW") {
       return { finalText: turn.text, rounds, guarded: true, exhausted: false, stallRetries };
     }
