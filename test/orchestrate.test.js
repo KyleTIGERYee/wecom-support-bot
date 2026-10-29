@@ -148,3 +148,41 @@ test("超时给超时话术而不是通用错误话术", async () => {
   assert.equal(result.timedOut, true);
   assert.match(result.finalText, /查得有点久/);
 });
+
+test("卡住时自动重试一次，第二次成功就正常答复", async () => {
+  let calls = 0;
+  const deps = {
+    state: fakeState(false),
+    runAgent: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { text: "", biTouched: false, timedOut: false, stalled: true, failed: false };
+      }
+      return { text: "重试后答上了", biTouched: false, timedOut: false, stalled: false, failed: false };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "退租怎么算", sessionKey: "wx-abc", deps });
+
+  assert.equal(calls, 2);
+  assert.equal(result.finalText, "重试后答上了");
+});
+
+test("重试仍然卡住时给超时话术", async () => {
+  const deps = {
+    state: fakeState(false),
+    runAgent: async () => ({ text: "", biTouched: false, timedOut: false, stalled: true, failed: false }),
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({
+    question: "退租怎么算",
+    sessionKey: "wx-abc",
+    deps,
+    messages: { timeoutText: "这个我查得有点久" },
+  });
+
+  assert.equal(result.finalText, "这个我查得有点久");
+  assert.equal(result.stalled, true);
+});

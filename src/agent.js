@@ -6,10 +6,10 @@ const BI_SCRIPT = "bi_query.py";
 /**
  * 默认的进程启动器：调用隔离的 pi 实例，输出 JSONL 事件流。
  *
- * @param {{prompt: string, sessionId: string, config: any, projectDir: string}} options
+ * @param {{prompt: string, sessionId: string, config: any, projectDir: string, thinkingLevel?: string}} options
  * @returns {import("node:child_process").ChildProcess}
  */
-export function spawnPi({ prompt, sessionId, config, projectDir }) {
+export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }) {
   const args = [
     "--mode",
     "json",
@@ -25,7 +25,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir }) {
     "--model",
     config.pi.model,
     "--thinking",
-    config.pi.thinkingLevel,
+    thinkingLevel ?? config.pi.thinkingLevel,
     "--session-id",
     sessionId,
     "--append-system-prompt",
@@ -62,6 +62,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir }) {
  *   timeoutMs?: number,
  *   idleTimeoutMs?: number,
  *   hardTimeoutMs?: number,
+ *   thinkingLevel?: string,
  *   config?: any,
  *   projectDir?: string
  * }} options
@@ -74,19 +75,20 @@ export async function runAgentTurn({
   timeoutMs = 180000,
   idleTimeoutMs,
   hardTimeoutMs,
+  thinkingLevel,
   config,
   projectDir,
 }) {
   /** @param {{prompt: string, sessionId: string}} options */
   const defaultLaunch = (options) => {
     if (!config || !projectDir) throw new Error("缺少 config 或 projectDir");
-    return spawnPi({ ...options, config, projectDir });
+    return spawnPi({ ...options, thinkingLevel, config, projectDir });
   };
   const launch = runner ?? defaultLaunch;
   const hardLimit = hardTimeoutMs ?? timeoutMs;
 
   return new Promise((resolvePromise) => {
-    const child = launch({ prompt, sessionId, config, projectDir });
+    const child = launch({ prompt, sessionId, thinkingLevel, config, projectDir });
 
     let text = "";
     let biTouched = false;

@@ -16,13 +16,13 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   sessionKey: string,
  *   deps: {
  *     state: {isBiTouched: (key: string) => boolean, markBiTouched: (key: string) => void, flush: () => Promise<void>},
- *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, failed: boolean}>,
+ *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean}>,
  *     review: (options: {question: string, answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>
  *   },
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
  * }} options
- * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, lastDenyReason?: string}>}
+ * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, lastDenyReason?: string}>}
  */
 export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
@@ -39,11 +39,19 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     rounds += 1;
     const isRework = rounds > 1;
 
-    const turn = await runAgent({ prompt, sessionId: sessionKey, isRework });
+    const turn = await runWithStallRetry(runAgent, { prompt, sessionId: sessionKey, isRework });
 
     // 超时和失败给不同的话术：超时说明查得太久，失败说明出了岔子
-    if (turn.timedOut) {
-      return { finalText: timeoutText, rounds, guarded: needGuard, exhausted: false, timedOut: true };
+    // 卡住（事件流静默）也算超时，因为已经重试过一次还是没动静
+    if (turn.timedOut || turn.stalled) {
+      return {
+        finalText: timeoutText,
+        rounds,
+        guarded: needGuard,
+        exhausted: false,
+        timedOut: true,
+        stalled: Boolean(turn.stalled),
+      };
     }
     if (turn.failed) {
       return { finalText: errorText, rounds, guarded: needGuard, exhausted: false };
@@ -75,6 +83,21 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     exhausted: true,
     lastDenyReason,
   };
+}
+
+/**
+ * 卡住时自动重试一次。
+ *
+ * 事件流静默多半是模型通道间歇停摆，而不是这道题真的答不了：换个时刻再跑一次往往就通了。
+ * 只重试一次，且沿用同一个会话 —— 第一次已经查到的东西还在上下文里。
+ *
+ * @param {(options: any) => Promise<any>} runAgent
+ * @param {any} options
+ */
+async function runWithStallRetry(runAgent, options) {
+  const first = await runAgent(options);
+  if (!first.stalled) return first;
+  return await runAgent(options);
 }
 
 /**

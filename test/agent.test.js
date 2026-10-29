@@ -275,3 +275,21 @@ test("回传上一轮的输入 token 数", async () => {
 
   assert.equal(result.inputTokens, 51234);
 });
+
+test("把思考强度传给 runner", async () => {
+  /** @type {any} */
+  let seen = null;
+  const runner = (/** @type {any} */ options) => {
+    seen = options;
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => true;
+    queueMicrotask(() => child.emit("close", 0));
+    return child;
+  };
+
+  await runAgentTurn({ prompt: "问", sessionId: "wx-abc", runner, thinkingLevel: "low" });
+
+  assert.equal(seen.thinkingLevel, "low");
+});
