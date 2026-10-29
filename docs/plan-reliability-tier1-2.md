@@ -182,3 +182,33 @@
 | 群聊 @ 提问 + 新会话指令 | 正常答复，不崩进程 |
 | 人为让 pi 卡住（断内网模型地址） | 45 秒后重试一次，再失败给超时话术，不吐原始错误 |
 | 查数题答复含个人信息 | guard 仍打回重写（回归既有行为） |
+
+---
+
+## 执行记录（2026-10-29）
+
+分支 `reliability-tier12`，固定点 `e13a0ec`，票与提交对应：
+
+| 票 | 提交 | 结果 |
+|---|---|---|
+| T0 | 8787e81 | 12 题基线：P50 15s / P90 57s；`docs/regression-baseline.json` |
+| T1 | 4d93d6d | `WECOM_BOT_SECRETS` + 单实例 pid 锁（实测：活进程占用时第二份拒绝、pid 死了可接管） |
+| T2 | fc597bb | 收件箱 9 项测试 |
+| T3 | b2d965c | 投递兜底 4 项测试 |
+| T5 | 082e219 | 队列 4 项测试 |
+| T6 | e5f13e9 | 看门狗 4 项新测试（持续有输出不误杀 / 静默判 stalled / 总上限 / token 回传） |
+| T7 | a4b3183 | 两段式 5 项测试 |
+| T8 | e07d0ba | 轮转 6 项测试 |
+| T9 | 48b6b88 | 路由 6 项 + thinkingLevel 透传 + 卡住重试 2 项 |
+| T4 | a8b0600 | index.js 接线、plist ExitTimeOut 40s |
+| T10 | ed04c7a | core 14.3KB + 手册 11.7KB；回归对比 P90 57s→30s；Q11 口径事故已修 |
+| T11 | 随各票 | 日志字段：msgid/route/thinkingLevel/mode/channel/stallRetries/inputTokens/timings |
+| review | 148c916 | 两轴 17 项发现，硬伤全修 |
+
+最终实测：`npm test` 121 项全绿，`npm run typecheck` 通过，模块层管线冒烟 4/4（快答流式 / 慢答转推送 / 同人串行 / 收件箱可恢复）。
+
+**未完成（需要虎老师）**：
+1. D1 测试机器人：代码侧已就绪，需要在企微后台新建 API 模式机器人并把 botId/secret 写进 `config/secrets.dev.json`。
+2. 第 7 节企微冒烟：生产机器人（pid 2650）仍在跑旧代码，起第二份会踢线，故未做。
+3. 上线：验收通过后合 master、重启 launchd 任务。
+4. Q8「60 家 vs 09-17 定过的 56 家」需要确认是增长还是口径变化。
