@@ -172,3 +172,106 @@ test("把 prompt 与 sessionId 传给 runner", async () => {
   assert.equal(seen.prompt, "我的问题");
   assert.equal(seen.sessionId, "wx-abc");
 });
+
+test("事件流持续有输出时不会因空闲判定被杀", async () => {
+  const runner = () => {
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.killed = false;
+    child.kill = () => {
+      child.killed = true;
+      return true;
+    };
+    let ticks = 0;
+    const timer = setInterval(() => {
+      ticks += 1;
+      child.stdout.emit("data", `${JSON.stringify({ type: "message_update" })}\n`);
+      if (ticks === 4) {
+        clearInterval(timer);
+        child.stdout.emit("data", `${textMessage("想清楚了")}\n`);
+        child.emit("close", 0);
+      }
+    }, 10);
+    return child;
+  };
+
+  const result = await runAgentTurn({
+    prompt: "问",
+    sessionId: "wx-abc",
+    runner,
+    idleTimeoutMs: 40,
+    hardTimeoutMs: 500,
+  });
+
+  assert.equal(result.text, "想清楚了");
+  assert.equal(result.stalled, false);
+  assert.equal(result.timedOut, false);
+});
+
+test("静默超过空闲阈值时判定卡住并杀掉进程", async () => {
+  const runner = () => {
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.killed = false;
+    child.kill = () => {
+      child.killed = true;
+      queueMicrotask(() => child.emit("close", null));
+      return true;
+    };
+    return child;
+  };
+
+  const result = await runAgentTurn({
+    prompt: "问",
+    sessionId: "wx-abc",
+    runner,
+    idleTimeoutMs: 30,
+    hardTimeoutMs: 5000,
+  });
+
+  assert.equal(result.stalled, true);
+  assert.equal(result.timedOut, false);
+});
+
+test("有进展也会被总时长上限截断", async () => {
+  const runner = () => {
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.killed = false;
+    child.kill = () => {
+      child.killed = true;
+      queueMicrotask(() => child.emit("close", null));
+      return true;
+    };
+    const timer = setInterval(() => child.stdout.emit("data", `${JSON.stringify({ type: "message_update" })}\n`), 10);
+    child.on("close", () => clearInterval(timer));
+    return child;
+  };
+
+  const result = await runAgentTurn({
+    prompt: "问",
+    sessionId: "wx-abc",
+    runner,
+    idleTimeoutMs: 100,
+    hardTimeoutMs: 60,
+  });
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.stalled, false);
+});
+
+test("回传上一轮的输入 token 数", async () => {
+  const runner = fakeRunner([
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "答案" }], usage: { input: 51234, output: 800 } },
+    }),
+  ]);
+
+  const result = await runAgentTurn({ prompt: "问", sessionId: "wx-abc", runner });
+
+  assert.equal(result.inputTokens, 51234);
+});
