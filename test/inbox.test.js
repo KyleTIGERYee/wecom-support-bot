@@ -149,3 +149,13 @@ test("超出窗口的未答问题可以通过 stale 查出来（只记日志用�
   assert.deepEqual(stale, ["old-open"]);
   assert.deepEqual(inbox.recoverable(NOW, WINDOW).map((entry) => entry.msgid), ["fresh-open"]);
 });
+
+test("消息记录缺 state 字段时仍当作待答（写入被截断也不丢单）", async () => {
+  const storePath = await tempStore();
+  await writeFile(storePath, `${JSON.stringify({ ...makeMessage(), state: undefined })}\n`, "utf8");
+
+  const inbox = createInbox({ storePath });
+  await inbox.load();
+
+  assert.deepEqual(inbox.recoverable(NOW, WINDOW).map((entry) => entry.msgid), ["m1"]);
+});

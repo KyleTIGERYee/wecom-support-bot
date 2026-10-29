@@ -37,11 +37,12 @@ export function createInbox({ storePath }) {
     for (const line of raw.split("\n")) {
       const record = parseLine(line);
       if (!record) continue;
-      if (record.state === "received") {
-        entries.set(record.msgid, record);
+      if (typeof record.question === "string") {
+        // 带正文的是消息记录；state 缺失（写到一半被截断）按「还没答」处理，宁可多补跑一次
+        entries.set(record.msgid, { ...record, state: record.state === "running" ? "running" : "received" });
       } else {
         const existing = entries.get(record.msgid);
-        if (existing) existing.state = record.state;
+        if (existing && typeof record.state === "string") existing.state = record.state;
       }
     }
     seen = new Set(entries.keys());
