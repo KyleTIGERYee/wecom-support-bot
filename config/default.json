@@ -38,7 +38,8 @@
     "enabled": true
   },
   "rotation": {
-    "idleMs": 14400000,
+    "idleMs": 86400000,
+    "maxAgeMs": 86400000,
     "maxInputTokens": 60000
   },
   "queue": {
