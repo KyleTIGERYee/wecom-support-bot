@@ -11,6 +11,8 @@
 
 判断依据：问题里的系统名、功能名、表名、模块名。拿不准就两边各搜一次看哪边有命中；如果两条线都涉及（比如小乐 AI 连着乐寓业务数据），说明覆盖范围，不要假设。
 
+**已知的一条踩坑，别再踩**：同事问「深梦扬帆报名」时，实时数据在**乐租租**（`ajly_flow` 的 `ajly_flow_sail_application`），按门店统计用 `store_name_snapshot`。乐寓侧那张 `ajly_management.ajly_smyf_info` **从 2026-08-11 起就停更了**，查它会得出"数据只到 8 月中"的错误结论——查之前先看一眼这张表的最新日期，如果不是近期就别拿它当答案。
+
 **硬边界**：`ajly_flow` 是乐租租的唯一业务库；`qft_*`、`ajly-house`、`ajly_tickets` 等是安居乐寓的库。不要用 lzz-db-wiki 查 qft_*，也不要用 ajly-db-wiki 查 ajly_flow。
 
 ## 知识库根目录
