@@ -61,6 +61,7 @@ test("回归加载记录区分查数手册、指标卡、表文档与 SQL", asyn
   const dbRoot = join(defaults.roots.knowledgeBase, "数据库/lzz-db-wiki");
   const paths = [
     join(projectDir, "prompts/data-playbook.md"),
+    join(dbRoot, ".lzz-db-wiki-evolution/common/机构经验.md"),
     join(dbRoot, "metrics/机构总数及类型分布.md"),
     join(dbRoot, "tables/ajly_flow/system_tenant.md"),
     join(dbRoot, "queries/机构总数.sql"),
@@ -71,8 +72,9 @@ test("回归加载记录区分查数手册、指标卡、表文档与 SQL", asyn
 const paths = ${JSON.stringify(paths)};
 for (const [index, path] of paths.entries()) {
   console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "read-" + index, toolName: "read", args: { path } }));
-  console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "read-" + index, toolName: "read", result: {}, isError: false }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "read-" + index, toolName: "read", result: path.endsWith(".sql") ? { content: "-- ✅ 已验证" } : {}, isError: false }));
 }
+console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "56 家" }] } }));
 `,
     { mode: 0o755 },
@@ -84,7 +86,11 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   });
 
   const [record] = JSON.parse(await readFile(out, "utf8"));
-  assert.deepEqual(record.loadedResources.map((resource) => resource.depth), ["playbook", "metrics", "table", "sql"]);
+  assert.deepEqual(record.loadedResources.map((resource) => resource.depth), ["playbook", "experience", "metrics", "table", "sql"]);
+  assert.deepEqual(record.loadedResources.map((resource) => resource.resourceType), ["playbook", "experience", "metrics", "table", "sql"]);
+  assert.equal(record.loadedResources.at(-1).verification, "verified");
+  assert.equal(record.answer, "56 家");
+  assert.equal(record.biTouched, true);
   assert.equal(record.loadDepth, "sql");
 });
 

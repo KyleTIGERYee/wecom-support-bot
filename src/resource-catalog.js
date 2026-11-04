@@ -1,6 +1,19 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
+const RESOURCE_PATH = {
+  playbook: /data-playbook|查数手册/i,
+  experience: /(?:^|\/)(?:\.[^/]*-evolution|evolution|经验)(?:\/|$)/i,
+  metrics: /(?:^|\/)metrics(?:\/|$)/i,
+  table: /(?:^|\/)tables(?:\/|$)/i,
+  sql: /\.sql$|(?:^|\/)queries(?:\/|$)/i,
+  timeline: /时间线|(?:^|\/)timeline(?:\.|\/|$)/i,
+  record: /(?:^|\/)raw\/(?:收件箱|records?|history)(?:\/|$)|当时记录/i,
+  decision: /(?:^|\/)(?:决策|decisions?)(?:\/|$)|决策资料/i,
+  project: /(?:^|\/)(?:projects?|项目|项目资料)(?:\/|$)|当前进展|项目进展/i,
+  raw: /(?:^|\/)raw(?:\/|$)/i,
+};
+
 /**
  * 默认实例的选择目录来自现有配置，不在主提示词中复制固定路径或资源正文。
  *
@@ -102,10 +115,12 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
         path,
         relativePath,
         depth: classifyResourceDepth(path),
+        resourceType: classifyResourceType(path),
         summary: metadata.summary,
         sourceTime,
         copiedAt,
         validity: metadata.validity ?? inferValidity(path),
+        verification: metadata.verification,
         rawSources: metadata.rawSources,
         rawBase: rawBaseFor(root, path),
       });
@@ -131,10 +146,12 @@ function formatEntry(entry) {
     `scope: ${entry.scope}`,
     `path: ${entry.path}`,
     `depth: ${entry.depth}`,
+    `resource_type: ${entry.resourceType}`,
     `source_time: ${entry.sourceTime}`,
     `copied_at: ${entry.copiedAt}`,
     `validity: ${entry.validity}`,
   ];
+  if (entry.verification) fields.push(`verification: ${entry.verification}`);
   if (entry.summary) fields.push(`summary: ${entry.summary}`);
   if (entry.rawSources.length > 0) {
     fields.push(`raw_source: ${entry.rawSources.join(", ")}`, `raw_base: ${entry.rawBase}`);
@@ -144,7 +161,14 @@ function formatEntry(entry) {
 
 /** @param {string} path */
 async function readMetadata(path) {
-  const empty = { summary: "", sourceTime: undefined, validity: undefined, rawSources: [] };
+  const empty = { summary: "", sourceTime: undefined, validity: undefined, verification: undefined, rawSources: [] };
+  if (/\.sql$/i.test(path)) {
+    const header = (await readFile(path, "utf8")).split("\n").slice(0, 12).join("\n");
+    return {
+      ...empty,
+      verification: parseSqlVerification(header),
+    };
+  }
   if (!/\.(?:md|markdown|txt)$/i.test(path)) return empty;
   const content = await readFile(path, "utf8");
   const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/)?.[1];
@@ -185,16 +209,49 @@ async function readMetadata(path) {
         ? "current"
         : undefined,
     rawSources,
+    verification: undefined,
   };
+}
+
+/** @param {string} header */
+function parseSqlVerification(header) {
+  if (/❌|已知问题|known[ -]issue/i.test(header)) return "known-issue";
+  if (/⚠️\s*未验证|未验证|\bnot[\s-]+verified\b|\bunverified\b|\bverified\s*:\s*(?:false|no|0)\b/i.test(header)) {
+    return "unverified";
+  }
+  return /✅\s*已验证|\bverified\b/i.test(header) ? "verified" : "unverified";
 }
 
 /** @param {string} path */
 export function classifyResourceDepth(path) {
-  if (/(?:^|\/)raw(?:\/|$)/i.test(path)) return "raw";
-  if (/data-playbook|查数手册/i.test(path)) return "playbook";
-  if (/(?:^|\/)metrics(?:\/|$)/i.test(path)) return "metrics";
-  if (/(?:^|\/)tables(?:\/|$)/i.test(path)) return "table";
-  if (/\.sql$|(?:^|\/)queries(?:\/|$)/i.test(path)) return "sql";
+  if (RESOURCE_PATH.experience.test(path)) return "experience";
+  if (RESOURCE_PATH.timeline.test(path) || RESOURCE_PATH.decision.test(path) || RESOURCE_PATH.project.test(path)) {
+    return "document";
+  }
+  if (RESOURCE_PATH.raw.test(path)) return "raw";
+  if (RESOURCE_PATH.playbook.test(path)) return "playbook";
+  if (RESOURCE_PATH.metrics.test(path)) return "metrics";
+  if (RESOURCE_PATH.table.test(path)) return "table";
+  if (RESOURCE_PATH.sql.test(path)) return "sql";
+  return "concept";
+}
+
+/**
+ * 目录和加载记录共用资源类型，避免历史记录、经验和表文档都被笼统当成普通正文。
+ *
+ * @param {string} path
+ */
+function classifyResourceType(path) {
+  if (RESOURCE_PATH.playbook.test(path)) return "playbook";
+  if (RESOURCE_PATH.experience.test(path)) return "experience";
+  if (RESOURCE_PATH.metrics.test(path)) return "metrics";
+  if (RESOURCE_PATH.table.test(path)) return "table";
+  if (RESOURCE_PATH.sql.test(path)) return "sql";
+  if (RESOURCE_PATH.timeline.test(path)) return "timeline";
+  if (RESOURCE_PATH.record.test(path)) return "record";
+  if (RESOURCE_PATH.decision.test(path)) return "decision";
+  if (RESOURCE_PATH.project.test(path)) return "project";
+  if (RESOURCE_PATH.raw.test(path)) return "raw";
   return "concept";
 }
 
@@ -203,8 +260,9 @@ export function classifyResourceDepth(path) {
  *
  * @param {string} path
  * @param {Array<any>} catalog
+ * @param {string|undefined} readContent
  */
-export function findCatalogResource(path, catalog) {
+export function findCatalogResource(path, catalog, readContent = undefined) {
   const exact = catalog.find((entry) => entry.path === path);
   const entry =
     exact ??
@@ -212,21 +270,26 @@ export function findCatalogResource(path, catalog) {
       .filter((candidate) => candidate.directory && path.startsWith(`${candidate.path}/`))
       .sort((a, b) => b.path.length - a.path.length)[0];
   if (!entry) return null;
+  const resourceType = entry.resourceType ?? classifyResourceType(path);
+  const verification =
+    entry.verification ?? (resourceType === "sql" && readContent ? parseSqlVerification(readContent) : undefined);
   return {
     source: entry.source,
     path,
     depth: entry.directory ? classifyResourceDepth(path) : entry.depth,
+    resourceType,
     ...(Object.hasOwn(entry, "sourceTime") ? { sourceTime: entry.sourceTime } : {}),
     ...(Object.hasOwn(entry, "copiedAt") ? { copiedAt: entry.copiedAt } : {}),
     ...(entry.validity ? { validity: entry.validity } : {}),
     ...(entry.scope ? { scope: entry.scope } : {}),
+    ...(verification ? { verification } : {}),
   };
 }
 
 /** @param {Array<{depth: string}>} resources */
 export function getLoadDepth(resources) {
   /** @type {Record<string, number>} */
-  const ranks = { catalog: 0, concept: 1, document: 1, playbook: 2, metrics: 2, table: 3, sql: 3, raw: 4 };
+  const ranks = { catalog: 0, concept: 1, document: 1, playbook: 2, metrics: 2, experience: 3, table: 3, sql: 4, raw: 5 };
   let deepest = "catalog";
   for (const resource of resources) {
     if ((ranks[resource.depth] ?? 1) >= (ranks[deepest] ?? 0)) deepest = resource.depth;

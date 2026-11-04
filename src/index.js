@@ -266,7 +266,7 @@ async function main() {
         sessionKey,
         deps: {
           state,
-          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook },
+          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries },
           runAgent: async ({ prompt, sessionId }) => {
             const agentStartedAt = Date.now();
             const agentTurn = await runAgentTurn({

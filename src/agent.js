@@ -202,7 +202,7 @@ export async function runAgentTurn({
             } else if (parsed.readCompleted) {
               const path = parsed.readPath ?? pendingReads.get(parsed.completedReadId ?? "");
               if (parsed.completedReadId) pendingReads.delete(parsed.completedReadId);
-              const resource = path && !parsed.readFailed ? findCatalogResource(path, resourceCatalog) : null;
+              const resource = path && !parsed.readFailed ? findCatalogResource(path, resourceCatalog, parsed.readContent) : null;
               if (resource && !loadedResources.some((loaded) => loaded.path === resource.path)) {
                 loadedResources.push(resource);
               }
@@ -226,7 +226,7 @@ export async function runAgentTurn({
  * 解析单行 JSONL 事件，提取对该轮有意义的信息。
  *
  * @param {string} line
- * @returns {{text?: string, contextInsufficient?: boolean, biTouched?: boolean, inputTokens?: number, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean} | null}
+ * @returns {{text?: string, contextInsufficient?: boolean, biTouched?: boolean, inputTokens?: number, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean, readContent?: string} | null}
  */
 function parseEvent(line) {
   const trimmed = line.trim();
@@ -256,10 +256,17 @@ function parseEvent(line) {
 
   if (event?.type === "tool_execution_end" && event.toolName === "read") {
     const path = event.args?.path ?? event.input?.path;
+    const readContent =
+      event.result !== undefined
+        ? typeof event.result === "string"
+          ? event.result
+          : JSON.stringify(event.result)
+        : undefined;
     return {
       readCompleted: true,
       completedReadId: event.toolCallId,
       ...(typeof path === "string" ? { readPath: path } : {}),
+      ...(readContent ? { readContent } : {}),
       readFailed: Boolean(event.isError),
     };
   }

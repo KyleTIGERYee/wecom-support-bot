@@ -66,7 +66,7 @@ for (const item of picked) {
     deps: {
       // 每题独立状态；review 是不调用真实 Guard 模型的 ALLOW 替身。
       state: { isBiTouched: () => false, markBiTouched: () => {}, flush: async () => {} },
-      context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook },
+      context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries },
       runAgent: async ({ prompt, sessionId }) => {
         const agentTurn = await runAgentTurn({
           prompt,

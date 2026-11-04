@@ -181,7 +181,7 @@ async function ask(args) {
     sessionKey,
     deps: {
       state,
-      context: { catalog: context.text, dataPlaybook: context.dataPlaybook },
+      context: { catalog: context.text, dataPlaybook: context.dataPlaybook, entries: context.entries },
       runAgent: async ({ prompt, sessionId }) => {
         const turn = await runAgentTurn({
           prompt,

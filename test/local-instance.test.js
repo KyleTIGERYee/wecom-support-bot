@@ -467,6 +467,253 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   assert.equal(calls[0].systemPrompt.includes("RAW_FULL_BODY"), false);
 });
 
+test("本地查数公开记录经验、指标、SQL 校验状态与表文档的加载", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared-data");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  const files = {
+    playbook: join(source, "prompts/data-playbook.md"),
+    experience: join(source, ".lzz-db-wiki-evolution/common/机构经验.md"),
+    metrics: join(source, "metrics/机构总数.md"),
+    verifiedSql: join(source, "queries/机构总数.sql"),
+    unverifiedSql: join(source, "queries/机构无标记参考.sql"),
+    explicitUnverifiedSql: join(source, "queries/机构显式未验证.sql"),
+    notVerifiedSql: join(source, "queries/机构英文否定.sql"),
+    falseVerifiedSql: join(source, "queries/机构布尔否定.sql"),
+    knownIssueSql: join(source, "queries/机构已知问题.sql"),
+    table: join(source, "tables/ajly_flow/system_tenant.md"),
+  };
+  for (const path of Object.values(files)) await mkdir(dirname(path), { recursive: true });
+  await writeFile(files.playbook, "查数必须先确认经验、指标、SQL 和表文档。\n");
+  await writeFile(files.experience, "机构统计不能使用门店品牌配置表。\n");
+  await writeFile(files.metrics, "---\nupdated: 2026-11-01\nstatus: current\n---\n机构总数只统计有效入驻机构。\n");
+  await writeFile(files.verifiedSql, "-- ✅ 已验证\nSELECT tenant_id FROM system_tenant WHERE deleted = 0;\n");
+  await writeFile(files.unverifiedSql, "SELECT tenant_id FROM system_tenant;\n");
+  await writeFile(files.explicitUnverifiedSql, "-- ⚠️ 未验证\nSELECT tenant_id FROM system_tenant;\n");
+  await writeFile(files.notVerifiedSql, "-- not verified\nSELECT tenant_id FROM system_tenant;\n");
+  await writeFile(files.falseVerifiedSql, "-- verified:false\nSELECT tenant_id FROM system_tenant;\n");
+  await writeFile(files.knownIssueSql, "-- ❌ 已知问题\nSELECT tenant_id FROM system_tenant;\n");
+  await writeFile(files.table, "system_tenant 的 tenant_id 是机构标识，deleted 是软删标记。\n");
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const localFiles = Object.fromEntries(
+    Object.entries(files).map(([key, path]) => [key, path.replace(source, join(instanceDir, "context/001-shared-data"))]),
+  );
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+const prompt = process.argv.at(-1);
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ prompt }) + "\\n");
+const files = ${JSON.stringify(localFiles)};
+let paths = [];
+let answer = "";
+if (prompt.includes("继续完成数据口径任务")) {
+  paths = [
+    files.verifiedSql,
+    files.unverifiedSql,
+    files.explicitUnverifiedSql,
+    files.notVerifiedSql,
+    files.falseVerifiedSql,
+    files.knownIssueSql,
+    files.table,
+  ];
+  const verified = readFileSync(files.verifiedSql, "utf8").includes("✅ 已验证");
+  const table = readFileSync(files.table, "utf8").includes("tenant_id");
+  answer = verified && table ? "机构总数按当前指标口径统计；已验证 SQL 仅供参照，未验证参考不作为确认事实。" : "缺少可核对的 SQL 或表文档";
+} else if (prompt.includes("原始问题：")) {
+  paths = [files.playbook, files.experience, files.metrics];
+  answer = "CONTEXT_INSUFFICIENT\\n指标口径已确认，还缺 SQL 关联与表字段核对";
+} else {
+  answer = "CONTEXT_INSUFFICIENT\\n目录摘要没有机构统计口径";
+}
+for (const [index, path] of paths.entries()) {
+  console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "read-" + index, toolName: "read", args: { path } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "read-" + index, toolName: "read", result: {}, isError: false }));
+}
+if (prompt.includes("继续完成数据口径任务")) {
+  console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+}
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "查一下乐租租机构总数", "--session-key", "data-colleague"],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog } },
+  );
+
+  assert.match(result.finalText, /未验证参考不作为确认事实/);
+  assert.equal(result.guarded, true);
+  assert.deepEqual(
+    result.loadedResources.map((resource) => resource.resourceType),
+    ["playbook", "experience", "metrics", "sql", "sql", "sql", "sql", "sql", "sql", "table"],
+  );
+  assert.deepEqual(
+    result.loadedResources.filter((resource) => resource.resourceType === "sql").map((resource) => resource.verification),
+    ["verified", "unverified", "unverified", "unverified", "unverified", "known-issue"],
+  );
+  assert.equal(result.loadedResources.find((resource) => resource.resourceType === "metrics").sourceTime, "2026-11-01");
+  assert.equal(result.loadDepth, "sql");
+  const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].prompt.includes("机构统计不能使用门店品牌配置表"), false);
+  assert.match(calls[0].prompt, /resource_type: experience/);
+  assert.match(calls[0].prompt, /verification: verified/);
+  assert.match(calls[0].prompt, /verification: unverified/);
+  assert.match(calls[0].prompt, /verification: known-issue/);
+});
+
+test("本地历史问答公开共享时间线、当时记录和决策资料的来源时间", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared-memory");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const files = {
+    timeline: join(source, "wiki/时间线.md"),
+    record: join(source, "raw/收件箱/2026-08-01--审批讨论.md"),
+    decision: join(source, "wiki/决策/退租审批.md"),
+  };
+  for (const path of Object.values(files)) await mkdir(dirname(path), { recursive: true });
+  await writeFile(files.timeline, "---\nupdated: 2026-08-03\n---\n2026-08-01 讨论退租审批调整。\n");
+  await writeFile(
+    files.record,
+    "---\nsource_time: 2026-08-01\nstatus: history\n---\n当时讨论认为一级审批缺少业务复核。\n",
+  );
+  await writeFile(
+    files.decision,
+    "---\nsource_time: 2026-08-02\nstatus: history\n---\n当时决定调整为两级审批。\n",
+  );
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const localFiles = Object.fromEntries(
+    Object.entries(files).map(([key, path]) => [key, path.replace(source, join(instanceDir, "context/001-shared-memory"))]),
+  );
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const prompt = process.argv.at(-1);
+const files = ${JSON.stringify(localFiles)};
+const deepened = prompt.includes("原始问题：");
+const paths = deepened ? [files.record, files.decision] : [files.timeline];
+for (const [index, path] of paths.entries()) {
+  readFileSync(path, "utf8");
+  console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "history-" + index, toolName: "read", args: { path } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "history-" + index, toolName: "read", result: {}, isError: false }));
+}
+const answer = deepened
+  ? "2026 年 8 月 1 日的当时记录说明缺少业务复核，8 月 2 日拍板改为两级审批。"
+  : "CONTEXT_INSUFFICIENT\\n时间线只有调整时间，缺少当时讨论和决策依据";
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const result = await runCli(
+    [
+      "ask",
+      "--instance-dir",
+      instanceDir,
+      "--question",
+      "退租审批当时为什么改成两级？",
+      "--session-key",
+      "history-colleague",
+    ],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi } },
+  );
+
+  assert.match(result.finalText, /8 月 2 日拍板/);
+  assert.deepEqual(
+    result.loadedResources.map((resource) => resource.resourceType),
+    ["timeline", "record", "decision"],
+  );
+  assert.deepEqual(
+    result.loadedResources.map((resource) => resource.sourceTime),
+    ["2026-08-03", "2026-08-01", "2026-08-02"],
+  );
+  assert.ok(result.loadedResources.every((resource) => resource.scope === "shared"));
+  assert.equal(result.loadDepth, "raw");
+});
+
+test("本地当前进展只读取最新且明确有效的共享项目资料", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared-projects");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const oldPath = join(source, "projects/房源审核/历史讨论.md");
+  const currentPath = join(source, "projects/房源审核/当前进展.md");
+  await mkdir(dirname(oldPath), { recursive: true });
+  await writeFile(
+    oldPath,
+    "---\nsource_time: 2026-09-01\nstatus: history\n---\nOLD_PROGRESS：当时仍在讨论方案。\n",
+  );
+  await writeFile(
+    currentPath,
+    "---\nsource_time: 2026-11-03\nstatus: current\n---\nCURRENT_PROGRESS：正在联调，尚未上线。\n",
+  );
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const prompt = process.argv.at(-1);
+const candidates = prompt.split("\\n").flatMap((line) => {
+  if (!line.includes("resource_type: project") || !line.includes("scope: shared")) return [];
+  const path = line.match(/\\| path: ([^|]+?) \\|/)?.[1]?.trim();
+  const sourceTime = line.match(/source_time: ([^|]+?) \\|/)?.[1]?.trim();
+  const validity = line.match(/validity: ([^|]+?)(?: \\||$)/)?.[1]?.trim();
+  return path ? [{ path, sourceTime, validity }] : [];
+});
+candidates.sort((a, b) => b.sourceTime.localeCompare(a.sourceTime));
+const selected = candidates.find((candidate) => candidate.validity === "current");
+let answer = "缺少最新共享项目资料";
+if (selected) {
+  const content = readFileSync(selected.path, "utf8");
+  console.log(JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: selected.path } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolName: "read", args: { path: selected.path }, isError: false }));
+  if (content.includes("CURRENT_PROGRESS")) answer = "截至 2026 年 11 月 3 日正在联调，尚未上线。";
+}
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "房源审核目前进展如何？", "--session-key", "progress-colleague"],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi } },
+  );
+
+  assert.equal(result.finalText, "截至 2026 年 11 月 3 日正在联调，尚未上线。");
+  assert.equal(result.loadedResources.length, 1);
+  assert.equal(result.loadedResources[0].resourceType, "project");
+  assert.equal(result.loadedResources[0].path, join(instanceDir, "context/001-shared-projects/projects/房源审核/当前进展.md"));
+  assert.equal(result.loadedResources[0].sourceTime, "2026-11-03");
+  assert.equal(result.loadedResources[0].validity, "current");
+});
+
 test("空白实例的来源也必须明确共享或个人私有范围", async (t) => {
   const root = await makeTempDir(t);
   const models = await startModelServer();

@@ -5,6 +5,8 @@
  * 让它重写，绝不把原答复带给调用方。
  */
 
+import { dirname } from "node:path";
+
 import { getLoadDepth } from "./resource-catalog.js";
 
 const DEFAULT_MAX_ROUNDS = 3;
@@ -13,19 +15,33 @@ const DEFAULT_ERROR_TEXT = "刚才没处理好，你再问一次？";
 const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找虎老师更快。";
 
 /**
+ * @typedef {{
+ *   source: string,
+ *   path: string,
+ *   depth: string,
+ *   resourceType?: string,
+ *   sourceTime?: string|null,
+ *   copiedAt?: string|null,
+ *   validity?: string,
+ *   scope?: string,
+ *   verification?: string
+ * }} LoadedResource
+ */
+
+/**
  * @param {{
  *   question: string,
  *   sessionKey: string,
  *   deps: {
  *     state: {isBiTouched: (key: string) => boolean, markBiTouched: (key: string) => void, flush: () => Promise<void>},
- *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, contextInsufficient?: boolean, loadedResources?: Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>}>,
+ *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, contextInsufficient?: boolean, loadedResources?: Array<LoadedResource>}>,
  *     review: (options: {answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>,
- *     context?: {catalog?: string, dataPlaybook?: boolean}
+ *     context?: {catalog?: string, dataPlaybook?: boolean, entries?: Array<LoadedResource>}
  *   },
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
  * }} options
- * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string, loadedResources: Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>, loadDepth: string}>}
+ * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string, loadedResources: Array<LoadedResource>, loadDepth: string}>}
  */
 export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
@@ -33,12 +49,13 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
   const errorText = messages.errorText ?? DEFAULT_ERROR_TEXT;
   const timeoutText = messages.timeoutText ?? DEFAULT_TIMEOUT_TEXT;
 
-  let prompt = buildInitialPrompt(question, deps.context?.catalog);
+  const knowledgeTask = classifyKnowledgeTask(question);
+  let prompt = buildInitialPrompt(question, deps.context?.catalog, knowledgeTask);
   let lastDenyReason = "";
   let rounds = 0;
   let stallRetries = 0;
   let needGuard = state.isBiTouched(sessionKey);
-  /** @type {Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>} */
+  /** @type {Array<LoadedResource>} */
   const loadedResources = [];
   const observation = () => ({
     loadedResources: loadedResources.map((resource) => ({ ...resource })),
@@ -52,7 +69,14 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     const { turn, retries } = await runWithProgressiveDepth(
       runAgent,
       { prompt, sessionId: sessionKey, isRework },
-      { question, catalog: deps.context?.catalog, dataPlaybook: deps.context?.dataPlaybook, loadedResources },
+      {
+        question,
+        task: knowledgeTask,
+        catalog: deps.context?.catalog,
+        catalogEntries: deps.context?.entries ?? [],
+        dataPlaybook: deps.context?.dataPlaybook,
+        loadedResources,
+      },
     );
     stallRetries += retries;
 
@@ -108,24 +132,86 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
  *
  * @param {string} question
  * @param {string|undefined} catalog
+ * @param {"concept"|"data"|"history"|"progress"} task
  */
-function buildInitialPrompt(question, catalog) {
+function buildInitialPrompt(question, catalog, task) {
   if (!catalog) return question;
-  return [
+  const lines = [
     question,
     "",
     "[渐进式资源目录]",
     "以下目录只用于选择资料，不是资料正文。先用目录和摘要定位，再按需读取概念页；只有当前内容不足以可靠回答时才继续读取相关原始资料。",
     "如果读完概念内容仍不足以可靠回答，请在答复第一行输出 CONTEXT_INSUFFICIENT 并说明缺口；内容充分时正常回答，不输出该标记。",
-    catalog,
-  ].join("\n");
+  ];
+  if (task === "data") lines.push(...buildDataPrompt(question, "initial"));
+  else if (task === "history") lines.push(...buildHistoryPrompt(question, "initial"));
+  else if (task === "progress") lines.push(...buildProgressPrompt(question, "initial"));
+  lines.push(catalog);
+  return lines.join("\n");
+}
+
+/** @param {string} question @param {"initial"|"metrics"|"sql"} phase */
+function buildDataPrompt(question, phase) {
+  if (phase === "initial") {
+    return [
+      "[知识任务路由：数据口径]",
+      "先确定业务口径，再按手册组合相关历史经验、指标卡、SQL 参考和表文档；不要只搜表名或凭概念页直接给数字。",
+    ];
+  }
+  if (phase === "metrics") {
+    return [
+      `原始问题：${question}`,
+      "这是查数或数据口径任务。先按需读取目录中的 data-playbook 查数手册，再读取相关历史经验和指标卡，确认业务定义、排除条件与统计时间轴；不要凭记忆直接给数字。",
+      "新旧口径同时存在时，优先 source_time 最新且 validity=current、明确拍板或生效的资料；history 和历史讨论只用于解释旧口径。无法消解的冲突必须在答复中说明。",
+    ];
+  }
+  return [
+    `原始问题：${question}`,
+    "继续完成数据口径任务：按已确定的指标口径读取相关 SQL 参考和表文档，核对真实表字段、JOIN 条件与过滤条件。",
+    "已验证 SQL 只能作为已验证关联路径的参考；未验证、已知问题或没有校验标记的 SQL 不得当成已确认事实，必须重新验证。",
+    "不要只凭 SQL 文件名或表名作答。资料仍不足时明确缺少经验、指标卡、SQL 或表文档中的哪一项，以及还缺什么信息。",
+  ];
+}
+
+/** @param {string} question @param {"initial"|"deepen"} phase */
+function buildHistoryPrompt(question, phase) {
+  if (phase === "initial") {
+    return [
+      "[知识任务路由：历史事件]",
+      "先读共享时间线（仅限明确共享的来源）定位时间和相关事项，再按需读取当时记录与决策资料；保留 source_time，不用当前规则倒推当时情况。",
+    ];
+  }
+  const lines = [
+    `原始问题：${question}`,
+    "这是历史事件任务。先确认已读取共享时间线；若尚未读取就先定位，再只继续读取明确共享的当时记录与相关决策资料，核对事情发生的时间和原因。不要用当前资料替代当时记录；缺少时间线、当时记录或决策依据时明确说出缺口。",
+  ];
+  if (needsCurrentProgress(question)) {
+    lines.push(
+      "问题还追问当前进展：另读最新共享项目资料，优先 source_time 最新且 validity=current、明确拍板的记录；history 或其他历史资料只回答当时，不能覆盖当前。新旧资料冲突且无法消解时，必须在答复中说明冲突。",
+    );
+  }
+  return lines;
+}
+
+/** @param {string} question @param {"initial"|"deepen"} phase */
+function buildProgressPrompt(question, phase) {
+  if (phase === "initial") {
+    return [
+      "[知识任务路由：当前进展]",
+      "只从明确共享的项目资料中选择最新进展：结合 source_time 与 validity=current 判断有效版本，history 和早期讨论只能作背景，不能当成现状；无法确认最新时间或拍板结论时明确说明。",
+    ];
+  }
+  return [
+    `原始问题：${question}`,
+    "这是当前进展任务。只读明确共享且与问题相关的项目资料，按 source_time 和 validity=current 选择最新有效记录。不要用 history 或早期讨论冒充现状；无法确认最新时间、拍板结论或资料相互冲突时明确说明。",
+  ];
 }
 
 /**
  * 合并实际读取记录，保留来源、时间和每次读取的深度。
  *
- * @param {Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>} target
- * @param {Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>|undefined} incoming
+ * @param {Array<LoadedResource>} target
+ * @param {Array<LoadedResource>|undefined} incoming
  */
 function mergeLoadedResources(target, incoming) {
   for (const resource of incoming ?? []) {
@@ -141,29 +227,52 @@ function mergeLoadedResources(target, incoming) {
  *
  * @param {(options: any) => Promise<any>} runAgent
  * @param {any} options
- * @param {{question: string, catalog?: string, dataPlaybook?: boolean, loadedResources: Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>}} context
+ * @param {{question: string, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, loadedResources: Array<LoadedResource>}} context
  */
 async function runWithProgressiveDepth(
   runAgent,
   options,
-  { question, catalog, dataPlaybook, loadedResources },
+  { question, task, catalog, catalogEntries = [], dataPlaybook, loadedResources },
 ) {
   const first = await runWithStallRetry(runAgent, options);
   for (const attempt of first.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
   if (!catalog || options.isRework || first.turn.failed || first.turn.timedOut || first.turn.stalled) return first;
 
-  const rawNeeded = first.turn.contextInsufficient && !loadedResources.some((resource) => resource.depth === "raw");
+  const dataTask = task === "data";
+  const historyTask = task === "history";
+  const progressTask = task === "progress";
+  const rawNeeded =
+    !dataTask &&
+    !historyTask &&
+    !progressTask &&
+    first.turn.contextInsufficient &&
+    !loadedResources.some((resource) => resource.depth === "raw");
   const playbookNeeded =
     dataPlaybook &&
-    needsDataPlaybook(question) &&
+    dataTask &&
     first.turn.contextInsufficient &&
     !loadedResources.some((resource) => resource.depth === "playbook");
-  if (!rawNeeded && !playbookNeeded) return first;
-
-  const instructions = [`原始问题：${question}`];
-  if (playbookNeeded) {
-    instructions.push("这是查数或数据口径任务。先读取目录中的 data-playbook 查数手册，再按手册完成回答；不要凭记忆直接给数字。");
+  const dataEvidenceNeeded = dataTask && getMissingDataEvidence(loadedResources, question, first.turn.biTouched).length > 0;
+  const historyEvidenceNeeded = historyTask && getMissingHistoryEvidence(loadedResources, question, catalogEntries).length > 0;
+  const progressEvidenceNeeded = progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries);
+  if (
+    !rawNeeded &&
+    !playbookNeeded &&
+    !((dataTask || historyTask || progressTask) && first.turn.contextInsufficient) &&
+    !dataEvidenceNeeded &&
+    !historyEvidenceNeeded &&
+    !progressEvidenceNeeded
+  ) {
+    return first;
   }
+
+  const instructions = dataTask
+    ? buildDataPrompt(question, "metrics")
+    : historyTask
+      ? buildHistoryPrompt(question, "deepen")
+      : progressTask
+        ? buildProgressPrompt(question, "deepen")
+        : [`原始问题：${question}`];
   if (rawNeeded) {
     instructions.push(
       "当前概念页或摘要不足以可靠回答具体规则。请只继续读取目录中与本问题相关的 raw 原始资料（优先概念页列出的 raw_source），保留资料的来源和时间。",
@@ -173,15 +282,172 @@ async function runWithProgressiveDepth(
 
   const second = await runWithStallRetry(runAgent, { ...options, prompt: instructions.join("\n") });
   for (const attempt of second.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  const sharedMissing = historyTask
+    ? getMissingHistoryEvidence(loadedResources, question, catalogEntries)
+    : progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries)
+      ? ["最新且明确有效的共享项目资料"]
+      : [];
+  const dataNeedsThird =
+    dataTask &&
+    (second.turn.contextInsufficient ||
+      getMissingDataEvidence(loadedResources, question, Boolean(first.turn.biTouched || second.turn.biTouched)).length > 0);
+  if (!dataTask || !dataNeedsThird || second.turn.failed || second.turn.timedOut || second.turn.stalled) {
+    return {
+      turn: {
+        ...second.turn,
+        text:
+          (second.turn.contextInsufficient || sharedMissing.length > 0) && (historyTask || progressTask)
+            ? buildSharedInsufficientText(task, second.turn.text, sharedMissing)
+            : second.turn.text,
+        biTouched: Boolean(first.turn.biTouched || second.turn.biTouched),
+      },
+      retries: first.retries + second.retries,
+    };
+  }
+
+  const third = await runWithStallRetry(runAgent, {
+    ...options,
+    prompt: buildDataPrompt(question, "sql").join("\n"),
+  });
+  for (const attempt of third.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  const dataMissing = getMissingDataEvidence(
+    loadedResources,
+    question,
+    Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched),
+  );
   return {
-    turn: { ...second.turn, biTouched: Boolean(first.turn.biTouched || second.turn.biTouched) },
-    retries: first.retries + second.retries,
+    turn: {
+      ...third.turn,
+      text: third.turn.contextInsufficient || dataMissing.length > 0 ? buildDataInsufficientText(dataMissing) : third.turn.text,
+      biTouched: Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched),
+    },
+    retries: first.retries + second.retries + third.retries,
   };
+}
+
+/** @param {LoadedResource} resource */
+function isCurrentSharedProject(resource) {
+  return (
+    (resource.resourceType ?? resource.depth) === "project" &&
+    resource.scope === "shared" &&
+    resource.validity === "current" &&
+    Boolean(resource.sourceTime)
+  );
+}
+
+/** @param {Array<LoadedResource>} resources @param {Array<LoadedResource>} catalogEntries */
+function hasCurrentProjectEvidence(resources, catalogEntries) {
+  const currentProjects = (/** @type {Array<LoadedResource>} */ candidates, /** @type {string} */ group) =>
+    candidates.filter((resource) => isCurrentSharedProject(resource) && dirname(resource.path) === group);
+  return resources.some((resource) => {
+    if (!isCurrentSharedProject(resource)) return false;
+    const group = dirname(resource.path);
+    const catalogProjects = currentProjects(catalogEntries, group);
+    const candidates = catalogProjects.length > 0 ? catalogProjects : currentProjects(resources, group);
+    const latestTime = candidates.reduce((latest, candidate) =>
+      String(candidate.sourceTime).localeCompare(latest) > 0 ? String(candidate.sourceTime) : latest, "");
+    return resource.sourceTime === latestTime;
+  });
+}
+
+/** @param {Array<LoadedResource>} resources @param {string} question @param {Array<LoadedResource>} catalogEntries */
+function getMissingHistoryEvidence(resources, question, catalogEntries) {
+  const hasShared = (/** @type {string[]} */ types) =>
+    resources.some(
+      (resource) => types.includes(resource.resourceType ?? resource.depth) && resource.scope === "shared",
+    );
+  const missing = [];
+  if (!hasShared(["timeline"])) missing.push("共享时间线");
+  if (!hasShared(["record"])) missing.push("当时记录");
+  if (needsCurrentProgress(question) && !hasCurrentProjectEvidence(resources, catalogEntries)) {
+    missing.push("最新且明确有效的共享项目资料");
+  }
+  return missing;
+}
+
+/** @param {"history"|"progress"} task @param {string} detail @param {string[]} missing */
+function buildSharedInsufficientText(task, detail, missing) {
+  const safeDetail = /冲突|缺少|不足|无法|不能确认|未提供/.test(detail) ? `\n${detail}` : "";
+  const base =
+    task === "history"
+      ? "现有共享资料不足或存在未消解冲突，没法可靠还原当时情况。请补充对应时间的共享时间线、当时记录或明确拍板的决策资料。"
+      : "现有共享项目资料不足或存在未消解冲突，没法可靠确认当前进展。请补充最新且明确拍板的共享项目资料与生效时间。";
+  return `${base}${missing.length > 0 ? `\n缺少：${missing.join("、")}。` : ""}${safeDetail}`;
+}
+
+/**
+ * 查数证据由编排层验收，不依赖模型自报不足。口径题需要经验和指标；具体数字、
+ * 字段或 SQL 任务还需要 SQL 参考和表文档。
+ *
+ * @param {Array<LoadedResource>} resources
+ * @param {string} question
+ * @param {boolean} biTouched
+ */
+function getMissingDataEvidence(resources, question, biTouched) {
+  const has = (/** @type {string} */ type) =>
+    resources.some((resource) => (resource.resourceType ?? resource.depth) === type);
+  const missing = [
+    ...(!has("experience") ? ["相关历史经验"] : []),
+    ...(!has("metrics") ? ["对应指标卡"] : []),
+  ];
+  const actualDataQuery = isActualDataQuery(question);
+  const needsSqlAndTable = actualDataQuery || /SQL|表文档|字段|JOIN|关联/i.test(question);
+  if (needsSqlAndTable) {
+    if (!resources.some((resource) => (resource.resourceType ?? resource.depth) === "sql" && resource.verification === "verified")) {
+      missing.push("已验证 SQL");
+    }
+    if (!has("table")) missing.push("相关表文档");
+  }
+  if (actualDataQuery && !biTouched) missing.push("本轮只读 BI 查询验证");
+  return missing;
+}
+
+/** @param {string} question */
+function isActualDataQuery(question) {
+  const asksQuantity = /多少|几个|几家/.test(question);
+  if (/口径|定义|区别|怎么算|如何计算|是什么|什么意思/.test(question) && !asksQuantity) return false;
+  return (
+    asksQuantity ||
+    /查数|查一下|查查|查询|统计|生产数据/.test(question) ||
+    (/(?:现在|目前|当前|截至|本月|今年|今天|\d+月)/.test(question) &&
+      /总数|数量|签约量|预约量|出租率|退租率|续约率|空置率|转化率/.test(question))
+  );
+}
+
+/** @param {string[]} missing */
+function buildDataInsufficientText(missing) {
+  return `现有共享资料不足，没法可靠确认这个数据。缺少：${missing.join("、") || "可核对的字段关联或统计范围"}。请补充对应共享资料或明确统计范围。`;
+}
+
+/** @param {string} question */
+function classifyKnowledgeTask(question) {
+  if (needsDataPlaybook(question)) return "data";
+  if (/历史|当时|之前|以前|过去|曾经|原先|来龙去脉|决策原因|为什么(?:改|调整|决定)/.test(question)) return "history";
+  if (needsCurrentProgress(question)) return "progress";
+  return "concept";
+}
+
+/** @param {string} question */
+function needsCurrentProgress(question) {
+  if (/状态(?:有哪些|列表|枚举)|(?:有哪些|哪些)[^？\n]*状态/.test(question)) return false;
+  return (
+    /进展如何|项目进展|最新进展|当前进展/.test(question) ||
+    (/当前|目前|现在|最新/.test(question) &&
+      /项目|需求|功能|开发|上线|同步|联调|排期|进展|完成|推进|关闭|下线|发布|迭代|版本/.test(question))
+  );
 }
 
 /** @param {string} question */
 function needsDataPlaybook(question) {
-  return /生产数据|查数|统计|口径|SQL|签约量|预约量|出租率|退租率|续约率|多少/i.test(question);
+  if (
+    /(?:多少|几)(?:种|类)|哪些(?:类型|种类)/.test(question) &&
+    !/生产数据|查数|查一下|统计|口径|SQL|现在|目前|当前|总数|数量|几个|几家/i.test(question)
+  ) {
+    return false;
+  }
+  return /生产数据|查数|查一下|统计|口径|SQL|签约量|预约量|出租率|退租率|续约率|空置率|转化率|总数|数量|机构数|多少|几个|几家/i.test(
+    question,
+  );
 }
 
 /**
