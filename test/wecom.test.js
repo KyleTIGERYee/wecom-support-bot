@@ -92,3 +92,50 @@ test("没有 msgid 时归一化成 null（交给上层兜底）", () => {
 
   assert.equal(message.msgid, null);
 });
+
+test("纯图片消息归一化出 images，没有文字也不丢弃", () => {
+  const frame = {
+    body: {
+      msgtype: "image",
+      image: { url: "https://example.com/img1", aeskey: "key1" },
+      from: { userid: "zhangsan" },
+      msgid: "m1",
+    },
+  };
+
+  const message = normalizeMessage(frame);
+
+  assert.notEqual(message, null);
+  assert.equal(message.text, "");
+  assert.deepEqual(message.images, [{ url: "https://example.com/img1", aeskey: "key1" }]);
+});
+
+test("图文混排同时取出文字和图片", () => {
+  const frame = {
+    body: {
+      msgtype: "mixed",
+      mixed: {
+        msg_item: [
+          { msgtype: "text", text: { content: "这个报错怎么回事" } },
+          { msgtype: "image", image: { url: "https://example.com/img2", aeskey: "key2" } },
+          { msgtype: "image", image: { url: "https://example.com/img3" } },
+        ],
+      },
+      from: { userid: "zhangsan" },
+    },
+  };
+
+  const message = normalizeMessage(frame);
+
+  assert.equal(message.text, "这个报错怎么回事");
+  assert.deepEqual(message.images, [
+    { url: "https://example.com/img2", aeskey: "key2" },
+    { url: "https://example.com/img3", aeskey: undefined },
+  ]);
+});
+
+test("纯文本消息 images 为空数组", () => {
+  const frame = { body: { text: { content: "退租怎么算" }, from: { userid: "zhangsan" } } };
+
+  assert.deepEqual(normalizeMessage(frame).images, []);
+});

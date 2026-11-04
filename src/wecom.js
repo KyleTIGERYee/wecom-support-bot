@@ -5,18 +5,19 @@
  */
 
 /**
- * 把企微消息帧归一化成网关需要的形状；无法提取文本时返回 null。
+ * 把企微消息帧归一化成网关需要的形状；无法提取文本且没有图片时返回 null。
  *
  * @param {any} frame
- * @returns {{text: string, userId: string, chatType: string, chatId: string, msgid: string | null} | null}
+ * @returns {{text: string, userId: string, chatType: string, chatId: string, msgid: string | null, images: Array<{url: string, aeskey?: string}>} | null}
  */
 export function normalizeMessage(frame) {
   const body = frame?.body;
   if (!body) return null;
 
   const text = extractText(body);
+  const images = extractImages(body);
   const userId = body.from?.userid;
-  if (!text || !userId) return null;
+  if ((!text && images.length === 0) || !userId) return null;
 
   return {
     text,
@@ -25,6 +26,7 @@ export function normalizeMessage(frame) {
     chatId: body.chatid ?? "",
     // 去重要用的消息唯一标识；缺了它退化成「按内容去重」，由上层兜底
     msgid: typeof body.msgid === "string" && body.msgid ? body.msgid : null,
+    images,
   };
 }
 
@@ -69,6 +71,30 @@ function extractText(body) {
       .trim();
   }
   return "";
+}
+
+/**
+ * 取出消息里的图片（纯图片消息与图文混排里的图）。
+ * 下载链接只有五分钟有效期，由上层收到后立刻下载。
+ *
+ * @param {any} body
+ * @returns {Array<{url: string, aeskey?: string}>}
+ */
+function extractImages(body) {
+  /** @type {Array<{url: string, aeskey?: string}>} */
+  const images = [];
+  const push = (/** @type {any} */ image) => {
+    if (typeof image?.url === "string" && image.url) {
+      images.push({ url: image.url, aeskey: typeof image.aeskey === "string" ? image.aeskey : undefined });
+    }
+  };
+  push(body.image);
+  if (Array.isArray(body.mixed?.msg_item)) {
+    for (const item of body.mixed.msg_item) {
+      if (item?.msgtype === "image") push(item.image);
+    }
+  }
+  return images;
 }
 
 /**

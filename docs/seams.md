@@ -14,7 +14,9 @@
 | S8 两段式生命周期 | `src/turn-lifecycle.js` | `runTurnLifecycle({execute, surface, messages, slowAfterMs, handoffAfterMs}) → {mode, text, result}` | 快答不发提示；慢了一次慢提示；超交接时限先收尾再返回后台答案；执行失败异常上抛；交接后不再重复提示 |
 | S9 会话队列 | `src/session-queue.js` | `createSessionQueue({maxConcurrent}) → {run(key, fn)}` | 同 key 按到达顺序串行；不同 key 并行；总并发不超上限；任务抛异常后队列继续 |
 | S10 分级路由 | `src/route.js` | `classifyQuestion({question, callModel}) → "quick"\|"deep"` | QUICK/DEEP 正确解析；夹带解释取首个关键词；无法识别或模型故障一律 deep |
+| S11 图片下载 | `src/images.js` | `downloadImages({client, images, dir, msgid, maxBytes}) → string[]` | 下载解密后落盘并返回路径；超限拒绝；非常见后缀归一为 .jpg；多张按序号命名 |
+| S12 消息归一化 | `src/wecom.js` | `normalizeMessage(frame) → {text, userId, chatType, chatId, msgid, images} \| null` | 文本/语音/图文混排提取文字；纯图与混排取图；无文字且无图返回 null；会话指令识别与 @提及剥离 |
 
-依赖注入约定：S2 的 `runner`、S3/S10 的 `callModel`、S4 的 `deps`、S7 的 `stream`/`push`/`wait`、S8 的 `execute`/`surface` 都是注入点，测试用假实现替换真实的外部边界（子进程、HTTP、企微 SDK、时钟）。项目自身模块一律不 mock。
+依赖注入约定：S2 的 `runner`、S3/S10 的 `callModel`、S4 的 `deps`、S7 的 `stream`/`push`/`wait`、S8 的 `execute`/`surface`、S11 的 `client` 都是注入点，测试用假实现替换真实的外部边界（子进程、HTTP、企微 SDK、时钟）。项目自身模块一律不 mock。
 
 不写单测、靠冒烟验证的部分：单实例锁的 pid 探活、SIGTERM 优雅退出的等待、launchd 配置、启动补跑的实际拉起、提示词拆分的效果（靠 `docs/regression-questions.md` 前后对比）。

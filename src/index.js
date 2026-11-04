@@ -17,6 +17,7 @@ import { handleTurn } from "./orchestrate.js";
 import { runTurnLifecycle } from "./turn-lifecycle.js";
 import { deliverFinal } from "./deliver.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
+import { downloadImages } from "./images.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -94,44 +95,95 @@ async function main() {
         msgtype: "text",
         text: {
           content:
-            "我是赛博阿虎。我拥有安居乐寓和乐租租几乎所有的知识库，你可以找我排查问题，查询数据，了解功能等等。有什么事情不要找阿虎，请找我。",
+            "我是赛博阿虎。我拥有安居乐寓和乐租租几乎所有的知识库，你可以找我排查问题，查询数据，了解功能等等。也可以直接发截图给我，我能看图。有什么事情不要找阿虎，请找我。",
         },
       })
       .catch((error) => log.warn("欢迎语发送失败", { message: String(error?.message ?? error) }));
   });
 
+  /** @type {Map<string, Promise<void>>} 同一同事的消息按到达顺序处理：图片下载是异步的，不能被后来的文本插队 */
+  const ingestChains = new Map();
+
+  /**
+   * 立刻回一条短文本（新会话确认、图片失败提示）。
+   * 群聊里 reply 的 text 类型会被企微拒收（40008），走流式通道。
+   *
+   * @param {any} frame
+   * @param {string} text
+   * @param {string} warnLabel
+   */
+  function replyImmediate(frame, text, warnLabel) {
+    const streamId = AiBot.generateReqId("stream");
+    client
+      .replyStream(frame, streamId, text, false)
+      .then(() => client.replyStream(frame, streamId, text, true))
+      .catch((error) => log.warn(warnLabel, { message: String(error?.message ?? error) }));
+  }
+
   client.on("message", (frame) => {
     const message = normalizeMessage(frame);
     if (!message) return;
-
-    const question = stripMention(message.text);
-    if (!question) return;
-
     const userKey = toSessionKey(message.userId);
+    const prev = ingestChains.get(userKey) ?? Promise.resolve();
+    const next = prev
+      .then(() => handleIncomingMessage(frame, message, userKey))
+      .catch((error) => log.error("消息处理异常", { message: String(error?.message ?? error) }));
+    ingestChains.set(userKey, next);
+    void next.finally(() => {
+      if (ingestChains.get(userKey) === next) ingestChains.delete(userKey);
+    });
+  });
+
+  /**
+   * 收一条企微消息：指令识别 → 图片下载 → 落收件箱 → 排队执行。
+   * 图片 URL 只有五分钟有效期，必须在入队前下载，所以整个处理是异步的；
+   * 同一同事的消息由 ingestChains 保证按到达顺序走完这段。
+   *
+   * @param {any} frame
+   * @param {NonNullable<ReturnType<typeof normalizeMessage>>} message
+   * @param {string} userKey
+   */
+  async function handleIncomingMessage(frame, message, userKey) {
+    const question = stripMention(message.text);
+    if (!question && message.images.length === 0) return;
 
     // 开新会话：抬一代代号，上一轮的上下文和粘性标记一并作废
     if (isNewSessionRequest(question)) {
       const sessionId = state.startNewSession(userKey);
       void state.flush();
       void log.info("开新会话", { user: message.userId, sessionId });
-      // 群聊里 reply 的 text 类型会被企微拒收（40008），走流式通道
-      const newSessionText = "好，之前的聊的我先忘了，咱们重新开始。";
-      const streamId = AiBot.generateReqId("stream");
-      client
-        .replyStream(frame, streamId, newSessionText, false)
-        .then(() => client.replyStream(frame, streamId, newSessionText, true))
-        .catch((error) => log.warn("新会话确认发送失败", { message: String(error?.message ?? error) }));
+      replyImmediate(frame, "好，之前的聊的我先忘了，咱们重新开始。", "新会话确认发送失败");
       return;
     }
 
-    // 问题先落到收件箱，再考虑执行：企微重推靠 msgid 去重，进程重启靠它补跑
     const msgid = message.msgid ?? fallbackMsgid();
+
+    // 图片立刻下载解密存盘（URL 五分钟过期），路径拼进提问，让 agent 用 read 工具看图
+    let finalQuestion = question;
+    if (message.images.length > 0) {
+      try {
+        const imagePaths = await downloadImages({
+          client,
+          images: message.images,
+          dir: join(projectDir, "data/images"),
+          msgid,
+        });
+        finalQuestion = withImageInstructions(question, imagePaths);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        void log.warn("图片下载失败", { msgid, message: reason });
+        replyImmediate(frame, "图片我这边没收到，麻烦再发一次。", "图片失败提示发送失败");
+        return;
+      }
+    }
+
+    // 问题先落到收件箱，再考虑执行：企微重推靠 msgid 去重，进程重启靠它补跑
     const { isNew } = inbox.accept({
       msgid,
       userId: message.userId,
       chatId: message.chatId,
       chatType: message.chatType,
-      question,
+      question: finalQuestion,
       receivedAt: new Date().toISOString(),
     });
     if (!isNew) {
@@ -145,9 +197,9 @@ async function main() {
       return;
     }
 
-    void log.info("收到提问", { msgid, user: message.userId, chatType: message.chatType, length: question.length });
-    void enqueueTurn({ question, userKey, msgid, userId: message.userId, chatId: message.chatId, frame });
-  });
+    void log.info("收到提问", { msgid, user: message.userId, chatType: message.chatType, length: finalQuestion.length, images: message.images.length });
+    void enqueueTurn({ question: finalQuestion, userKey, msgid, userId: message.userId, chatId: message.chatId, frame });
+  }
 
   /**
    * 占位 + 排队 + 执行。同一个同事的连发按顺序跑，不同人并行。
@@ -423,6 +475,19 @@ async function main() {
  */
 function fallbackMsgid() {
   return `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 把图片路径拼进提问正文：agent 用 read 工具看图，后续分诊、收件箱、补跑都与纯文本提问一致。
+ *
+ * @param {string} question
+ * @param {string[]} imagePaths
+ * @returns {string}
+ */
+function withImageInstructions(question, imagePaths) {
+  const base = question || "（同事只发了图片，没有附文字）";
+  const lines = imagePaths.map((path) => `- ${path}`).join("\n");
+  return `${base}\n\n[系统补充] 同事随消息附了 ${imagePaths.length} 张图片，已保存到本地：\n${lines}\n请先用 read 工具逐张查看图片内容，再结合图片回答。`;
 }
 
 main().catch((error) => {
