@@ -117,6 +117,29 @@ WECOM_BOT_SECRETS=config/secrets.dev.json npm start
 | `inbox.recoveryWindowMs` / `inbox.retentionMs` | 补跑窗口（30 分钟）/ 收件箱保留期（24 小时） |
 | `surface.*` | 用户可见文案 |
 
+## 本地实例初始化
+
+不用手改实例配置。通过公开初始化命令选择目录、单文件或 zip 资源包，并逐项指定 `shared` / `private` 范围；主模型和 Guard 模型连接测试通过后实例才会启用。团队模板（`--template team`）只接受 `shared` 来源，空白模板可省略 `--template`。
+
+```bash
+npm run instance -- init \
+  --instance-dir ./instances/team \
+  --template team \
+  --source /path/to/shared-docs --scope shared \
+  --source /path/to/context.zip --scope shared \
+  --base-url http://127.0.0.1:3425/v1 \
+  --api-key <模型凭证> \
+  --model <主模型> \
+  --guard-model <Guard 模型>
+
+npm run instance -- ask \
+  --instance-dir ./instances/team \
+  --question "退租审批需要几级？" \
+  --session-key <同事标识>
+```
+
+初始化会把来源复制到实例的 `context/`。问答只读取这些副本，并使用实例自己的 `agent/` 与 `data/session-state.json`；原始目录、GitLab 和主工作区不是运行时来源。Guard 地址或凭证不同时，可追加 `--guard-base-url` 与 `--guard-api-key`。zip 解包使用本机已有的 `unzip`，不会安装新依赖。
+
 ## 已知限制
 
 - 纯文本对话。图片、文件、语音暂未处理（图片需解密下载，语音企微已转文字可直接用）。

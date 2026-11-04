@@ -59,7 +59,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
     "--session-id",
     sessionId,
     "--append-system-prompt",
-    `${projectDir}/prompts/core.md`,
+    config.pi.systemPromptPath ?? `${projectDir}/prompts/core.md`,
     prompt,
   ];
 
@@ -69,6 +69,8 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
       ...process.env,
       PI_CODING_AGENT_DIR: config.pi.agentDir,
       PI_OFFLINE: "1",
+      WECOM_BOT_ROOTS: JSON.stringify(config.roots ?? []),
+      WECOM_BOT_LOCAL_INSTANCE: config.pi.localInstance ? "1" : "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

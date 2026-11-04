@@ -8,14 +8,17 @@
  *
  * 判定逻辑与 src/command-whitelist.js 语义一致，但扩展独立运行在 pi 进程里
  * （pi 的扩展加载器不解析项目模块路径），因此这里内联实现。
- * 根目录清单在 ROOTS 维护，与 config/default.json 的 roots 保持一致。
+ * 默认根目录清单在 DEFAULT_ROOTS 维护，与 config/default.json 的 roots 保持一致；
+ * 本地实例由父进程注入自己的副本根。
  */
 
 /**
- * 允许 read 读取的项目内文件：不在 ROOTS 里，但 agent 必须先读它才能正确查数。
- * 只放行这一个绝对路径，其它项目内文件（config/secrets.json）依旧读不到。
+ * 默认企微模式允许 read 读取的项目内文件：不在 ROOTS 里，但 agent 必须先读它才能正确查数。
+ * 本地实例不使用这份例外清单，只能读取自己的副本根。
  */
-const ALLOWED_READ_FILES = ["/Users/kyle/Desktop/VIBECODING/wecom-support-bot/prompts/data-playbook.md"];
+const DEFAULT_ALLOWED_READ_FILES = ["/Users/kyle/Desktop/VIBECODING/wecom-support-bot/prompts/data-playbook.md"];
+const IS_LOCAL_INSTANCE = process.env.WECOM_BOT_LOCAL_INSTANCE === "1";
+const ALLOWED_READ_FILES: string[] = IS_LOCAL_INSTANCE ? [] : DEFAULT_ALLOWED_READ_FILES;
 
 /** 允许被 python3 执行的检索脚本。 */
 const ALLOWED_SCRIPTS = new Set(["search_db.py", "search_queries.py", "search_wiki.py", "bi_query.py"]);
@@ -38,13 +41,14 @@ const ALLOWED_COMMANDS = new Set([
 ]);
 
 /**
- * 允许用 node 执行的只读脚本：经验检索与指标路由。
- * 这些路径在项目目录下，不在 ROOTS 里，所以单独放行（脚本本身不接受写操作）。
+ * 默认企微模式允许用 node 执行的只读脚本：经验检索与指标路由。
+ * 本地实例不执行主工作区脚本。
  */
-const ALLOWED_NODE_SCRIPTS = new Set([
+const DEFAULT_ALLOWED_NODE_SCRIPTS = [
 	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js",
 	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js",
-]);
+];
+const ALLOWED_NODE_SCRIPTS = new Set<string>(IS_LOCAL_INSTANCE ? [] : DEFAULT_ALLOWED_NODE_SCRIPTS);
 
 /** 改变数据流向或串联命令的元字符；`$` 单独列出以拦住 $HOME 之类的变量展开。 */
 const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
@@ -71,14 +75,21 @@ function findUnquotedMetachar(command: string): string | null {
 	return null;
 }
 
-/** 允许访问的文件系统根。与 config/default.json 的 roots 保持一致。 */
-const ROOTS = [
+/** 默认允许访问的文件系统根。与 config/default.json 的 roots 保持一致。 */
+const DEFAULT_ROOTS = [
 	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
 	"/Users/kyle/Desktop/VIBECODING/ajly",
 	"/Users/kyle/Desktop/VIBECODING/lezuzu",
 	// 同事发来的截图：机器人自己下载存到这里，agent 必须用 read 看图
 	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/data/images",
 ];
+
+/** 本地实例只使用注入的副本根；默认企微模式保留原有根目录。 */
+const ROOTS: string[] = process.env.WECOM_BOT_ROOTS
+	? JSON.parse(process.env.WECOM_BOT_ROOTS)
+	: IS_LOCAL_INSTANCE
+		? []
+		: DEFAULT_ROOTS;
 
 /** 解析成规范化的绝对路径；无法判定时返回 null。 */
 function toAbsolute(token: string): string | null {

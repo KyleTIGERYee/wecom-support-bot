@@ -11,16 +11,18 @@ import { join } from "node:path";
 export async function createGuardClient({ config, agentDir }) {
   const readFileFn = (/** @type {string} */ path) => readFile(path, "utf8");
 
-  // provider 与密钥复用隔离实例的 models.json（软链到 coding 侧的同一份定义）
-  let apiKey = "";
+  // 本地实例直接提供 Guard 凭证；现有生产实例仍复用隔离 pi 的 models.json。
+  let apiKey = config.guard.apiKey ?? "";
   let baseUrl = config.guard.baseUrl;
-  try {
-    const models = JSON.parse(await readFileFn(join(agentDir, "models.json")));
-    const provider = models?.providers?.[config.pi.provider];
-    if (provider?.apiKey) apiKey = provider.apiKey;
-    if (provider?.baseUrl) baseUrl = provider.baseUrl;
-  } catch {
-    // 读不到就让调用失败，guard 会 fail-closed
+  if (!apiKey) {
+    try {
+      const models = JSON.parse(await readFileFn(join(agentDir, "models.json")));
+      const provider = models?.providers?.[config.pi.provider];
+      if (provider?.apiKey) apiKey = provider.apiKey;
+      if (provider?.baseUrl) baseUrl = provider.baseUrl;
+    } catch {
+      // 读不到就让调用失败，guard 会 fail-closed
+    }
   }
 
   /**
