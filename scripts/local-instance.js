@@ -100,6 +100,7 @@ async function main() {
     models: {
       main: { baseUrl: options.baseUrl, model: options.model },
       guard: { baseUrl: options.guardBaseUrl, model: options.guardModel },
+      executionApproval: { baseUrl: options.approvalBaseUrl, model: options.approvalModel },
     },
     contextSources,
     checks: { mainModel, guardModel, context: contextCheck },
@@ -108,6 +109,7 @@ async function main() {
   await writeJson(join(instanceDir, "secrets.json"), {
     mainApiKey: options.apiKey,
     guardApiKey: options.guardApiKey,
+    executionApprovalApiKey: options.approvalApiKey,
   });
   await mkdir(join(instanceDir, "agent"), { recursive: true });
   await writeJson(join(instanceDir, "agent/models.json"), {
@@ -144,10 +146,13 @@ async function ask(args) {
   const secrets = JSON.parse(await readFile(join(instanceDir, "secrets.json"), "utf8"));
   const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
   const agentDir = join(instanceDir, "agent");
+  const approvalModel = saved.models.executionApproval ?? saved.models.main;
   const config = {
     ...defaults,
     projectDir,
     roots: [join(instanceDir, "context")],
+    writeRoots: [join(instanceDir, "context")],
+    protectedRoots: [projectDir],
     pi: {
       ...defaults.pi,
       binary: process.env.WECOM_BOT_PI_BINARY || join(homedir(), ".pi-support/bin/pi"),
@@ -162,6 +167,13 @@ async function ask(args) {
       baseUrl: saved.models.guard.baseUrl,
       model: saved.models.guard.model,
       apiKey: secrets.guardApiKey,
+    },
+    executionApproval: {
+      ...defaults.executionApproval,
+      enabled: true,
+      baseUrl: approvalModel.baseUrl,
+      model: approvalModel.model,
+      apiKey: secrets.executionApprovalApiKey ?? secrets.mainApiKey,
     },
   };
 
@@ -263,6 +275,9 @@ function parseInitArgs(args) {
     else if (flag === "--guard-base-url") options.guardBaseUrl = value;
     else if (flag === "--guard-api-key") options.guardApiKey = value;
     else if (flag === "--guard-model") options.guardModel = value;
+    else if (flag === "--approval-base-url") options.approvalBaseUrl = value;
+    else if (flag === "--approval-api-key") options.approvalApiKey = value;
+    else if (flag === "--approval-model") options.approvalModel = value;
     else throw new Error(`未知选项：${flag}`);
   }
   for (const key of ["instanceDir", "baseUrl", "apiKey", "model"]) {
@@ -271,6 +286,9 @@ function parseInitArgs(args) {
   options.guardBaseUrl ??= options.baseUrl;
   options.guardApiKey ??= options.apiKey;
   options.guardModel ??= options.model;
+  options.approvalBaseUrl ??= options.baseUrl;
+  options.approvalApiKey ??= options.apiKey;
+  options.approvalModel ??= options.model;
   return options;
 }
 

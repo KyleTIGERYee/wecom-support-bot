@@ -52,7 +52,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
     "--extension",
     `${projectDir}/extensions/bash-whitelist.ts`,
     "--tools",
-    "read,bash",
+    config.pi.localInstance && config.executionApproval?.enabled === true ? "read,write,edit,bash" : "read,bash",
     "--provider",
     config.pi.provider,
     "--model",
@@ -74,6 +74,11 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
       PI_OFFLINE: "1",
       WECOM_BOT_ROOTS: JSON.stringify(config.roots ?? []),
       WECOM_BOT_LOCAL_INSTANCE: config.pi.localInstance ? "1" : "0",
+      WECOM_BOT_EXECUTION_APPROVAL: JSON.stringify(config.executionApproval ?? { enabled: false }),
+      WECOM_BOT_WRITE_ROOTS: JSON.stringify(config.writeRoots ?? []),
+      WECOM_BOT_PROTECTED_ROOTS: JSON.stringify(config.protectedRoots ?? []),
+      WECOM_BOT_MODEL_CLIENT_PATH: `${projectDir}/src/model-client.js`,
+      WECOM_BOT_PI_PROVIDER: config.pi.provider,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -213,6 +218,19 @@ export async function runAgentTurn({
       });
     }
 
+    if (child.stderr) {
+      let buffer = "";
+      child.stderr.on("data", (/** @type {Buffer|string} */ chunk) => {
+        buffer += chunk.toString();
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          relayExecutionApprovalLog(buffer.slice(0, newlineIndex));
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineIndex = buffer.indexOf("\n");
+        }
+      });
+    }
+
     child.on("error", () => finish({ failed: true }));
     // 用 close 而非 exit：close 保证 stdout 已完全读空，避免丢掉末尾的答复
     child.on("close", (/** @type {number|null} */ code) => {
@@ -220,6 +238,30 @@ export async function runAgentTurn({
       finish({ failed: code !== 0 });
     });
   });
+}
+
+/**
+ * 只转发扩展产生的执行审批摘要；其他 stderr 与未白名单化的字段不进入父进程日志。
+ *
+ * @param {string} line
+ */
+function relayExecutionApprovalLog(line) {
+  const prefix = "[execution-approval] ";
+  if (!line.startsWith(prefix)) return;
+  try {
+    const entry = JSON.parse(line.slice(prefix.length));
+    if (entry?.type !== "execution_approval") return;
+    const summary = /** @type {Record<string, string>} */ ({ type: "execution_approval" });
+    for (const key of ["timestamp", "toolCallId", "toolName", "target", "command", "verdict", "source", "riskCategory"]) {
+      if (typeof entry[key] === "string") summary[key] = entry[key];
+    }
+    // 模型理由可能包含写入正文或凭证；父进程只转发安全类别，硬规则理由保持可操作。
+    if (entry.source === "hard-rule" && typeof entry.reason === "string") summary.reason = entry.reason;
+    if (entry.source === "model") summary.reason = entry.verdict === "ALLOW" ? "model-allow" : "model-deny";
+    process.stderr.write(`${prefix}${JSON.stringify(summary)}\n`);
+  } catch {
+    // 非审批日志或截断的 JSON 不转发，避免把子进程凭证与完整参数带入日志。
+  }
 }
 
 /**

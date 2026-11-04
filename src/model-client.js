@@ -2,26 +2,21 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
- * 直连内网 OpenAI 兼容接口的模型客户端，供 guard 判定使用。
+ * 直连 OpenAI 兼容接口的共享客户端。Guard 与执行审批只提供各自的模型配置。
  *
- * 不走 pi 进程：guard 每次调用要快（1-2 秒），而起一个 pi 要加载工具和提示词。
- *
- * @param {{config: any, agentDir: string}} options
+ * @param {{modelConfig: any, provider: string, agentDir: string}} options
  */
-export async function createGuardClient({ config, agentDir }) {
-  const readFileFn = (/** @type {string} */ path) => readFile(path, "utf8");
-
-  // 本地实例直接提供 Guard 凭证；现有生产实例仍复用隔离 pi 的 models.json。
-  let apiKey = config.guard.apiKey ?? "";
-  let baseUrl = config.guard.baseUrl;
+async function createOpenAICompatibleClient({ modelConfig, provider, agentDir }) {
+  let apiKey = modelConfig.apiKey ?? "";
+  let baseUrl = modelConfig.baseUrl;
   if (!apiKey) {
     try {
-      const models = JSON.parse(await readFileFn(join(agentDir, "models.json")));
-      const provider = models?.providers?.[config.pi.provider];
-      if (provider?.apiKey) apiKey = provider.apiKey;
-      if (provider?.baseUrl) baseUrl = provider.baseUrl;
+      const models = JSON.parse(await readFile(join(agentDir, "models.json"), "utf8"));
+      const modelProvider = models?.providers?.[provider];
+      if (modelProvider?.apiKey) apiKey = modelProvider.apiKey;
+      if (modelProvider?.baseUrl) baseUrl = modelProvider.baseUrl;
     } catch {
-      // 读不到就让调用失败，guard 会 fail-closed
+      // 读不到凭证时让调用失败，Guard 与执行审批都会 fail-closed。
     }
   }
 
@@ -33,13 +28,13 @@ export async function createGuardClient({ config, agentDir }) {
     if (!apiKey) throw new Error("未找到模型 apiKey");
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.guard.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), modelConfig.timeoutMs);
     try {
       const response = await fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
-          model: config.guard.model,
+          model: modelConfig.model,
           messages,
           temperature: 0,
           max_tokens: 200,
@@ -47,14 +42,33 @@ export async function createGuardClient({ config, agentDir }) {
         signal: controller.signal,
       });
 
-      if (!response.ok) {
-        throw new Error(`模型返回 ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`模型返回 ${response.status}`);
       const data = /** @type {any} */ (await response.json());
       return data?.choices?.[0]?.message?.content ?? "";
     } finally {
       clearTimeout(timer);
     }
   };
+}
+
+/**
+ * Guard 直连模型，避免为每次判定启动 pi。
+ *
+ * @param {{config: any, agentDir: string}} options
+ */
+export async function createGuardClient({ config, agentDir }) {
+  return createOpenAICompatibleClient({ modelConfig: config.guard, provider: config.pi.provider, agentDir });
+}
+
+/**
+ * 独立执行审批模型客户端，只返回模型文本，不执行工具。
+ *
+ * @param {{config: any, agentDir: string}} options
+ */
+export async function createExecutionApprovalClient({ config, agentDir }) {
+  return createOpenAICompatibleClient({
+    modelConfig: config.executionApproval,
+    provider: config.pi.provider,
+    agentDir,
+  });
 }

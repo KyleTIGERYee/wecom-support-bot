@@ -25,6 +25,12 @@
     "timeoutMs": 30000,
     "maxRounds": 3
   },
+  "executionApproval": {
+    "enabled": false,
+    "baseUrl": "http://127.0.0.1:3425/v1",
+    "model": "group/auto-deepseek-v4.1-flash",
+    "timeoutMs": 10000
+  },
   "surface": {
     "progressText": "正在查，稍等一下…",
     "slowProgressText": "这个查得有点慢，我再看看，马上就好。",

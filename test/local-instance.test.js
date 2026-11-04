@@ -115,6 +115,9 @@ function initInstance({
   apiKey = "test-key",
   model = "main-model",
   guardModel,
+  approvalBaseUrl,
+  approvalApiKey,
+  approvalModel,
   template,
   allowFailure = false,
 }) {
@@ -126,6 +129,9 @@ function initInstance({
   }
   args.push("--base-url", baseUrl, "--api-key", apiKey, "--model", model);
   if (guardModel) args.push("--guard-model", guardModel);
+  if (approvalBaseUrl) args.push("--approval-base-url", approvalBaseUrl);
+  if (approvalApiKey) args.push("--approval-api-key", approvalApiKey);
+  if (approvalModel) args.push("--approval-model", approvalModel);
   return runCli(args, { allowFailure });
 }
 
@@ -153,6 +159,7 @@ test("公开初始化流程复制共享目录并测试主模型与 Guard 模型"
   );
 
   const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.deepEqual(saved.models.executionApproval, { baseUrl: models.baseUrl, model: "main-model" });
   assert.equal(saved.contextSources.length, 1);
   assert.equal(saved.contextSources[0].scope, "shared");
   assert.equal(saved.contextSources[0].type, "directory");
@@ -162,6 +169,120 @@ test("公开初始化流程复制共享目录并测试主模型与 Guard 模型"
     await readFile(join(instanceDir, saved.contextSources[0].localPath, "handbook.md"), "utf8"),
     "退租审批需要两级审批。\n",
   );
+});
+
+test("本地实例向 pi 子进程注入独立审批模型、写工具和副本写根", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "docs.md");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  await writeFile(source, "本地资料。\n");
+  await initInstance({
+    instanceDir,
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    model: "main-model",
+    approvalBaseUrl: "http://127.0.0.1:39999/v1",
+    approvalApiKey: "approval-secret",
+    approvalModel: "approval-model",
+  });
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
+  tools: args[args.indexOf("--tools") + 1],
+  approval: JSON.parse(process.env.WECOM_BOT_EXECUTION_APPROVAL || "{}"),
+  writeRoots: JSON.parse(process.env.WECOM_BOT_WRITE_ROOTS || "[]"),
+  protectedRoots: JSON.parse(process.env.WECOM_BOT_PROTECTED_ROOTS || "[]"),
+  modelClientPath: process.env.WECOM_BOT_MODEL_CLIENT_PATH,
+}) + "\\n");
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "配置已接收" }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "检查配置", "--session-key", "approval-config"],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog } },
+  );
+
+  assert.equal(result.finalText, "配置已接收");
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.deepEqual(saved.models.executionApproval, { baseUrl: "http://127.0.0.1:39999/v1", model: "approval-model" });
+  const call = JSON.parse((await readFile(piLog, "utf8")).trim());
+  assert.equal(call.tools, "read,write,edit,bash");
+  assert.deepEqual(call.approval, {
+    enabled: true,
+    baseUrl: "http://127.0.0.1:39999/v1",
+    model: "approval-model",
+    apiKey: "approval-secret",
+    timeoutMs: 10000,
+  });
+  assert.deepEqual(call.writeRoots, [join(instanceDir, "context")]);
+  assert.deepEqual(call.protectedRoots, [projectDir]);
+  assert.equal(call.modelClientPath, join(projectDir, "src/model-client.js"));
+});
+
+test("ask 运行链路公开审批摘要、结果与安全理由类别但不泄露敏感原文", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "docs.md");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const modelReason = "只创建当前任务要求的报告；S14_MODEL_FAKE_CREDENTIAL_91c2e7；S14_MODEL_WRITE_BODY_整段机密正文";
+  await writeFile(source, "本地资料。\n");
+  await initInstance({
+    instanceDir,
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const approvalEntry = {
+    timestamp: "2026-11-05T00:00:00.000Z",
+    type: "execution_approval",
+    toolCallId: "write-1",
+    toolName: "write",
+    target: join(instanceDir, "context/report.md"),
+    verdict: "ALLOW",
+    source: "model",
+    reason: modelReason,
+    riskCategory: "low",
+    arguments: { content: "完整敏感参数" },
+    apiKey: "approval-secret",
+  };
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+process.stderr.write(${JSON.stringify(`[execution-approval] ${JSON.stringify(approvalEntry)}\n`)});
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "报告已创建" }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const { stdout, stderr } = await execFileAsync(
+    process.execPath,
+    [cliPath, "ask", "--instance-dir", instanceDir, "--question", "创建报告", "--session-key", "approval-log"],
+    { cwd: projectDir, env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi } },
+  );
+
+  assert.equal(JSON.parse(stdout).finalText, "报告已创建");
+  const logLine = stderr.trim().split("\n").find((line) => line.startsWith("[execution-approval] "));
+  assert.ok(logLine, `应公开执行审批日志，实际 stderr：${stderr}`);
+  const observed = JSON.parse(logLine.slice("[execution-approval] ".length));
+  assert.equal(observed.toolCallId, "write-1");
+  assert.equal(observed.target, approvalEntry.target);
+  assert.equal(observed.verdict, "ALLOW");
+  assert.equal(observed.reason, "model-allow");
+  assert.equal(observed.riskCategory, "low");
+  assert.equal(stderr.includes("S14_MODEL_FAKE_CREDENTIAL_91c2e7"), false);
+  assert.equal(stderr.includes("S14_MODEL_WRITE_BODY_整段机密正文"), false);
+  assert.equal(stderr.includes("approval-secret"), false);
+  assert.equal(stderr.includes("完整敏感参数"), false);
 });
 
 test("公开初始化流程接受单文件和 zip 资源包并分别保存共享范围", async (t) => {
