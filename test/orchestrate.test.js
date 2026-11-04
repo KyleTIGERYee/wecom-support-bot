@@ -1384,3 +1384,180 @@ test("卡住重试前已经读取的资源仍保留在本轮加载记录", async
   assert.deepEqual(result.loadedResources, [concept]);
   assert.equal(result.loadDepth, "concept");
 });
+
+test("命中文档 Skill 后交接真实身份并只公开实际读取的正文和必要引用", async () => {
+  const skill = {
+    name: "docx",
+    path: "/instance/context/skills/docx/SKILL.md",
+    description: "创建或修改 DOCX 文档",
+    capabilities: "文档生成、模板套用、受限写入",
+    triggers: ["文档", "docx", "报告"],
+    source: "共享 Skills",
+    scope: "shared",
+    sourceTime: "2026-11-04",
+  };
+  const skillBody = {
+    source: skill.source,
+    path: skill.path,
+    depth: "skill",
+    resourceType: "skill",
+    skillName: skill.name,
+    sourceTime: skill.sourceTime,
+    scope: "shared",
+  };
+  const reference = {
+    source: skill.source,
+    path: "/instance/context/skills/docx/references/layout.md",
+    depth: "skill-reference",
+    resourceType: "skill-reference",
+    skillName: skill.name,
+    sourceTime: skill.sourceTime,
+    scope: "shared",
+  };
+  const runs = [];
+  const deps = {
+    state: fakeState(false),
+    context: {
+      catalog: "共享业务库目录\n- skill: docx | 创建或修改 DOCX 文档 | 文档生成、模板套用、受限写入\n- skill: prototype | 生成原型 | HTML 原型",
+      skills: [skill, { name: "prototype", path: "/instance/context/skills/prototype/SKILL.md", triggers: ["原型"] }],
+    },
+    runAgent: async (options) => {
+      runs.push(options);
+      return {
+        text: "已按文档 Skill 生成报告。",
+        biTouched: false,
+        timedOut: false,
+        failed: false,
+        loadedResources: [skillBody, reference],
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "帮我生成一份退租规则文档", sessionKey: "wx-abc", deps });
+
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].currentSkill, "docx");
+  assert.match(runs[0].prompt, /current_skill: docx/);
+  assert.match(runs[0].prompt, /skills\/docx\/SKILL\.md/);
+  assert.match(runs[0].prompt, /正文明确要求.*当前任务需要/);
+  assert.equal(runs[0].prompt.includes("SKILL_BODY_SECRET"), false);
+  assert.equal(runs[0].prompt.includes("PROTOTYPE_BODY_SECRET"), false);
+  assert.equal(result.currentSkill, "docx");
+  assert.deepEqual(result.loadedSkills, [skillBody]);
+  assert.deepEqual(result.loadedResources, [skillBody, reference]);
+  assert.equal(result.loadDepth, "skill-reference");
+});
+
+async function runSkillRoute(question, skills) {
+  const runs = [];
+  const result = await handleTurn({
+    question,
+    sessionKey: "wx-abc",
+    deps: {
+      state: fakeState(false),
+      context: { catalog: "Skill 目录只含元数据", skills },
+      runAgent: async (options) => {
+        runs.push(options);
+        return { text: "ok", biTouched: false, timedOut: false, failed: false };
+      },
+      review: async () => ({ verdict: "ALLOW" }),
+    },
+  });
+  return { result, runs };
+}
+
+test("明确点名非首项 Skill 时优先精确名称而不被宽泛任务类型抢选", async () => {
+  const skills = [
+    { name: "data-a", path: "/skills/data-a/SKILL.md", tasks: ["data"] },
+    { name: "data-b", path: "/skills/data-b/SKILL.md", tasks: ["data"] },
+  ];
+
+  const { result, runs } = await runSkillRoute("请使用 data-b 按数据口径生成报告", skills);
+
+  assert.equal(result.currentSkill, "data-b");
+  assert.equal(runs[0].currentSkill, "data-b");
+  assert.match(runs[0].prompt, /current_skill: data-b/);
+});
+
+test("只有标准 description 的 Skill 也能按任务描述命中并传递真实身份", async () => {
+  const skills = [
+    { name: "weekly-report", path: "/skills/weekly-report/SKILL.md", description: "把会议记录整理成周报" },
+    { name: "prototype", path: "/skills/prototype/SKILL.md", description: "生成 HTML 交互原型" },
+  ];
+
+  const { result, runs } = await runSkillRoute("请把会议记录整理成周报", skills);
+
+  assert.equal(result.currentSkill, "weekly-report");
+  assert.equal(runs[0].currentSkill, "weekly-report");
+  assert.match(runs[0].prompt, /skill_path: \/skills\/weekly-report\/SKILL\.md/);
+});
+
+test("无关 Skill 不因目录顺序或宽泛能力描述进入本轮", async () => {
+  const skills = [
+    { name: "docx", path: "/skills/docx/SKILL.md", description: "创建 DOCX 文档", capabilities: "文档生成" },
+    { name: "data-query", path: "/skills/data-query/SKILL.md", description: "查询生产数据", tasks: ["data"] },
+  ];
+
+  const { result, runs } = await runSkillRoute("退租是什么？", skills);
+
+  assert.equal(result.currentSkill, "unknown");
+  assert.equal(runs[0].currentSkill, "unknown");
+  assert.doesNotMatch(runs[0].prompt, /\[任务路由：Skill\]/);
+});
+
+test("宽泛同类任务类型不抢精确触发词命中的 Skill", async () => {
+  const skills = [
+    { name: "data-a", path: "/skills/data-a/SKILL.md", tasks: ["data"] },
+    { name: "vacancy-rate", path: "/skills/vacancy-rate/SKILL.md", triggers: ["退租率"], tasks: ["data"] },
+  ];
+
+  const { result, runs } = await runSkillRoute("请统计退租率", skills);
+
+  assert.equal(result.currentSkill, "vacancy-rate");
+  assert.equal(runs[0].currentSkill, "vacancy-rate");
+});
+
+test("多个元数据候选得分相同且无法消解时保守不选首项", async () => {
+  const skills = [
+    { name: "minutes-a", path: "/skills/minutes-a/SKILL.md", description: "整理会议纪要" },
+    { name: "minutes-b", path: "/skills/minutes-b/SKILL.md", description: "整理会议纪要" },
+  ];
+
+  const { result, runs } = await runSkillRoute("请整理会议纪要", skills);
+
+  assert.equal(result.currentSkill, "unknown");
+  assert.equal(runs[0].currentSkill, "unknown");
+  assert.doesNotMatch(runs[0].prompt, /current_skill: minutes-[ab]/);
+});
+
+test("ASCII 完整词与最长触发优先，doc 不会在明确 docx 内误命中", async () => {
+  const skills = [
+    { name: "doc", path: "/skills/doc/SKILL.md", triggers: ["doc"] },
+    { name: "docx", path: "/skills/docx/SKILL.md", triggers: ["docx"] },
+  ];
+
+  const { result, runs } = await runSkillRoute("请使用 docx 生成文件", skills);
+
+  assert.equal(result.currentSkill, "docx");
+  assert.equal(runs[0].currentSkill, "docx");
+  assert.match(runs[0].prompt, /current_skill: docx/);
+});
+
+test("中文最长精确触发优先于宽泛触发，同级歧义仍保守 unknown", async () => {
+  const skills = [
+    { name: "generic-document", path: "/skills/generic-document/SKILL.md", triggers: ["文档"] },
+    { name: "checkout-document", path: "/skills/checkout-document/SKILL.md", triggers: ["退租文档"] },
+  ];
+
+  const selected = await runSkillRoute("请生成退租文档", skills);
+  assert.equal(selected.result.currentSkill, "checkout-document");
+  assert.equal(selected.runs[0].currentSkill, "checkout-document");
+
+  const ambiguous = await runSkillRoute("请生成文档", [
+    { name: "document-a", path: "/skills/document-a/SKILL.md", triggers: ["文档"] },
+    { name: "document-b", path: "/skills/document-b/SKILL.md", triggers: ["文档"] },
+  ]);
+  assert.equal(ambiguous.result.currentSkill, "unknown");
+  assert.equal(ambiguous.runs[0].currentSkill, "unknown");
+});

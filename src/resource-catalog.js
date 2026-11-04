@@ -73,6 +73,7 @@ export function createDefaultResourceCatalog(roots, projectDir) {
 
   return {
     entries,
+    skills: [],
     dataPlaybook: true,
     text: [
       "以下目录来自本实例配置，只含选择所需元数据；按业务线选择，不得混用两条业务线的资源。",
@@ -102,24 +103,65 @@ export function createDefaultResourceCatalog(roots, projectDir) {
 export async function createLocalResourceCatalog(instanceDir, sources, copiedAt = null) {
   /** @type {Array<any>} */
   const entries = [];
+  /** @type {Array<any>} */
+  const skills = [];
   for (const source of sources) {
     if (source.status !== "ok" || !source.localPath) continue;
     const root = resolve(instanceDir, source.localPath);
-    for (const path of await listFiles(root)) {
+    const files = await listFiles(root);
+    const skillFiles = files.filter((path) => basename(path) === "SKILL.md");
+    const skillMetadata = new Map();
+    for (const path of skillFiles) {
       const metadata = await readMetadata(path);
-      const relativePath = relative(root, path) || basename(path);
+      const skillRoot = dirname(path);
+      const name = metadata.name ?? basename(skillRoot);
+      skillMetadata.set(skillRoot, { ...metadata, name });
+    }
+    for (const path of files) {
+      const skillRoot = [...skillMetadata.keys()]
+        .filter((candidate) => path === candidate || path.startsWith(`${candidate}/`))
+        .sort((a, b) => b.length - a.length)[0];
+      const metadata = skillRoot ? skillMetadata.get(skillRoot) : await readMetadata(path);
       const sourceTime = metadata.sourceTime ?? null;
-      entries.push({
+      const common = {
         source: source.name,
         scope: source.scope,
         path,
+        sourceTime,
+        copiedAt,
+        validity: metadata.validity ?? inferValidity(path),
+      };
+      if (skillRoot) {
+        const skillName = skillMetadata.get(skillRoot).name;
+        const isBody = path === join(skillRoot, "SKILL.md");
+        const resourceType = isBody ? "skill" : classifySkillResource(skillRoot, path);
+        entries.push({
+          ...common,
+          relativePath: relative(root, path) || basename(path),
+          depth: resourceType,
+          resourceType,
+          skillName,
+          summary: metadata.summary,
+        });
+        if (isBody) {
+          skills.push({
+            ...common,
+            name: skillName,
+            description: metadata.summary,
+            capabilities: metadata.capabilities ?? "未声明额外能力；命中后按需读取正文",
+            triggers: metadata.triggers,
+            tasks: metadata.tasks,
+          });
+        }
+        continue;
+      }
+      const relativePath = relative(root, path) || basename(path);
+      entries.push({
+        ...common,
         relativePath,
         depth: classifyResourceDepth(path),
         resourceType: classifyResourceType(path),
         summary: metadata.summary,
-        sourceTime,
-        copiedAt,
-        validity: metadata.validity ?? inferValidity(path),
         verification: metadata.verification,
         rawSources: metadata.rawSources,
         rawBase: rawBaseFor(root, path),
@@ -130,13 +172,38 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
 
   return {
     entries,
+    skills,
     dataPlaybook: entries.some((entry) => entry.depth === "playbook"),
     text: [
       "以下来源均为初始化时选择的本地副本；只能读取目录中的路径。source_time 是资料自身时间，未知为 null；copied_at 是实例复制时间。",
       "validity=history 表示历史资料；validity=current 表示明确标记的当前口径；unmarked 不得在历史冲突时直接当作最新口径。",
-      ...entries.map(formatEntry),
+      ...entries.filter((entry) => !entry.skillName).map(formatEntry),
+      "Skill 目录只含名称、触发描述、必要能力摘要与正文入口；未命中时不读取正文，命中后按需读取引用资源。",
+      ...(skills.length > 0 ? skills.map(formatSkillEntry) : ["Skill 目录：当前未配置可加载 Skills。"]),
     ].join("\n"),
   };
+}
+
+/** @param {any} skill */
+function formatSkillEntry(skill) {
+  return [
+    `- skill: ${skill.name}`,
+    `path: ${skill.path}`,
+    `trigger: ${skill.description}`,
+    `capabilities: ${Array.isArray(skill.capabilities) ? skill.capabilities.join("、") : skill.capabilities}`,
+    `triggers: ${skill.triggers.join("、")}`,
+    `tasks: ${skill.tasks.join("、")}`,
+    `source_time: ${skill.sourceTime}`,
+    `copied_at: ${skill.copiedAt}`,
+  ].join(" | ");
+}
+
+/** @param {string} skillRoot @param {string} path */
+function classifySkillResource(skillRoot, path) {
+  const relativePath = relative(skillRoot, path).replaceAll("\\", "/");
+  if (relativePath.startsWith("scripts/")) return "skill-script";
+  if (/(?:^|\/)(?:templates?|模板)\//i.test(relativePath)) return "skill-template";
+  return "skill-reference";
 }
 
 /** @param {any} entry */
@@ -161,7 +228,7 @@ function formatEntry(entry) {
 
 /** @param {string} path */
 async function readMetadata(path) {
-  const empty = { summary: "", sourceTime: undefined, validity: undefined, verification: undefined, rawSources: [] };
+  const empty = { name: undefined, summary: "", capabilities: undefined, sourceTime: undefined, validity: undefined, verification: undefined, rawSources: [], triggers: [], tasks: [] };
   if (/\.sql$/i.test(path)) {
     const header = (await readFile(path, "utf8")).split("\n").slice(0, 12).join("\n");
     return {
@@ -174,24 +241,32 @@ async function readMetadata(path) {
   const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/)?.[1];
   if (!frontmatter) return empty;
 
-  const scalar = (/** @type {string[]} */ names) => {
+  const metadata = parseFrontmatter(frontmatter);
+  const value = (/** @type {string[]} */ names) => {
     for (const name of names) {
-      const value = frontmatter.match(new RegExp(`^${name}:\\s*(.+?)\\s*$`, "im"))?.[1];
-      if (value) return value.replace(/^(?:"|')|(?:"|')$/g, "");
+      if (metadata.has(name)) return metadata.get(name);
     }
     return undefined;
   };
-  const rawSources = [];
-  const lines = frontmatter.split("\n");
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!/^raw_source\s*:\s*$/i.test(lines[index])) continue;
-    for (let next = index + 1; next < lines.length && /^\s+-\s+/.test(lines[next]); next += 1) {
-      rawSources.push(lines[next].replace(/^\s+-\s+/, "").replace(/^(?:"|')|(?:"|')$/g, ""));
-    }
-  }
+  const scalar = (/** @type {string[]} */ names) => {
+    const found = value(names);
+    return typeof found === "string" && found ? found : undefined;
+  };
+  const list = (/** @type {string[]} */ names) => {
+    const found = value(names);
+    const values = Array.isArray(found) ? found : typeof found === "string" ? found.split(/[,，;；]/) : [];
+    return values.map((item) => String(item).trim()).filter(Boolean);
+  };
   const status = scalar(["validity", "status"])?.toLowerCase();
+  const capabilities = value(["capabilities", "capability"]);
   return {
+    name: scalar(["name"]),
     summary: scalar(["summary", "description", "title"]) ?? "",
+    capabilities: Array.isArray(capabilities)
+      ? capabilities.map((item) => String(item).trim()).filter(Boolean)
+      : scalar(["capabilities", "capability"]),
+    triggers: list(["triggers", "trigger"]),
+    tasks: list(["tasks", "task"]),
     sourceTime: scalar([
       "source_time",
       "source-date",
@@ -208,9 +283,70 @@ async function readMetadata(path) {
       : /current|effective|active|当前|有效/.test(status ?? "")
         ? "current"
         : undefined,
-    rawSources,
+    rawSources: list(["raw_source"]),
     verification: undefined,
   };
+}
+
+/**
+ * 当前公开元数据只需要顶层标量、folded/literal 块与缩进列表。
+ * 这是刻意受限的 YAML 子集，不执行标签、锚点或 Skill 中的任何代码。
+ *
+ * @param {string} frontmatter
+ */
+function parseFrontmatter(frontmatter) {
+  const values = new Map();
+  const lines = frontmatter.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^([a-z_][\w-]*):(?:[ \t]*(.*))?$/i);
+    if (!match) continue;
+    const key = match[1].toLowerCase();
+    const inline = match[2] ?? "";
+    const block = inline.match(/^([>|])([+-])?$/);
+    if (block) {
+      const blockLines = [];
+      while (index + 1 < lines.length && (/^[ \t]/.test(lines[index + 1]) || lines[index + 1].trim() === "")) {
+        blockLines.push(lines[index + 1]);
+        index += 1;
+      }
+      values.set(key, parseBlockScalar(blockLines, block[1], block[2]));
+      continue;
+    }
+    if (!inline) {
+      const items = [];
+      while (index + 1 < lines.length && /^\s+-\s*/.test(lines[index + 1])) {
+        items.push(parseInlineScalar(lines[index + 1].replace(/^\s+-\s*/, "")));
+        index += 1;
+      }
+      values.set(key, items.length > 0 ? items : "");
+      continue;
+    }
+    values.set(key, parseInlineScalar(inline));
+  }
+  return values;
+}
+
+/** @param {string} value */
+function parseInlineScalar(value) {
+  const trimmed = value.trim();
+  const quote = trimmed[0];
+  return (quote === '"' || quote === "'") && trimmed.at(-1) === quote ? trimmed.slice(1, -1) : trimmed;
+}
+
+/** @param {string[]} lines @param {string} style @param {string|undefined} chomping */
+function parseBlockScalar(lines, style, chomping) {
+  const indentation = Math.min(...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)?.[0].length ?? 0));
+  const content = lines.map((line) => line.trim() ? line.slice(Number.isFinite(indentation) ? indentation : 0) : "");
+  let body = style === "|" ? content.join("\n") : "";
+  if (style === ">") {
+    body = content.reduce((folded, line, index) => {
+      if (index === 0) return line;
+      return `${folded}${line && content[index - 1] ? " " : "\n"}${line}`;
+    }, "");
+  }
+  if (chomping === "-") return body.replace(/\n+$/, "");
+  if (chomping === "+") return `${body}\n`;
+  return `${body.replace(/\n+$/, "")}\n`;
 }
 
 /** @param {string} header */
@@ -282,6 +418,7 @@ export function findCatalogResource(path, catalog, readContent = undefined) {
     ...(Object.hasOwn(entry, "copiedAt") ? { copiedAt: entry.copiedAt } : {}),
     ...(entry.validity ? { validity: entry.validity } : {}),
     ...(entry.scope ? { scope: entry.scope } : {}),
+    ...(entry.skillName ? { skillName: entry.skillName } : {}),
     ...(verification ? { verification } : {}),
   };
 }
@@ -289,7 +426,7 @@ export function findCatalogResource(path, catalog, readContent = undefined) {
 /** @param {Array<{depth: string}>} resources */
 export function getLoadDepth(resources) {
   /** @type {Record<string, number>} */
-  const ranks = { catalog: 0, concept: 1, document: 1, playbook: 2, metrics: 2, experience: 3, table: 3, sql: 4, raw: 5 };
+  const ranks = { catalog: 0, concept: 1, document: 1, playbook: 2, skill: 2, metrics: 2, experience: 3, table: 3, "skill-reference": 3, "skill-template": 3, sql: 4, "skill-script": 4, raw: 5 };
   let deepest = "catalog";
   for (const resource of resources) {
     if ((ranks[resource.depth] ?? 1) >= (ranks[deepest] ?? 0)) deepest = resource.depth;

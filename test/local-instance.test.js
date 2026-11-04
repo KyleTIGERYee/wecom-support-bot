@@ -27,7 +27,7 @@ async function runCli(args, options = {}) {
   }
 }
 
-async function startModelServer({ failModel, mainReply = "ok" } = {}) {
+async function startModelServer({ failModel, mainReply = "ok", approvalReply } = {}) {
   const calls = [];
   const server = createServer((request, response) => {
     let body = "";
@@ -48,15 +48,20 @@ async function startModelServer({ failModel, mainReply = "ok" } = {}) {
         .join("\n");
       const isGuard = messageText.includes("机器人的答复");
       const isConnectionTest = messageText.includes("连接测试，请回复 ok");
+      const isApproval = messageText.includes("你是独立的执行审批模型");
       const reply = isGuard
         ? messageText.includes("13800138000")
           ? "DENY\n包含手机号"
           : "ALLOW"
         : isConnectionTest
           ? "ok"
-          : typeof mainReply === "function"
-            ? mainReply(payload)
-            : mainReply;
+          : isApproval
+            ? typeof approvalReply === "function"
+              ? approvalReply(payload)
+              : approvalReply ?? "ALLOW\n理由：当前任务产物范围明确\n风险：低"
+            : typeof mainReply === "function"
+              ? mainReply(payload)
+              : mainReply;
       const completion = typeof reply === "string" ? { content: reply } : reply;
       const delta = { role: "assistant" };
       if (completion.content !== undefined) delta.content = completion.content;
@@ -100,6 +105,27 @@ async function startModelServer({ failModel, mainReply = "ok" } = {}) {
     calls,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
+}
+
+function modelToolCall(id, name, input) {
+  return {
+    toolCalls: [
+      {
+        index: 0,
+        id,
+        type: "function",
+        function: { name, arguments: JSON.stringify(input) },
+      },
+    ],
+  };
+}
+
+function currentAgentPhase(payload) {
+  const userIndex = payload.messages.findLastIndex((message) => message.role === "user");
+  const userContent = payload.messages[userIndex]?.content;
+  const prompt = typeof userContent === "string" ? userContent : JSON.stringify(userContent ?? "");
+  const messages = payload.messages.slice(Math.max(0, userIndex + 1));
+  return { prompt, toolMessages: messages.filter((message) => message.role === "tool") };
 }
 
 async function makeTempDir(t) {
@@ -223,7 +249,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
     apiKey: "approval-secret",
     timeoutMs: 10000,
   });
-  assert.deepEqual(call.writeRoots, [join(instanceDir, "context")]);
+  assert.deepEqual(call.writeRoots, [join(instanceDir, "context"), join(instanceDir, "workspace")]);
   assert.deepEqual(call.protectedRoots, [projectDir]);
   assert.equal(call.modelClientPath, join(projectDir, "src/model-client.js"));
 });
@@ -515,7 +541,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   for (const call of calls) {
     assert.equal(call.prompt.includes(source), false);
     assert.equal(call.agentDir, join(instanceDir, "agent"));
-    assert.deepEqual(call.roots, [join(instanceDir, "context")]);
+    assert.deepEqual(call.roots, [join(instanceDir, "context"), join(instanceDir, "workspace")]);
   }
   const state = JSON.parse(await readFile(join(instanceDir, "data/session-state.json"), "utf8"));
   assert.equal(Object.keys(state.generation).length, 1);
@@ -867,7 +893,7 @@ test("实例配置可跨进程重读且两个实例的会话与运行状态独�
 import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const prompt = args.at(-1);
-appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ sessionId: args[args.indexOf("--session-id") + 1], agentDir: process.env.PI_CODING_AGENT_DIR }) + "\\n");
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ prompt, sessionId: args[args.indexOf("--session-id") + 1], agentDir: process.env.PI_CODING_AGENT_DIR }) + "\\n");
 const resourcePath = prompt.match(/\\| path: ([^|]+?) \\| depth:/)?.[1]?.trim();
 const resource = resourcePath ? readFileSync(resourcePath, "utf8") : "";
 if (resourcePath) {
@@ -919,6 +945,352 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
     calls.map((call) => call.agentDir),
     [join(a.instanceDir, "agent"), join(a.instanceDir, "agent"), join(b.instanceDir, "agent"), join(b.instanceDir, "agent")],
   );
+  const workspaceA = join(a.instanceDir, "workspace");
+  const workspaceB = join(b.instanceDir, "workspace");
+  for (const [index, workspace] of [workspaceA, workspaceA, workspaceB, workspaceB].entries()) {
+    assert.ok(calls[index].prompt.split("\n").includes(`workspace: ${workspace}`));
+    assert.equal(calls[index].prompt.includes(`workspace: ${workspace === workspaceA ? workspaceB : workspaceA}`), false);
+  }
+});
+
+test("公开查数任务由真实 pi 渐进加载业务知识与 Skill，并从隔离假 BI 取得结果后经过 Guard", { timeout: 120000 }, async (t) => {
+  const realPi = join(homedir(), ".pi-support/bin/pi");
+  if (!existsSync(realPi)) {
+    t.skip("本机未安装隔离 pi，跳过真实 pi 查数公开工作流验收");
+    return;
+  }
+  const root = await makeTempDir(t);
+  const source = join(root, "shared-data-skill");
+  const instanceDir = join(root, "instance");
+  const isolatedHome = join(root, "home");
+  const defaultKnowledgeRoot = "/Users/kyle/Desktop/PM/信息技术部资产库/知识库";
+  const defaultScriptDir = `${defaultKnowledgeRoot}/数据库/ajly-db-wiki/scripts`;
+  const trustedKnowledgeRoot = join(isolatedHome, "Desktop/PM/信息技术部资产库/知识库");
+  const trustedScriptDir = join(trustedKnowledgeRoot, "数据库/ajly-db-wiki/scripts");
+  const fakeBiScript = join(trustedScriptDir, "bi_query.py");
+  const extensionCopy = join(root, "default-mode-extension/bash-whitelist.ts");
+  const realPiWrapper = join(root, "real-pi-default-mode.js");
+  const extensionSource = await readFile(join(projectDir, "extensions/bash-whitelist.ts"), "utf8");
+  const isolatedExtension = extensionSource
+    .replace(JSON.stringify(defaultScriptDir), JSON.stringify(trustedScriptDir))
+    .replace(JSON.stringify(defaultKnowledgeRoot), JSON.stringify(trustedKnowledgeRoot));
+  assert.ok(isolatedExtension.includes(JSON.stringify(trustedScriptDir)));
+  assert.ok(isolatedExtension.includes(JSON.stringify(trustedKnowledgeRoot)));
+  await mkdir(dirname(extensionCopy), { recursive: true });
+  await writeFile(extensionCopy, isolatedExtension, { mode: 0o555 });
+  // 04 不允许本地实例执行副本内 Python。此验收仅借现有 binary 注入点启动真实 pi 的
+  // 默认只读模式，并把既有默认 Wiki 来源重定位到隔离 HOME；白名单规则本身不变。
+  await writeFile(
+    realPiWrapper,
+    `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+const args = process.argv.slice(2);
+const extensionIndex = args.indexOf("--extension");
+if (extensionIndex < 0) throw new Error("missing extension argument");
+args[extensionIndex + 1] = process.env.REAL_PI_TEST_EXTENSION;
+const roots = [...JSON.parse(process.env.WECOM_BOT_ROOTS || "[]"), process.env.REAL_PI_TEST_TRUSTED_ROOT];
+const child = spawn(process.env.REAL_PI_BINARY, args, {
+  env: { ...process.env, WECOM_BOT_LOCAL_INSTANCE: "0", WECOM_BOT_ROOTS: JSON.stringify(roots) },
+  stdio: "inherit",
+});
+child.once("error", (error) => { throw error; });
+child.once("exit", (code, signal) => {
+  if (signal) process.kill(process.pid, signal);
+  else process.exit(code ?? 1);
+});
+`,
+    { mode: 0o755 },
+  );
+  const files = {
+    concept: join(source, "wiki/概念/机构.md"),
+    skill: join(source, "skills/data-query/SKILL.md"),
+    reference: join(source, "skills/data-query/references/query-checklist.md"),
+    script: join(source, "skills/data-query/scripts/not-needed.sh"),
+    unrelatedSkill: join(source, "skills/document-delivery/SKILL.md"),
+    playbook: join(source, "prompts/data-playbook.md"),
+    experience: join(source, ".lzz-db-wiki-evolution/common/机构经验.md"),
+    metrics: join(source, "metrics/机构总数.md"),
+    sql: join(source, "queries/机构总数.sql"),
+    table: join(source, "tables/ajly_flow/system_tenant.md"),
+  };
+  for (const path of Object.values(files)) await mkdir(dirname(path), { recursive: true });
+  await writeFile(files.concept, "---\nsource_time: 2026-11-01\nstatus: current\n---\nBUSINESS_CONCEPT：机构是入驻主体。\n");
+  await writeFile(
+    files.skill,
+    "---\nname: data-query\ndescription: >-\n  按业务口径完成\n  只读查数\ncapabilities:\n  - 口径核对\n  - 已验证 SQL\n  - 只读 BI\ntriggers:\n  - 查数\ntasks:\n  - data\nsource_time: 2026-11-04\n---\nDATA_SKILL_BODY：具体查数必须读取 references/query-checklist.md；scripts 仅在人工要求自动化时使用。\n",
+  );
+  await writeFile(files.reference, "QUERY_REFERENCE：核对经验、指标、已验证 SQL、表文档后才执行只读查询。\n");
+  await writeFile(files.script, "UNNEEDED_SCRIPT_BODY\n");
+  await writeFile(files.unrelatedSkill, "---\nname: document-delivery\ndescription: 创建文档\ntriggers: 文档\n---\nUNRELATED_DOCUMENT_SKILL_BODY\n");
+  await writeFile(files.playbook, "查数手册：先口径后查询。\n");
+  await writeFile(files.experience, "机构统计排除门店品牌配置。\n");
+  await writeFile(files.metrics, "---\nsource_time: 2026-11-02\nstatus: current\n---\n机构总数只统计有效入驻机构。\n");
+  await writeFile(files.sql, "-- ✅ 已验证\nSELECT tenant_id FROM system_tenant WHERE deleted = 0;\n");
+  await writeFile(files.table, "system_tenant.tenant_id 是机构标识，deleted 是软删标记。\n");
+  await mkdir(dirname(fakeBiScript), { recursive: true });
+  await writeFile(
+    fakeBiScript,
+    "import sys\nif sys.argv[1:] != ['SELECT 56 AS tenant_count']:\n    raise SystemExit('unexpected test query')\nprint('FAKE_BI_COUNT=56')\n",
+    { mode: 0o555 },
+  );
+  const localFiles = Object.fromEntries(
+    Object.entries(files).map(([key, path]) => [key, path.replace(source, join(instanceDir, "context/001-shared-data-skill"))]),
+  );
+  let observedExternalResult = false;
+  const models = await startModelServer({
+    mainReply: (payload) => {
+      const { prompt, toolMessages } = currentAgentPhase(payload);
+      const phase = prompt.includes("继续完成数据口径任务")
+        ? "sql"
+        : prompt.includes("这是查数或数据口径任务")
+          ? "metrics"
+          : "initial";
+      if (phase === "initial") {
+        if (toolMessages.length === 0) return modelToolCall("data-read-skill", "read", { path: localFiles.skill });
+        if (toolMessages.length === 1) return modelToolCall("data-read-reference", "read", { path: localFiles.reference });
+        if (toolMessages.length === 2) return modelToolCall("data-read-concept", "read", { path: localFiles.concept });
+        return "CONTEXT_INSUFFICIENT\nSkill 与业务概念已加载，还缺查数证据";
+      }
+      if (phase === "metrics") {
+        if (toolMessages.length === 0) return modelToolCall("data-read-playbook", "read", { path: localFiles.playbook });
+        if (toolMessages.length === 1) return modelToolCall("data-read-experience", "read", { path: localFiles.experience });
+        if (toolMessages.length === 2) return modelToolCall("data-read-metrics", "read", { path: localFiles.metrics });
+        return "CONTEXT_INSUFFICIENT\n口径已确认，还缺 SQL 和表字段核对";
+      }
+      if (toolMessages.length === 0) return modelToolCall("data-read-sql", "read", { path: localFiles.sql });
+      if (toolMessages.length === 1) return modelToolCall("data-read-table", "read", { path: localFiles.table });
+      if (toolMessages.length === 2) {
+        return modelToolCall("data-query-fake-bi", "bash", { command: `python3 "${fakeBiScript}" "SELECT 56 AS tenant_count"` });
+      }
+      if (!JSON.stringify(toolMessages).includes("FAKE_BI_COUNT=56")) return "EXTERNAL_QUERY_RESULT_MISSING";
+      observedExternalResult = true;
+      return "按当前指标口径，机构总数为 56 家。";
+    },
+  });
+  t.after(() => models.close());
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    model: "main-model",
+    guardModel: "guard-model",
+  });
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "查一下乐租租现在有多少入驻机构", "--session-key", "real-data-skill"],
+    {
+      env: {
+        ...process.env,
+        HOME: isolatedHome,
+        WECOM_BOT_PI_BINARY: realPiWrapper,
+        REAL_PI_BINARY: realPi,
+        REAL_PI_TEST_EXTENSION: extensionCopy,
+        REAL_PI_TEST_TRUSTED_ROOT: trustedKnowledgeRoot,
+      },
+      timeout: 90000,
+    },
+  );
+
+  assert.equal(result.finalText, "按当前指标口径，机构总数为 56 家。");
+  assert.equal(result.currentSkill, "data-query");
+  assert.equal(result.guarded, true);
+  assert.equal(observedExternalResult, true);
+  assert.equal(result.loadedSkills.length, 1);
+  assert.equal(result.loadedSkills[0].skillName, "data-query");
+  assert.deepEqual(
+    result.loadedResources.map((resource) => resource.resourceType),
+    ["skill", "skill-reference", "concept", "playbook", "experience", "metrics", "sql", "table"],
+  );
+  assert.ok(result.loadedResources.every((resource) => resource.source === "shared-data-skill" && resource.scope === "shared"));
+  assert.equal(result.loadedResources.some((resource) => resource.resourceType === "skill-script"), false);
+  assert.equal(result.loadedResources.some((resource) => resource.skillName === "document-delivery"), false);
+  assert.equal(result.loadDepth, "sql");
+  const executionApprovalCalls = models.calls.filter((call) =>
+    call.messages.some((message) => typeof message.content === "string" && message.content.includes("你是独立的执行审批模型")),
+  );
+  assert.equal(executionApprovalCalls.length, 0, "受信任只读查询只直接放行，不进入 write/edit 执行审批");
+  assert.ok(models.calls.some((call) => call.model === "guard-model" && JSON.stringify(call.messages).includes("机器人的答复")));
+  const mainCalls = models.calls.filter((call) => call.model === "main-model" && call.stream);
+  assert.match(JSON.stringify(mainCalls[0].messages), /按业务口径完成\s+只读查数/);
+  assert.match(JSON.stringify(mainCalls[0].messages), /capabilities: 口径核对、已验证 SQL、只读 BI/);
+  assert.equal(JSON.stringify(mainCalls[0].messages).includes("DATA_SKILL_BODY"), false);
+  assert.equal(JSON.stringify(mainCalls[0].messages).includes("QUERY_REFERENCE"), false);
+  assert.equal(JSON.stringify(mainCalls[0].messages).includes("UNNEEDED_SCRIPT_BODY"), false);
+  assert.equal(JSON.stringify(mainCalls[0].messages).includes("UNRELATED_DOCUMENT_SKILL_BODY"), false);
+});
+
+test("公开文档任务由真实 pi 读取 Skill，按 DENY 理由调整并新建后编辑本次工作区产物", { timeout: 120000 }, async (t) => {
+  const realPi = join(homedir(), ".pi-support/bin/pi");
+  if (!existsSync(realPi)) {
+    t.skip("本机未安装隔离 pi，跳过真实 pi 文档公开工作流验收");
+    return;
+  }
+  const root = await makeTempDir(t);
+  const source = join(root, "shared-docs");
+  const instanceDir = join(root, "instance");
+  const conceptPath = join(source, "wiki/概念/退租.md");
+  const skillPath = join(source, "skills/document-delivery/SKILL.md");
+  const referencePath = join(source, "skills/document-delivery/references/layout.md");
+  const unrelatedSkillPath = join(source, "skills/prototype/SKILL.md");
+  const conceptBody = "---\nsummary: 退租规则摘要\nsource_time: 2026-11-01\nstatus: current\n---\nBUSINESS_RULE：退租审批需要两级审批。\n";
+  for (const path of [conceptPath, skillPath, referencePath, unrelatedSkillPath]) await mkdir(dirname(path), { recursive: true });
+  await writeFile(conceptPath, conceptBody);
+  await writeFile(
+    skillPath,
+    "---\nname: document-delivery\ndescription: 创建或修改业务文档与报告\ncapabilities: 文档生成、模板套用、受限写入\ntriggers: 文档,报告\nsource_time: 2026-11-04\n---\nDOC_SKILL_BODY：生成文档时先读取 references/layout.md；只有任务要求自动转换格式时才读取 scripts。\n",
+  );
+  await writeFile(referencePath, "REFERENCE_REQUIRED：文档先给结论，再列规则。\n");
+  await writeFile(unrelatedSkillPath, "---\nname: prototype\ndescription: 生成 HTML 原型\ntriggers: 原型\n---\nUNRELATED_SKILL_BODY\n");
+  const localConceptPath = join(instanceDir, "context/001-shared-docs/wiki/概念/退租.md");
+  const localSkillPath = join(instanceDir, "context/001-shared-docs/skills/document-delivery/SKILL.md");
+  const localReferencePath = join(instanceDir, "context/001-shared-docs/skills/document-delivery/references/layout.md");
+  const artifactPath = join(instanceDir, "workspace/退租规则.md");
+  const unrelatedPath = join(instanceDir, "workspace/unrelated.md");
+  const initialArtifact = "退租审批需要两级审批。\n文档先给结论，再列规则。\n";
+  const finalArtifact = "已复核：退租审批需要两级审批。\n文档先给结论，再列规则。\n";
+  let observedDenialReason = false;
+  const models = await startModelServer({
+    approvalReply: (payload) => {
+      const operation = JSON.parse(payload.messages[1].content);
+      return operation.arguments.path.endsWith("unrelated.md")
+        ? "DENY\n理由：只生成当前文档并更新本次产物，不要创建无关文件\n风险：中"
+        : "ALLOW\n理由：本次文档产物的新建与复核修改均在任务范围内\n风险：低";
+    },
+    mainReply: (payload) => {
+      const { toolMessages } = currentAgentPhase(payload);
+      if (toolMessages.length === 0) return modelToolCall("document-read-skill", "read", { path: localSkillPath });
+      if (toolMessages.length === 1) return modelToolCall("document-read-reference", "read", { path: localReferencePath });
+      if (toolMessages.length === 2) return modelToolCall("document-read-concept", "read", { path: localConceptPath });
+      if (toolMessages.length === 3) {
+        return modelToolCall("document-write-unrelated", "write", { path: unrelatedPath, content: "无关内容" });
+      }
+      if (toolMessages.length === 4) {
+        const denial = JSON.stringify(toolMessages.at(-1));
+        if (!denial.includes("只生成当前文档并更新本次产物")) return "DENY_REASON_NOT_USED";
+        observedDenialReason = true;
+        return modelToolCall("document-write-artifact", "write", { path: artifactPath, content: initialArtifact });
+      }
+      if (toolMessages.length === 5) {
+        return modelToolCall("document-edit-artifact", "edit", {
+          path: artifactPath,
+          edits: [{ oldText: "退租审批需要两级审批。", newText: "已复核：退租审批需要两级审批。" }],
+        });
+      }
+      return "文档已新建，已根据审批理由缩小范围并完成本次产物修改。";
+    },
+  });
+  t.after(() => models.close());
+  const initialized = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    model: "main-model",
+    guardModel: "guard-model",
+    approvalModel: "approval-model",
+  });
+  assert.equal(initialized.ready, true);
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "根据退租规则生成一份文档，并在生成后复核修改本次文档产物", "--session-key", "real-document-skill"],
+    { env: { ...process.env, HOME: join(root, "home"), WECOM_BOT_PI_BINARY: realPi }, timeout: 90000 },
+  );
+
+  assert.equal(result.finalText, "文档已新建，已根据审批理由缩小范围并完成本次产物修改。");
+  assert.equal(result.currentSkill, "document-delivery");
+  assert.equal(result.guarded, false);
+  assert.equal(observedDenialReason, true);
+  assert.equal(await readFile(artifactPath, "utf8"), finalArtifact);
+  assert.equal(existsSync(unrelatedPath), false);
+  assert.equal(await readFile(conceptPath, "utf8"), conceptBody, "原始来源必须保持不变");
+  assert.equal(result.loadedSkills.length, 1);
+  assert.equal(result.loadedSkills[0].skillName, "document-delivery");
+  assert.equal(result.loadedSkills[0].sourceTime, "2026-11-04");
+  assert.ok(result.loadedResources.some((resource) => resource.resourceType === "skill-reference" && resource.path === localReferencePath));
+  assert.ok(result.loadedResources.some((resource) => resource.path === localConceptPath && resource.resourceType === "concept"));
+  assert.deepEqual(result.executionApprovals.map((entry) => entry.verdict), ["DENY", "ALLOW", "ALLOW"]);
+  assert.deepEqual(result.executionApprovals.map((entry) => entry.toolName), ["write", "write", "edit"]);
+  assert.equal(result.executionApprovals[0].target, unrelatedPath);
+  assert.ok(result.executionApprovals.slice(1).every((entry) => entry.target === artifactPath));
+  const approvalCalls = models.calls.filter((call) => call.model === "approval-model" && !call.stream);
+  assert.equal(approvalCalls.length, 3);
+  for (const call of approvalCalls) {
+    assert.equal(JSON.parse(call.messages[1].content).task.currentSkill, "document-delivery");
+  }
+  assert.ok(models.calls.some((call) => call.model === "guard-model"), "初始化已验证 Guard 模型可用");
+  const mainCalls = models.calls.filter((call) => call.model === "main-model" && call.stream);
+  const initialPrompt = currentAgentPhase(mainCalls[0]).prompt;
+  assert.match(initialPrompt, /文档生成、模板套用、受限写入/);
+  assert.match(initialPrompt, /skill: prototype/);
+  assert.equal(initialPrompt.includes(projectDir), false, "不得向任务 Agent 暴露主工作区路径");
+  assert.equal(initialPrompt.includes(source), false, "不得向任务 Agent 暴露初始化前的原始来源路径");
+  assert.equal(initialPrompt.includes("DOC_SKILL_BODY"), false);
+  assert.equal(initialPrompt.includes("REFERENCE_REQUIRED"), false);
+  assert.equal(initialPrompt.includes("UNRELATED_SKILL_BODY"), false);
+});
+
+test("Skill frontmatter 的块描述与 YAML 列表进入公开目录并参与路由", async (t) => {
+  const root = await makeTempDir(t);
+  const source = join(root, "shared-skills");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  const documentSkill = join(source, "skills/document-delivery/SKILL.md");
+  const conceptSkill = join(source, "skills/concept-guide/SKILL.md");
+  await mkdir(dirname(documentSkill), { recursive: true });
+  await mkdir(dirname(conceptSkill), { recursive: true });
+  await writeFile(
+    documentSkill,
+    "---\nname: document-delivery\ndescription: >-\n  创建或修改业务文档，\n  并按退租规则生成报告。\ncapabilities:\n  - 文档生成\n  - 受限写入\ntriggers:\n  - 退租文档\n  - 报告\ntasks:\n  - document\n---\nDOC_SKILL_BODY\n",
+  );
+  await writeFile(
+    conceptSkill,
+    "---\nname: concept-guide\ndescription: |-\n  按概念说明业务规则\n  保留来源时间\ncapabilities:\n  - 概念核对\n  - 来源追踪\ntriggers:\n  - 概念盘点\ntasks:\n  - concept\n---\nCONCEPT_SKILL_BODY\n",
+  );
+  const models = await startModelServer();
+  t.after(() => models.close());
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ prompt: process.argv.at(-1), currentSkill: process.env.WECOM_BOT_CURRENT_SKILL || "missing" }) + "\\n");
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }));
+`,
+    { mode: 0o755 },
+  );
+  const env = { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog };
+
+  const documentResult = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "请生成退租文档", "--session-key", "frontmatter-document"],
+    { env },
+  );
+  const conceptResult = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "这个术语是什么？", "--session-key", "frontmatter-concept"],
+    { env },
+  );
+
+  assert.equal(documentResult.currentSkill, "document-delivery");
+  assert.equal(conceptResult.currentSkill, "concept-guide");
+  const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(calls[0].currentSkill, "document-delivery");
+  assert.equal(calls[1].currentSkill, "concept-guide");
+  assert.match(calls[0].prompt, /创建或修改业务文档，\s+并按退租规则生成报告。/);
+  assert.match(calls[0].prompt, /按概念说明业务规则\n保留来源时间/);
+  assert.match(calls[0].prompt, /capabilities: 文档生成、受限写入/);
+  assert.match(calls[0].prompt, /capabilities: 概念核对、来源追踪/);
+  assert.match(calls[0].prompt, /triggers: 退租文档、报告/);
+  assert.match(calls[0].prompt, /tasks: concept/);
+  assert.equal(calls[0].prompt.includes("trigger: >-"), false);
+  assert.equal(calls[0].prompt.includes("trigger: |-"), false);
+  assert.equal(calls[0].prompt.includes("DOC_SKILL_BODY"), false);
+  assert.equal(calls[0].prompt.includes("CONCEPT_SKILL_BODY"), false);
 });
 
 test("真实 pi 使用初始化生成的模型配置读取本地副本", { timeout: 60000 }, async (t) => {

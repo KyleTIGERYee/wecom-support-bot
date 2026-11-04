@@ -466,10 +466,32 @@ test("S13 真实扩展 tool_call 通过独立模型 ALLOW、DENY 且硬阻断不
   assert.equal(model.calls.length, 2);
 });
 
-test("S13 写根内的同名 Python 脚本不能冒充受信任检索脚本", async (t) => {
+test("S13 真实扩展把编排传入的当前 Skill 交给审批模型", async (t) => {
+  const { copyRoot } = await makeCopyRoot(t);
+  const model = await startApprovalModel(t, () => "ALLOW\n理由：文档产物与当前 Skill 和任务一致\n风险：低");
+  setEnv(t, "WECOM_BOT_CURRENT_SKILL", "docx");
+  const handler = await loadEnabledApprovalHook(t, {
+    readRoots: [copyRoot],
+    writeRoots: [copyRoot],
+    baseUrl: model.baseUrl,
+  });
+
+  const allowed = await handler(
+    writeEvent(join(copyRoot, "workspace/退租规则.md"), "按真实 Skill 生成的内容"),
+    taskContext("生成退租规则文档"),
+  );
+
+  assert.equal(allowed, undefined);
+  const operation = JSON.parse(model.calls[0].messages[1].content);
+  assert.equal(operation.task.currentSkill, "docx");
+  assert.match(operation.task.goal, /生成退租规则文档/);
+});
+
+test("S13 外部环境变量不能把可写副本的同名 Python 脚本加入白名单", async (t) => {
   const { copyRoot } = await makeCopyRoot(t);
   const script = join(copyRoot, "bi_query.py");
   await writeFile(script, "raise SystemExit('untrusted code executed')\n");
+  setEnv(t, "WECOM_BOT_TRUSTED_PYTHON_SCRIPTS", JSON.stringify([script]));
   const model = await startApprovalModel(t, () => "ALLOW\n理由：模型错误信任同名脚本\n风险：低");
   const handler = await loadEnabledApprovalHook(t, {
     readRoots: [copyRoot],
@@ -486,7 +508,8 @@ test("S13 写根内的同名 Python 脚本不能冒充受信任检索脚本", as
 
   assert.equal(result?.block, true);
   assert.match(result?.reason ?? "", /hard-rule/);
-  assert.equal(model.calls.length, 0, "模型 ALLOW 不得覆盖不受信任脚本来源的硬拒绝");
+  assert.match(result?.reason ?? "", /不在可审批命令白名单内/);
+  assert.equal(model.calls.length, 0, "外部环境变量和模型 ALLOW 均不得覆盖可写同名脚本的硬拒绝");
 });
 
 test("S13 Python 选项不能借受信任脚本路径绕过脚本入口硬规则", async () => {

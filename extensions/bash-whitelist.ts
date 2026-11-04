@@ -168,6 +168,7 @@ const ROOTS: string[] = process.env.WECOM_BOT_ROOTS
 const EXECUTION_APPROVAL: any = readEnvJson("WECOM_BOT_EXECUTION_APPROVAL", { enabled: false });
 const WRITE_ROOTS = readEnvJson<string[]>("WECOM_BOT_WRITE_ROOTS", []);
 const PROTECTED_ROOTS = readEnvJson<string[]>("WECOM_BOT_PROTECTED_ROOTS", []);
+const CURRENT_SKILL = process.env.WECOM_BOT_CURRENT_SKILL?.trim() || "unknown";
 let approvalClientPromise: Promise<(messages: Array<{ role: string; content: string }>) => Promise<string>> | null = null;
 
 function readEnvJson<T>(name: string, fallback: T): T {
@@ -430,7 +431,7 @@ export async function processApprovedToolCall({
 	const messages = [
 		{
 			role: "system",
-			content: "你是独立的执行审批模型，不执行工具。根据任务目标、task.currentSkill、工具完整参数、真实目标和必要变更，判断操作的相关性、必要性、范围与潜在副作用。task.currentSkill 为 unknown 表示 pi 0.84.1 未提供 Skill 上下文，不得猜测或假定已加载 Skill。每次调用独立审批，不得把本次 ALLOW 当作后续授权。只输出三行：\nALLOW 或 DENY\n理由：简短且可操作的理由\n风险：低、中或高",
+			content: "你是独立的执行审批模型，不执行工具。根据任务目标、task.currentSkill、工具完整参数、真实目标和必要变更，判断操作的相关性、必要性、范围与潜在副作用。task.currentSkill 由轮次编排根据真实 Skill 目录传入；unknown 表示本轮未命中 Skill、未提供 Skill 上下文，不得猜测或假定已加载 Skill。每次调用独立审批，不得把本次 ALLOW 当作后续授权。只输出三行：\nALLOW 或 DENY\n理由：简短且可操作的理由\n风险：低、中或高",
 		},
 		{
 			role: "user",
@@ -661,7 +662,7 @@ function extractTaskContext(ctx: any): { goal: string; currentSkill: string } {
 			: "未提供任务目标";
 	return {
 		goal,
-		currentSkill: "unknown",
+		currentSkill: CURRENT_SKILL,
 	};
 }
 

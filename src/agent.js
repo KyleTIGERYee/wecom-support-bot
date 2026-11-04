@@ -39,10 +39,10 @@ export function killAllChildren() {
 /**
  * 默认的进程启动器：调用隔离的 pi 实例，输出 JSONL 事件流。
  *
- * @param {{prompt: string, sessionId: string, config: any, projectDir: string, thinkingLevel?: string}} options
+ * @param {{prompt: string, sessionId: string, config: any, projectDir: string, thinkingLevel?: string, currentSkill?: string}} options
  * @returns {import("node:child_process").ChildProcess}
  */
-export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }) {
+export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel, currentSkill }) {
   const args = [
     "--mode",
     "json",
@@ -75,6 +75,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
       WECOM_BOT_ROOTS: JSON.stringify(config.roots ?? []),
       WECOM_BOT_LOCAL_INSTANCE: config.pi.localInstance ? "1" : "0",
       WECOM_BOT_EXECUTION_APPROVAL: JSON.stringify(config.executionApproval ?? { enabled: false }),
+      WECOM_BOT_CURRENT_SKILL: currentSkill ?? "unknown",
       WECOM_BOT_WRITE_ROOTS: JSON.stringify(config.writeRoots ?? []),
       WECOM_BOT_PROTECTED_ROOTS: JSON.stringify(config.protectedRoots ?? []),
       WECOM_BOT_MODEL_CLIENT_PATH: `${projectDir}/src/model-client.js`,
@@ -108,8 +109,9 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
  *   config?: any,
  *   projectDir?: string,
  *   resourceCatalog?: Array<any>
+ *   currentSkill?: string
  * }} options
- * @returns {Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, inputTokens: number, contextInsufficient: boolean, loadedResources: Array<any>}>}
+ * @returns {Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, inputTokens: number, contextInsufficient: boolean, loadedResources: Array<any>, executionApprovals: Array<any>}>}
  */
 export async function runAgentTurn({
   prompt,
@@ -122,17 +124,18 @@ export async function runAgentTurn({
   config,
   projectDir,
   resourceCatalog = [],
+  currentSkill = "unknown",
 }) {
   /** @param {{prompt: string, sessionId: string}} options */
   const defaultLaunch = (options) => {
     if (!config || !projectDir) throw new Error("缺少 config 或 projectDir");
-    return spawnPi({ ...options, thinkingLevel, config, projectDir });
+    return spawnPi({ ...options, thinkingLevel, config, projectDir, currentSkill });
   };
   const launch = runner ?? defaultLaunch;
   const hardLimit = hardTimeoutMs ?? timeoutMs;
 
   return new Promise((resolvePromise) => {
-    const child = launch({ prompt, sessionId, thinkingLevel, config, projectDir });
+    const child = launch({ prompt, sessionId, thinkingLevel, config, projectDir, currentSkill });
 
     let text = "";
     let biTouched = false;
@@ -143,6 +146,8 @@ export async function runAgentTurn({
     let settled = false;
     /** @type {Array<any>} */
     const loadedResources = [];
+    /** @type {Array<any>} */
+    const executionApprovals = [];
     /** @type {Map<string, string>} */
     const pendingReads = new Map();
     /** @type {NodeJS.Timeout | undefined} */
@@ -164,6 +169,7 @@ export async function runAgentTurn({
         stalled,
         failed: false,
         loadedResources: loadedResources.map((resource) => ({ ...resource })),
+        executionApprovals: executionApprovals.map((approval) => ({ ...approval })),
         ...extra,
       });
     };
@@ -224,7 +230,8 @@ export async function runAgentTurn({
         buffer += chunk.toString();
         let newlineIndex = buffer.indexOf("\n");
         while (newlineIndex !== -1) {
-          relayExecutionApprovalLog(buffer.slice(0, newlineIndex));
+          const approval = relayExecutionApprovalLog(buffer.slice(0, newlineIndex));
+          if (approval) executionApprovals.push(approval);
           buffer = buffer.slice(newlineIndex + 1);
           newlineIndex = buffer.indexOf("\n");
         }
@@ -244,13 +251,14 @@ export async function runAgentTurn({
  * 只转发扩展产生的执行审批摘要；其他 stderr 与未白名单化的字段不进入父进程日志。
  *
  * @param {string} line
+ * @returns {Record<string, string>|null}
  */
 function relayExecutionApprovalLog(line) {
   const prefix = "[execution-approval] ";
-  if (!line.startsWith(prefix)) return;
+  if (!line.startsWith(prefix)) return null;
   try {
     const entry = JSON.parse(line.slice(prefix.length));
-    if (entry?.type !== "execution_approval") return;
+    if (entry?.type !== "execution_approval") return null;
     const summary = /** @type {Record<string, string>} */ ({ type: "execution_approval" });
     for (const key of ["timestamp", "toolCallId", "toolName", "target", "command", "verdict", "source", "riskCategory"]) {
       if (typeof entry[key] === "string") summary[key] = entry[key];
@@ -259,8 +267,10 @@ function relayExecutionApprovalLog(line) {
     if (entry.source === "hard-rule" && typeof entry.reason === "string") summary.reason = entry.reason;
     if (entry.source === "model") summary.reason = entry.verdict === "ALLOW" ? "model-allow" : "model-deny";
     process.stderr.write(`${prefix}${JSON.stringify(summary)}\n`);
+    return summary;
   } catch {
     // 非审批日志或截断的 JSON 不转发，避免把子进程凭证与完整参数带入日志。
+    return null;
   }
 }
 

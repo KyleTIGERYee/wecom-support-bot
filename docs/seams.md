@@ -5,9 +5,9 @@
 | 缝 | 模块 | 公开签名 | 验证的行为 |
 |---|---|---|---|
 | S1 命令白名单 | `src/command-whitelist.js` | `isCommandAllowed(command, roots) → {allowed, reason}` | 合法脚本放行；写入、外传、越界路径、读凭证全部拒绝 |
-| S2 Agent 调用 | `src/agent.js` | `runAgentTurn({prompt, sessionId, runner, timeoutMs, idleTimeoutMs, hardTimeoutMs, thinkingLevel, config, projectDir, resourceCatalog?}) → {text, biTouched, timedOut, stalled, failed, inputTokens, contextInsufficient, loadedResources}` | 从事件流提取最终答复；识别 bi_query.py；事件流持续吐时不超时；静默超过 idle 判 stalled；超过 hard 判 timedOut；回传输入 token 数；思考强度透传给 runner；识别概念内容不足信号；记录目录内成功完成的 read 及资源类型/深度 |
+| S2 Agent 调用 | `src/agent.js` | `runAgentTurn({prompt, sessionId, runner, timeoutMs, idleTimeoutMs, hardTimeoutMs, thinkingLevel, config, projectDir, resourceCatalog?, currentSkill?}) → {text, biTouched, timedOut, stalled, failed, inputTokens, contextInsufficient, loadedResources, executionApprovals}` | 从事件流提取最终答复；识别 bi_query.py；事件流持续吐时不超时；静默超过 idle 判 stalled；超过 hard 判 timedOut；回传输入 token 数；思考强度透传给 runner；识别概念内容不足信号；记录目录内成功完成的 read 及资源类型/深度；传递真实当前 Skill 并公开脱敏审批摘要 |
 | S3 守卫判定 | `src/guard.js` | `reviewReply({answer, callModel}) → {verdict, reason}` | ALLOW/DENY 解析；模型故障时 fail-closed；只判答复、不接收提问 |
-| S4 轮次编排 | `src/orchestrate.js` | `handleTurn({question, sessionKey, deps}) → {finalText, rounds, guarded, exhausted, timedOut, stalled, stallRetries, loadedResources, loadDepth}`；`deps.context` 提供薄资源目录与查数手册可用性 | DENY 后重写一次即通过；连续 3 次 DENY 走兜底；未碰 BI 时不调用 guard；卡住自动重试一次，仍卡住给超时话术；简单概念不强制 raw，具体规则按概念内容充分性深化，查数按需读手册；公开实际加载来源、时间、资源类型与最深深度 |
+| S4 轮次编排 | `src/orchestrate.js` | `handleTurn({question, sessionKey, deps}) → {finalText, rounds, guarded, exhausted, timedOut, stalled, stallRetries, currentSkill, loadedSkills, loadedResources, executionApprovals, loadDepth}`；`deps.context` 提供薄资源目录、查数手册可用性及 Skill 元数据 | DENY 后重写一次即通过；连续 3 次 DENY 走兜底；未碰 BI 时不调用 guard；卡住自动重试一次，仍卡住给超时话术；简单概念不强制 raw，具体规则按概念内容充分性深化，查数按需读手册；知识与 Skill 共用任务路由，命中后读取真实正文且按需深入引用；公开实际加载来源、时间、Skills、引用资源、审批结果与最深深度 |
 | S5 会话标记 | `src/session-state.js` | `createSessionState({storePath, rotation}) → {resolveSessionId(userKey, now), recordActivity, startNewSession, markBiTouched, isBiTouched, flush}` | 跨进程重启保留；文件损坏时保守地全量过 guard；会话满 24 小时 / 闲置满 24 小时 / 上下文超阈值自动换代；老状态文件首次访问换一次；旧代粘性标记随之作废 |
 | S6 收件箱 | `src/inbox.js` | `createInbox({storePath}) → {load, accept(msg) → {isNew}, markRunning, markAnswered, markFailed, recoverable(now, windowMs) → msg[], stale(now, windowMs) → msg[], compact, flush}` | 同 msgid 只接受一次；重启后读回未答问题；超出窗口不返回；坏行不崩；清理按保留期丢记录 |
 | S7 投递 | `src/deliver.js` | `deliverFinal({text, stream, push, retries, wait}) → {channel, reason?}` | 流式成功走 stream；流式失败改走 push；push 按次数重试；全失败返回 none 且不抛异常 |
@@ -17,9 +17,9 @@
 | S11 图片下载 | `src/images.js` | `downloadImages({client, images, dir, msgid, maxBytes}) → string[]` | 下载解密后落盘并返回路径；超限拒绝；非常见后缀归一为 .jpg；多张按序号命名 |
 | S12 消息归一化 | `src/wecom.js` | `normalizeMessage(frame) → {text, userId, chatType, chatId, msgid, images} \| null` | 文本/语音/图文混排提取文字；纯图与混排取图；无文字且无图返回 null；会话指令识别与 @提及剥离 |
 | S13 执行审批 | `extensions/bash-whitelist.ts` | 真实 pi `tool_call` 钩子：write/edit/bash → 放行或 `{block, reason}`；`processApprovedToolCall({event, task, callModel, execute, ...}) → {verdict, source, reason, riskCategory, executionResult?}` | ALLOW 后执行；DENY 理由回主 Agent；硬规则不可被模型覆盖；异常、超时、无效输出 fail-closed；逐次审批不扩散；写目标限写根，cp 源限读根，mv 源与目标均限写根且避开保护根；默认企微只读 |
-| S14 本地实例公开工作流程 | `scripts/local-instance.js` | `npm run instance -- init [选项]` / `npm run instance -- ask [选项]` → JSON 结果 | 目录、文件、zip 来源复制与共享范围；主模型/Guard 连接测试；未就绪检查；运行时仅访问本地实例副本；真实 pi 使用生成的模型配置；默认主工作区文件在本地实例中不可读；审批模型与写根注入；配置跨重启与实例间会话隔离；现有 Guard 重写保持可用 |
+| S14 本地实例公开工作流程 | `scripts/local-instance.js` | `npm run instance -- init [选项]` / `npm run instance -- ask [选项]` → JSON 结果 | 目录、文件、zip 来源复制与共享范围；主模型/Guard 连接测试；未就绪检查；运行时仅访问本地实例副本与独立 workspace；真实 pi 使用生成的模型配置；默认主工作区文件在本地实例中不可读；审批模型与写根注入；真实 Skill 正文/引用渐进加载、文档产物和查数组合；配置跨重启与实例间会话隔离；现有 Guard 重写保持可用 |
 
-S14 不新增内部函数测试缝：测试只驱动公开 CLI，以临时目录和本地假 OpenAI 兼容服务替代外部模型；本机存在隔离 pi 时，同时使用真实 pi binary 验证模型配置与文件白名单，不存在时仅跳过这两条真实 pi 验收。S13 使用真实 TS 扩展公开 `tool_call` 行为，并以临时目录、本地假模型和假执行器覆盖执行结果，不访问真实企微、生产或主工作区。
+S14 不新增内部函数测试缝：测试只驱动公开 CLI，以临时目录和本地假 OpenAI 兼容服务替代外部模型。真实 pi 查数验收通过现有 binary 注入点使用默认只读模式，测试扩展副本仅把 04 既有默认 Wiki 脚本目录重定位到隔离 HOME 的只读假数据脚本，不设置环境变量脚本白名单、不访问真实 BI；真实 pi 文档验收仍逐次验证 write/edit 审批。本机存在隔离 pi 时，同时使用真实 pi binary 验证模型配置、文件白名单、文档产物与查数组合，不存在时仅跳过对应真实 pi 验收。S13 使用真实 TS 扩展公开 `tool_call` 行为，并以临时目录、本地假模型和假执行器覆盖执行结果，不访问真实企微、生产或主工作区。
 
 依赖注入约定：S2 的 `runner`、S3/S10 的 `callModel`、S4 的 `deps`、S7 的 `stream`/`push`/`wait`、S8 的 `execute`/`surface`、S11 的 `client` 都是注入点，测试用假实现替换真实的外部边界（子进程、HTTP、企微 SDK、时钟）。项目自身模块一律不 mock。
 

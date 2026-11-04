@@ -266,12 +266,13 @@ async function main() {
         sessionKey,
         deps: {
           state,
-          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries },
-          runAgent: async ({ prompt, sessionId }) => {
+          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills },
+          runAgent: async ({ prompt, sessionId, currentSkill }) => {
             const agentStartedAt = Date.now();
             const agentTurn = await runAgentTurn({
               prompt,
               sessionId,
+              currentSkill,
               config,
               projectDir,
               resourceCatalog: resourceContext.entries,
@@ -369,6 +370,8 @@ async function main() {
       stallRetries: outcome.result.stallRetries ?? 0,
       loadDepth: outcome.result.loadDepth,
       loadedResources: outcome.result.loadedResources,
+      loadedSkills: outcome.result.loadedSkills,
+      executionApprovals: outcome.result.executionApprovals,
       inputTokens: lastInputTokens,
       outLength: text.length,
       totalMs: Date.now() - startedAt,

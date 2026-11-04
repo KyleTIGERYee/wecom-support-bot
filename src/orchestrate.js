@@ -25,6 +25,7 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   validity?: string,
  *   scope?: string,
  *   verification?: string
+ *   skillName?: string
  * }} LoadedResource
  */
 
@@ -34,14 +35,14 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   sessionKey: string,
  *   deps: {
  *     state: {isBiTouched: (key: string) => boolean, markBiTouched: (key: string) => void, flush: () => Promise<void>},
- *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, contextInsufficient?: boolean, loadedResources?: Array<LoadedResource>}>,
+ *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean, currentSkill: string}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, contextInsufficient?: boolean, loadedResources?: Array<LoadedResource>, executionApprovals?: Array<any>}>,
  *     review: (options: {answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>,
- *     context?: {catalog?: string, dataPlaybook?: boolean, entries?: Array<LoadedResource>}
+ *     context?: {catalog?: string, dataPlaybook?: boolean, entries?: Array<LoadedResource>, skills?: Array<any>, workspaceDir?: string}
  *   },
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
  * }} options
- * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string, loadedResources: Array<LoadedResource>, loadDepth: string}>}
+ * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string, currentSkill: string, loadedSkills: Array<LoadedResource>, loadedResources: Array<LoadedResource>, executionApprovals: Array<any>, loadDepth: string}>}
  */
 export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
@@ -50,15 +51,27 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
   const timeoutText = messages.timeoutText ?? DEFAULT_TIMEOUT_TEXT;
 
   const knowledgeTask = classifyKnowledgeTask(question);
-  let prompt = buildInitialPrompt(question, deps.context?.catalog, knowledgeTask);
+  const currentSkill = selectSkill(question, deps.context?.skills, knowledgeTask);
+  let prompt = buildInitialPrompt(
+    question,
+    deps.context?.catalog,
+    knowledgeTask,
+    currentSkill,
+    deps.context?.workspaceDir,
+  );
   let lastDenyReason = "";
   let rounds = 0;
   let stallRetries = 0;
   let needGuard = state.isBiTouched(sessionKey);
   /** @type {Array<LoadedResource>} */
   const loadedResources = [];
+  /** @type {Array<any>} */
+  const executionApprovals = [];
   const observation = () => ({
+    currentSkill: currentSkill?.name ?? "unknown",
+    loadedSkills: loadedResources.filter((resource) => resource.resourceType === "skill").map((resource) => ({ ...resource })),
     loadedResources: loadedResources.map((resource) => ({ ...resource })),
+    executionApprovals: executionApprovals.map((approval) => ({ ...approval })),
     loadDepth: getLoadDepth(loadedResources),
   });
 
@@ -68,7 +81,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
 
     const { turn, retries } = await runWithProgressiveDepth(
       runAgent,
-      { prompt, sessionId: sessionKey, isRework },
+      { prompt, sessionId: sessionKey, isRework, currentSkill: currentSkill?.name ?? "unknown" },
       {
         question,
         task: knowledgeTask,
@@ -76,6 +89,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
         catalogEntries: deps.context?.entries ?? [],
         dataPlaybook: deps.context?.dataPlaybook,
         loadedResources,
+        executionApprovals,
       },
     );
     stallRetries += retries;
@@ -133,8 +147,10 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
  * @param {string} question
  * @param {string|undefined} catalog
  * @param {"concept"|"data"|"history"|"progress"} task
+ * @param {any|undefined} skill
+ * @param {string|undefined} workspaceDir
  */
-function buildInitialPrompt(question, catalog, task) {
+function buildInitialPrompt(question, catalog, task, skill, workspaceDir) {
   if (!catalog) return question;
   const lines = [
     question,
@@ -143,6 +159,21 @@ function buildInitialPrompt(question, catalog, task) {
     "以下目录只用于选择资料，不是资料正文。先用目录和摘要定位，再按需读取概念页；只有当前内容不足以可靠回答时才继续读取相关原始资料。",
     "如果读完概念内容仍不足以可靠回答，请在答复第一行输出 CONTEXT_INSUFFICIENT 并说明缺口；内容充分时正常回答，不输出该标记。",
   ];
+  if (workspaceDir) {
+    lines.push(
+      "[用户任务工作区]",
+      `workspace: ${workspaceDir}`,
+      "本次任务新建或修改的文档、原型、报告等产物必须使用上述绝对路径并放在该目录内；不要写入主工作区、原始来源或其他目录。标准资源副本修改仍只限目录中的 context 路径，并逐次经过执行审批。",
+    );
+  }
+  if (skill) {
+    lines.push(
+      "[任务路由：Skill]",
+      `current_skill: ${skill.name}`,
+      `skill_path: ${skill.path}`,
+      "先用 read 读取这个 SKILL.md 的真实正文并遵循；仅正文明确要求且当前任务需要时，才继续读取其 references、模板或 scripts。不要读取其他 Skill 的正文或引用资源。",
+    );
+  }
   if (task === "data") lines.push(...buildDataPrompt(question, "initial"));
   else if (task === "history") lines.push(...buildHistoryPrompt(question, "initial"));
   else if (task === "progress") lines.push(...buildProgressPrompt(question, "initial"));
@@ -227,15 +258,18 @@ function mergeLoadedResources(target, incoming) {
  *
  * @param {(options: any) => Promise<any>} runAgent
  * @param {any} options
- * @param {{question: string, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, loadedResources: Array<LoadedResource>}} context
+ * @param {{question: string, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, loadedResources: Array<LoadedResource>, executionApprovals: Array<any>}} context
  */
 async function runWithProgressiveDepth(
   runAgent,
   options,
-  { question, task, catalog, catalogEntries = [], dataPlaybook, loadedResources },
+  { question, task, catalog, catalogEntries = [], dataPlaybook, loadedResources, executionApprovals },
 ) {
   const first = await runWithStallRetry(runAgent, options);
-  for (const attempt of first.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  for (const attempt of first.attempts) {
+    mergeLoadedResources(loadedResources, attempt.loadedResources);
+    executionApprovals.push(...(attempt.executionApprovals ?? []));
+  }
   if (!catalog || options.isRework || first.turn.failed || first.turn.timedOut || first.turn.stalled) return first;
 
   const dataTask = task === "data";
@@ -281,7 +315,10 @@ async function runWithProgressiveDepth(
   instructions.push("不要读取无关资料；资源仍不足时明确说缺少哪部分。完成后给出完整答复。");
 
   const second = await runWithStallRetry(runAgent, { ...options, prompt: instructions.join("\n") });
-  for (const attempt of second.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  for (const attempt of second.attempts) {
+    mergeLoadedResources(loadedResources, attempt.loadedResources);
+    executionApprovals.push(...(attempt.executionApprovals ?? []));
+  }
   const sharedMissing = historyTask
     ? getMissingHistoryEvidence(loadedResources, question, catalogEntries)
     : progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries)
@@ -309,7 +346,10 @@ async function runWithProgressiveDepth(
     ...options,
     prompt: buildDataPrompt(question, "sql").join("\n"),
   });
-  for (const attempt of third.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  for (const attempt of third.attempts) {
+    mergeLoadedResources(loadedResources, attempt.loadedResources);
+    executionApprovals.push(...(attempt.executionApprovals ?? []));
+  }
   const dataMissing = getMissingDataEvidence(
     loadedResources,
     question,
@@ -417,6 +457,100 @@ function isActualDataQuery(question) {
 /** @param {string[]} missing */
 function buildDataInsufficientText(missing) {
   return `现有共享资料不足，没法可靠确认这个数据。缺少：${missing.join("、") || "可核对的字段关联或统计范围"}。请补充对应共享资料或明确统计范围。`;
+}
+
+/**
+ * @param {string} question
+ * @param {Array<any>|undefined} skills
+ * @param {"concept"|"data"|"history"|"progress"} knowledgeTask
+ */
+function selectSkill(question, skills = [], knowledgeTask) {
+  const normalized = question.toLowerCase();
+  const named = longestSkillMatches(normalized, skills, (skill) => [skill.name]);
+  if (named.length > 0) return named.length === 1 ? named[0] : undefined;
+
+  const triggered = longestSkillMatches(normalized, skills, (skill) => skill.triggers ?? []);
+  if (triggered.length > 0) return triggered.length === 1 ? triggered[0] : undefined;
+
+  const related = skills
+    .map((skill) => ({ skill, score: scoreSkillMetadata(normalized, skill) }))
+    .filter((candidate) => candidate.score > 0);
+  if (related.length > 0) {
+    const bestScore = Math.max(...related.map((candidate) => candidate.score));
+    const best = related.filter((candidate) => candidate.score === bestScore);
+    return best.length === 1 ? best[0].skill : undefined;
+  }
+
+  const taskMatches = skills.filter((skill) => skill.tasks?.includes(knowledgeTask));
+  return taskMatches.length === 1 ? taskMatches[0] : undefined;
+}
+
+/**
+ * 名称与触发词先按完整匹配筛选，再只保留最长、最具体的一批候选。
+ *
+ * @param {string} question
+ * @param {Array<any>} skills
+ * @param {(skill: any) => Array<any>} getTerms
+ */
+function longestSkillMatches(question, skills, getTerms) {
+  const matches = skills.flatMap((skill) => {
+    const length = getTerms(skill).reduce((longest, value) => {
+      const term = String(value ?? "").trim().toLowerCase();
+      return term && includesCompleteTerm(question, term) ? Math.max(longest, term.length) : longest;
+    }, 0);
+    return length > 0 ? [{ skill, length }] : [];
+  });
+  const longest = Math.max(0, ...matches.map((match) => match.length));
+  return matches.filter((match) => match.length === longest).map((match) => match.skill);
+}
+
+/**
+ * ASCII 词不能在更长单词内部命中；中文词组按完整 substring 参与最长比较。
+ *
+ * @param {string} question
+ * @param {string} term
+ */
+function includesCompleteTerm(question, term) {
+  let offset = 0;
+  while (offset <= question.length - term.length) {
+    const index = question.indexOf(term, offset);
+    if (index < 0) return false;
+    const before = question[index - 1] ?? "";
+    const after = question[index + term.length] ?? "";
+    const crossesLeftBoundary = /^[a-z0-9_]/.test(term) && /[a-z0-9_]/.test(before);
+    const crossesRightBoundary = /[a-z0-9_]$/.test(term) && /[a-z0-9_]/.test(after);
+    if (!crossesLeftBoundary && !crossesRightBoundary) return true;
+    offset = index + 1;
+  }
+  return false;
+}
+
+/**
+ * 标准 Skill 没有自定义 triggers/tasks 时，用描述与能力中的完整短语或关键英文术语匹配。
+ * 同分候选不按目录顺序猜测，避免把无关 Skill 注入审批链。
+ *
+ * @param {string} question
+ * @param {any} skill
+ */
+function scoreSkillMetadata(question, skill) {
+  const stopWords = new Set([
+    "a", "an", "and", "are", "ask", "asks", "can", "create", "creating", "current", "for", "from",
+    "generate", "generating", "into", "make", "making", "need", "needs", "not", "only", "skill", "skills",
+    "support", "supports", "task", "tasks", "that", "the", "this", "to", "tool", "tools", "use", "used",
+    "user", "users", "using", "want", "wants", "when", "with", "you", "your",
+  ]);
+  const matched = new Set();
+  for (const value of [skill.description, skill.capabilities]) {
+    const text = String(value ?? "").toLowerCase();
+    for (const phrase of text.split(/[\n,，;；、.!?！？]+/)) {
+      const normalized = phrase.trim();
+      if (normalized.length >= 2 && includesCompleteTerm(question, normalized)) matched.add(normalized);
+    }
+    for (const word of text.match(/[a-z][a-z0-9_-]{2,}/g) ?? []) {
+      if (!stopWords.has(word) && includesCompleteTerm(question, word)) matched.add(word);
+    }
+  }
+  return [...matched].reduce((score, term) => score + term.length, 0);
 }
 
 /** @param {string} question */

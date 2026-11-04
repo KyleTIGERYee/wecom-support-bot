@@ -26,6 +26,7 @@ async function main() {
   const options = parseInitArgs(args);
   const instanceDir = resolve(options.instanceDir);
   await mkdir(join(instanceDir, "context"), { recursive: true });
+  await mkdir(join(instanceDir, "workspace"), { recursive: true });
 
   const contextSources = [];
   for (const [index, source] of options.sources.entries()) {
@@ -147,11 +148,13 @@ async function ask(args) {
   const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
   const agentDir = join(instanceDir, "agent");
   const approvalModel = saved.models.executionApproval ?? saved.models.main;
+  const workspaceDir = join(instanceDir, "workspace");
+  await mkdir(workspaceDir, { recursive: true });
   const config = {
     ...defaults,
     projectDir,
-    roots: [join(instanceDir, "context")],
-    writeRoots: [join(instanceDir, "context")],
+    roots: [join(instanceDir, "context"), workspaceDir],
+    writeRoots: [join(instanceDir, "context"), workspaceDir],
     protectedRoots: [projectDir],
     pi: {
       ...defaults.pi,
@@ -193,11 +196,18 @@ async function ask(args) {
     sessionKey,
     deps: {
       state,
-      context: { catalog: context.text, dataPlaybook: context.dataPlaybook, entries: context.entries },
-      runAgent: async ({ prompt, sessionId }) => {
+      context: {
+        catalog: context.text,
+        dataPlaybook: context.dataPlaybook,
+        entries: context.entries,
+        skills: context.skills,
+        workspaceDir,
+      },
+      runAgent: async ({ prompt, sessionId, currentSkill }) => {
         const turn = await runAgentTurn({
           prompt,
           sessionId,
+          currentSkill,
           config,
           projectDir,
           resourceCatalog: context.entries,
