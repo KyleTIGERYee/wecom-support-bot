@@ -76,6 +76,8 @@ const ROOTS = [
 	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
 	"/Users/kyle/Desktop/VIBECODING/ajly",
 	"/Users/kyle/Desktop/VIBECODING/lezuzu",
+	// 同事发来的截图：机器人自己下载存到这里，agent 必须用 read 看图
+	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/data/images",
 ];
 
 /** 解析成规范化的绝对路径；无法判定时返回 null。 */
@@ -190,7 +192,7 @@ export function checkReadPath(path: string): { allowed: boolean; reason?: string
 		return { allowed: true };
 	}
 	if (!isInsideRoots(path)) {
-		return { allowed: false, reason: `路径越界：${path}，只能读取知识库与代码仓库` };
+		return { allowed: false, reason: `路径越界：${path}，只能读取知识库、代码仓库与会话图片目录` };
 	}
 	return { allowed: true };
 }
@@ -211,7 +213,7 @@ export default function filesystemWhitelist(pi: any) {
 		if (event.toolName === "read") {
 			const verdict = checkReadPath(event.input?.path ?? "");
 			if (verdict.allowed) return;
-			return { block: true, reason: `${verdict.reason}。请只读取知识库与代码仓库里的文件。` };
+			return { block: true, reason: `${verdict.reason}。请只读取知识库、代码仓库与会话图片目录里的文件。` };
 		}
 
 		if (event.toolName === "bash") {
