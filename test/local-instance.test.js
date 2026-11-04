@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,7 +27,7 @@ async function runCli(args, options = {}) {
   }
 }
 
-async function startModelServer({ failModel, mainReply = "ok", approvalReply } = {}) {
+async function startModelServer({ failModel, failModels = [], mainReply = "ok", approvalReply } = {}) {
   const calls = [];
   const server = createServer((request, response) => {
     let body = "";
@@ -38,7 +38,7 @@ async function startModelServer({ failModel, mainReply = "ok", approvalReply } =
     request.on("end", () => {
       const payload = JSON.parse(body);
       calls.push({ ...payload, authorization: request.headers.authorization });
-      if (payload.model === failModel) {
+      if (payload.model === failModel || failModels.includes(payload.model)) {
         response.writeHead(401, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: "invalid credential" }));
         return;
@@ -48,6 +48,8 @@ async function startModelServer({ failModel, mainReply = "ok", approvalReply } =
         .join("\n");
       const isGuard = messageText.includes("机器人的答复");
       const isConnectionTest = messageText.includes("连接测试，请回复 ok");
+      const isExampleTask = messageText.includes("初始化示例任务");
+      const isApprovalWorkflow = payload.stream && messageText.includes("INIT_EXECUTION_APPROVAL_CHECK");
       const isApproval = messageText.includes("你是独立的执行审批模型");
       const reply = isGuard
         ? messageText.includes("13800138000")
@@ -55,6 +57,12 @@ async function startModelServer({ failModel, mainReply = "ok", approvalReply } =
           : "ALLOW"
         : isConnectionTest
           ? "ok"
+          : isApprovalWorkflow
+            ? initializationApprovalReply(payload)
+            : isExampleTask && payload.stream
+              ? initializationExampleReply(payload)
+          : isExampleTask
+            ? "DEEP"
           : isApproval
             ? typeof approvalReply === "function"
               ? approvalReply(payload)
@@ -128,6 +136,34 @@ function currentAgentPhase(payload) {
   return { prompt, toolMessages: messages.filter((message) => message.role === "tool") };
 }
 
+function initializationExampleReply(payload) {
+  const { prompt, toolMessages } = currentAgentPhase(payload);
+  const knowledgePath = prompt.match(/\| path: ([^|\\"\n\r]+?) \| depth:/)?.[1];
+  const skillPath = prompt.match(/skill_path: ([^\\"\n\r]+)/)?.[1];
+  const needsKnowledge = Boolean(knowledgePath);
+  const needsSkill = Boolean(skillPath);
+  if (needsKnowledge && toolMessages.length === 0) {
+    return modelToolCall("init-read-knowledge", "read", { path: knowledgePath });
+  }
+  if (needsSkill && toolMessages.length === (needsKnowledge ? 1 : 0)) {
+    return modelToolCall("init-read-skill", "read", { path: skillPath });
+  }
+  return "示例任务完成";
+}
+
+function initializationApprovalReply(payload) {
+  const { prompt, toolMessages } = currentAgentPhase(payload);
+  const allowedPath = prompt.match(/INIT_APPROVAL_ALLOWED_PATH: ([^\\"\n\r]+)/)?.[1];
+  const deniedPath = prompt.match(/INIT_APPROVAL_DENIED_PATH: ([^\\"\n\r]+)/)?.[1];
+  if (toolMessages.length === 0) {
+    return modelToolCall("init-write-workspace", "write", { path: allowedPath, content: "INIT_APPROVAL_WRITE" });
+  }
+  if (toolMessages.length === 1) {
+    return modelToolCall("init-write-outside", "write", { path: deniedPath, content: "INIT_OUTSIDE_WRITE" });
+  }
+  return "审批检查完成";
+}
+
 async function makeTempDir(t) {
   const dir = await mkdtemp(join(tmpdir(), "wsb-local-instance-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -141,24 +177,39 @@ function initInstance({
   apiKey = "test-key",
   model = "main-model",
   guardModel,
+  guardBaseUrl,
+  guardApiKey,
+  quickBaseUrl,
+  quickApiKey,
+  quickModel,
   approvalBaseUrl,
   approvalApiKey,
   approvalModel,
   template,
+  importPackage,
+  env,
   allowFailure = false,
 }) {
   const args = ["init", "--instance-dir", instanceDir];
   if (template) args.push("--template", template);
+  if (importPackage) args.push("--package", importPackage);
   for (const source of sources) {
     args.push("--source", source.path);
     if (source.scope !== undefined) args.push("--scope", source.scope);
+    if (source.type !== undefined) args.push("--source-type", source.type);
+    if (source.ref !== undefined) args.push("--ref", source.ref);
   }
   args.push("--base-url", baseUrl, "--api-key", apiKey, "--model", model);
   if (guardModel) args.push("--guard-model", guardModel);
+  if (guardBaseUrl) args.push("--guard-base-url", guardBaseUrl);
+  if (guardApiKey) args.push("--guard-api-key", guardApiKey);
+  if (quickBaseUrl) args.push("--quick-base-url", quickBaseUrl);
+  if (quickApiKey) args.push("--quick-api-key", quickApiKey);
+  if (quickModel) args.push("--quick-model", quickModel);
   if (approvalBaseUrl) args.push("--approval-base-url", approvalBaseUrl);
   if (approvalApiKey) args.push("--approval-api-key", approvalApiKey);
   if (approvalModel) args.push("--approval-model", approvalModel);
-  return runCli(args, { allowFailure });
+  return runCli(args, { allowFailure, ...(env ? { env } : {}) });
 }
 
 test("公开初始化流程复制共享目录并测试主模型与 Guard 模型", async (t) => {
@@ -179,10 +230,11 @@ test("公开初始化流程复制共享目录并测试主模型与 Guard 模型"
   });
 
   assert.equal(result.ready, true);
-  assert.deepEqual(
-    models.calls.map((call) => call.model).sort(),
-    ["guard-model", "main-model"],
-  );
+  assert.ok(models.calls.some((call) => call.model === "guard-model"));
+  assert.ok(models.calls.some((call) =>
+    call.model === "main-model" &&
+    call.messages.some((message) => typeof message.content === "string" && message.content.includes("连接测试")),
+  ));
 
   const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
   assert.deepEqual(saved.models.executionApproval, { baseUrl: models.baseUrl, model: "main-model" });
@@ -211,7 +263,7 @@ test("本地实例向 pi 子进程注入独立审批模型、写工具和副本�
     sources: [{ path: source, scope: "shared" }],
     baseUrl: models.baseUrl,
     model: "main-model",
-    approvalBaseUrl: "http://127.0.0.1:39999/v1",
+    approvalBaseUrl: models.baseUrl,
     approvalApiKey: "approval-secret",
     approvalModel: "approval-model",
   });
@@ -239,12 +291,12 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 
   assert.equal(result.finalText, "配置已接收");
   const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
-  assert.deepEqual(saved.models.executionApproval, { baseUrl: "http://127.0.0.1:39999/v1", model: "approval-model" });
+  assert.deepEqual(saved.models.executionApproval, { baseUrl: models.baseUrl, model: "approval-model" });
   const call = JSON.parse((await readFile(piLog, "utf8")).trim());
   assert.equal(call.tools, "read,write,edit,bash");
   assert.deepEqual(call.approval, {
     enabled: true,
-    baseUrl: "http://127.0.0.1:39999/v1",
+    baseUrl: models.baseUrl,
     model: "approval-model",
     apiKey: "approval-secret",
     timeoutMs: 10000,
@@ -324,7 +376,7 @@ test("公开初始化流程接受单文件和 zip 资源包并分别保存共享
   await writeFile(join(packageDocs, "rules.md"), "资源包上下文。\n");
   await execFileAsync("zip", ["-q", "-r", packagePath, "package-docs"], { cwd: root });
 
-  await initInstance({
+  const initialized = await initInstance({
     instanceDir,
     sources: [
       { path: singleFile, scope: "shared" },
@@ -334,6 +386,13 @@ test("公开初始化流程接受单文件和 zip 资源包并分别保存共享
   });
 
   const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  const singleLocalPath = saved.contextSources[0].localPath;
+  assert.ok(initialized.resources.files.includes(singleLocalPath));
+  assert.equal(initialized.resources.files.includes(`${singleLocalPath}/single.md`), false);
+  let status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.resources.consistent, true);
+  assert.equal(status.resources.actualVersion, initialized.resources.version);
+  assert.deepEqual(status.loadFailures, []);
   assert.deepEqual(
     saved.contextSources.map(({ type, scope }) => ({ type, scope })),
     [
@@ -349,6 +408,24 @@ test("公开初始化流程接受单文件和 zip 资源包并分别保存共享
     await readFile(join(instanceDir, saved.contextSources[1].localPath, "package-docs/rules.md"), "utf8"),
     "资源包上下文。\n",
   );
+
+  await writeFile(singleFile, "单文件上下文 V2。\n");
+  const synced = await runCli([
+    "sync",
+    "--instance-dir",
+    instanceDir,
+    "--source",
+    singleFile,
+    "--scope",
+    "shared",
+  ]);
+  assert.deepEqual(synced.resources.files, [singleLocalPath]);
+  assert.equal(await readFile(join(instanceDir, singleLocalPath), "utf8"), "单文件上下文 V2。\n");
+  status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.resources.consistent, true);
+  assert.equal(status.resources.actualVersion, synced.resources.version);
+  assert.equal(status.coverage.sources[0].files, 1);
+  assert.deepEqual(status.loadFailures, []);
 });
 
 test("团队实例把个人私有来源列入失败检查且不复制", async (t) => {
@@ -1076,6 +1153,7 @@ child.once("exit", (code, signal) => {
     model: "main-model",
     guardModel: "guard-model",
   });
+  models.calls.length = 0;
 
   const result = await runCli(
     ["ask", "--instance-dir", instanceDir, "--question", "查一下乐租租现在有多少入驻机构", "--session-key", "real-data-skill"],
@@ -1191,6 +1269,8 @@ test("公开文档任务由真实 pi 读取 Skill，按 DENY 理由调整并新�
     approvalModel: "approval-model",
   });
   assert.equal(initialized.ready, true);
+  assert.ok(models.calls.some((call) => call.model === "guard-model"), "初始化已验证 Guard 模型可用");
+  models.calls.length = 0;
 
   const result = await runCli(
     ["ask", "--instance-dir", instanceDir, "--question", "根据退租规则生成一份文档，并在生成后复核修改本次文档产物", "--session-key", "real-document-skill"],
@@ -1213,12 +1293,15 @@ test("公开文档任务由真实 pi 读取 Skill，按 DENY 理由调整并新�
   assert.deepEqual(result.executionApprovals.map((entry) => entry.toolName), ["write", "write", "edit"]);
   assert.equal(result.executionApprovals[0].target, unrelatedPath);
   assert.ok(result.executionApprovals.slice(1).every((entry) => entry.target === artifactPath));
-  const approvalCalls = models.calls.filter((call) => call.model === "approval-model" && !call.stream);
+  const approvalCalls = models.calls.filter((call) =>
+    call.model === "approval-model" &&
+    !call.stream &&
+    call.messages.some((message) => typeof message.content === "string" && message.content.includes("你是独立的执行审批模型")),
+  );
   assert.equal(approvalCalls.length, 3);
   for (const call of approvalCalls) {
     assert.equal(JSON.parse(call.messages[1].content).task.currentSkill, "document-delivery");
   }
-  assert.ok(models.calls.some((call) => call.model === "guard-model"), "初始化已验证 Guard 模型可用");
   const mainCalls = models.calls.filter((call) => call.model === "main-model" && call.stream);
   const initialPrompt = currentAgentPhase(mainCalls[0]).prompt;
   assert.match(initialPrompt, /文档生成、模板套用、受限写入/);
@@ -1335,6 +1418,8 @@ test("真实 pi 使用初始化生成的模型配置读取本地副本", { timeo
     guardModel: "real-guard-model",
   });
   localCopyPath = join(instanceDir, "context/001-docs.md");
+  assert.ok(models.calls.some((call) => call.model === "real-guard-model"));
+  models.calls.length = 0;
 
   const result = await runCli(
     ["ask", "--instance-dir", instanceDir, "--question", "本地资料写了什么？"],
@@ -1349,7 +1434,6 @@ test("真实 pi 使用初始化生成的模型配置读取本地副本", { timeo
   assert.equal(mainCalls[0].authorization, "Bearer real-pi-key");
   assert.equal(JSON.stringify(mainCalls[0].messages).includes("REAL_PI_CONTEXT_MARKER"), false);
   assert.match(JSON.stringify(mainCalls[1].messages), /REAL_PI_CONTEXT_MARKER/);
-  assert.ok(models.calls.some((call) => call.model === "real-guard-model"));
 });
 
 test("真实 pi 在本地实例中不能读取默认模式的主工作区手册", { timeout: 60000 }, async (t) => {
@@ -1390,6 +1474,7 @@ test("真实 pi 在本地实例中不能读取默认模式的主工作区手册"
     apiKey: "real-pi-key",
     model: "real-main-model",
   });
+  models.calls.length = 0;
 
   const result = await runCli(
     ["ask", "--instance-dir", instanceDir, "--question", "读取主工作区手册"],
@@ -1400,4 +1485,701 @@ test("真实 pi 在本地实例中不能读取默认模式的主工作区手册"
   const mainCalls = models.calls.filter((call) => call.model === "real-main-model" && call.stream);
   assert.equal(mainCalls.length, 2);
   assert.match(JSON.stringify(mainCalls[1].messages), /路径越界/);
+});
+
+test("团队实例二次同步使目录与副本同版本，删除旧资源且保留任务、会话和来源", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "team-resources");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  await mkdir(join(source, "wiki/概念"), { recursive: true });
+  await mkdir(join(source, "skills/document-delivery"), { recursive: true });
+  await writeFile(join(source, "CONTEXT.md"), "TEAM_CONTEXT_V1\n");
+  await writeFile(join(source, "wiki/概念/退租.md"), "退租规则 V1\n");
+  await writeFile(join(source, "obsolete.md"), "OBSOLETE_RESOURCE\n");
+  await writeFile(
+    join(source, "skills/document-delivery/SKILL.md"),
+    "---\nname: document-delivery\ndescription: 创建团队文档\ntriggers: 文档\n---\nDOC_SKILL_V1\n",
+  );
+  const initialized = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const initialVersion = initialized.resources.version;
+  const contextRoot = join(instanceDir, "context/001-team-resources");
+  await writeFile(join(contextRoot, "CONTEXT.md"), "LOCAL_COPY_EDIT\n");
+  await writeFile(join(instanceDir, "workspace/task.md"), "KEEP_WORKSPACE\n");
+  await mkdir(join(instanceDir, "data"), { recursive: true });
+  await writeFile(join(instanceDir, "data/session-state.json"), '{"generation":{"keep":"session"}}\n');
+  await writeFile(join(instanceDir, "data/inbox.jsonl"), '{"msgid":"keep"}\n');
+  const modifiedStatus = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(modifiedStatus.resources.consistent, true);
+  assert.equal(modifiedStatus.resources.matchesSyncedVersion, false);
+  assert.deepEqual(modifiedStatus.loadFailures, []);
+
+  await writeFile(join(source, "CONTEXT.md"), "TEAM_CONTEXT_V2\n");
+  await writeFile(join(source, "wiki/概念/退租.md"), "退租规则 V2\n");
+  await rm(join(source, "obsolete.md"));
+  await writeFile(
+    join(source, "skills/document-delivery/SKILL.md"),
+    "---\nname: document-delivery\ndescription: 创建团队文档\ntriggers: 文档\n---\nDOC_SKILL_V2\n",
+  );
+  const synced = await runCli([
+    "sync",
+    "--instance-dir",
+    instanceDir,
+    "--source",
+    source,
+    "--scope",
+    "shared",
+  ]);
+
+  assert.equal(synced.status, "ok");
+  assert.notEqual(synced.resources.version, initialVersion);
+  assert.equal(await readFile(join(contextRoot, "CONTEXT.md"), "utf8"), "TEAM_CONTEXT_V2\n");
+  assert.equal(existsSync(join(contextRoot, "obsolete.md")), false);
+  assert.equal(await readFile(join(instanceDir, "workspace/task.md"), "utf8"), "KEEP_WORKSPACE\n");
+  assert.equal(await readFile(join(instanceDir, "data/session-state.json"), "utf8"), '{"generation":{"keep":"session"}}\n');
+  assert.equal(await readFile(join(instanceDir, "data/inbox.jsonl"), "utf8"), '{"msgid":"keep"}\n');
+  assert.equal(await readFile(join(source, "CONTEXT.md"), "utf8"), "TEAM_CONTEXT_V2\n");
+  assert.equal((await readFile(join(source, "CONTEXT.md"), "utf8")).includes("LOCAL_COPY_EDIT"), false);
+
+  const status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.resources.version, synced.resources.version);
+  assert.equal(status.resources.catalogVersion, synced.resources.version);
+  assert.equal(status.resources.actualVersion, synced.resources.version);
+  assert.equal(status.resources.consistent, true);
+  assert.equal(status.lastSync.status, "ok");
+  assert.deepEqual(status.loadFailures, []);
+  assert.equal(status.coverage.skills, 1);
+  assert.equal(status.coverage.sources[0].files, 3);
+
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_PI_LOG, process.argv.at(-1) + "\\n");
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "同步后目录可用" }] } }));
+`,
+    { mode: 0o755 },
+  );
+  await runCli(["ask", "--instance-dir", instanceDir, "--question", "退租规则是什么？", "--session-key", "after-sync"], {
+    env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog },
+  });
+  const prompt = await readFile(piLog, "utf8");
+  assert.match(prompt, /TEAM_CONTEXT_V2|CONTEXT\.md/);
+  assert.match(prompt, /DOC_SKILL_V2|document-delivery/);
+  assert.equal(prompt.includes("obsolete.md"), false);
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.equal(saved.resources.version, status.resources.version);
+  assert.equal(saved.contextSources[0].version, status.resources.version);
+});
+
+test("团队分发与既有实例导入只携带共享副本，不含凭证、私人来源、会话或任务产物", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const shared = join(root, "shared");
+  const privateSource = join(root, "private.md");
+  const original = join(root, "original");
+  const imported = join(root, "imported");
+  const packagePath = join(root, "team-instance.zip");
+  await mkdir(shared);
+  await writeFile(join(shared, "CONTEXT.md"), "SHARED_CONTEXT\n");
+  await writeFile(privateSource, "PRIVATE_NEVER_EXPORT\n");
+  await initInstance({
+    instanceDir: original,
+    sources: [
+      { path: shared, scope: "shared" },
+      { path: privateSource, scope: "private" },
+    ],
+    baseUrl: models.baseUrl,
+    apiKey: "original-export-" + "fake-key",
+  });
+  await writeFile(join(original, "workspace/private-task.md"), "PRIVATE_TASK\n");
+  await mkdir(join(original, "data"), { recursive: true });
+  await writeFile(join(original, "data/session-state.json"), '{"generation":{"private":"session"}}\n');
+
+  const exported = await runCli(["export", "--instance-dir", original, "--output", packagePath]);
+  assert.equal(exported.status, "ok");
+  assert.equal(exported.excludedPrivateSources, 1);
+  const { stdout: packageEntriesText } = await execFileAsync("unzip", ["-Z1", packagePath]);
+  const packageEntries = packageEntriesText.split("\n").filter(Boolean);
+  assert.ok(packageEntries.includes("instance.json"));
+  assert.ok(packageEntries.includes("context/001-shared/CONTEXT.md"));
+  assert.equal(packageEntries.some((entry) => /secrets|agent\/|data\/|workspace\/|private/.test(entry)), false);
+  const packageConfig = JSON.parse(await execFileAsync("unzip", ["-p", packagePath, "instance.json"]).then((result) => result.stdout));
+  const originalSecrets = JSON.parse(await readFile(join(original, "secrets.json"), "utf8"));
+  assert.equal(JSON.stringify(packageConfig).includes(originalSecrets.mainApiKey), false);
+  assert.equal(JSON.stringify(packageConfig).includes(privateSource), false);
+  assert.equal(packageConfig.ready, false);
+
+  const importedResult = await runCli([
+    "init",
+    "--instance-dir",
+    imported,
+    "--template",
+    "import",
+    "--package",
+    packagePath,
+    "--api-key",
+    "imported-new-fake-key",
+  ]);
+  assert.equal(importedResult.ready, true);
+  assert.equal(await readFile(join(imported, "context/001-shared/CONTEXT.md"), "utf8"), "SHARED_CONTEXT\n");
+  assert.equal(existsSync(join(imported, "context/002-private.md")), false);
+  assert.equal(existsSync(join(imported, "workspace/private-task.md")), false);
+  assert.equal(existsSync(join(imported, "data/session-state.json")), false);
+  const importedConfig = JSON.parse(await readFile(join(imported, "instance.json"), "utf8"));
+  const originalConfig = JSON.parse(await readFile(join(original, "instance.json"), "utf8"));
+  assert.notEqual(importedConfig.instance.id, originalConfig.instance.id);
+  assert.equal(importedConfig.contextSources.length, 1);
+  assert.equal(importedConfig.contextSources[0].scope, "shared");
+  assert.deepEqual(importedConfig.models, packageConfig.models);
+  const importedSecrets = JSON.parse(await readFile(join(imported, "secrets.json"), "utf8"));
+  assert.notEqual(importedSecrets.mainApiKey, originalSecrets.mainApiKey);
+  assert.equal(JSON.stringify(importedSecrets).includes(originalSecrets.mainApiKey), false);
+});
+
+test("空白实例独立配置四模型并完整检查，快速问题使用快速模型且失败项清楚可见", async (t) => {
+  const root = await makeTempDir(t);
+  const source = join(root, "private-workspace");
+  const skillPath = join(source, "skills/greeting/SKILL.md");
+  await mkdir(dirname(skillPath), { recursive: true });
+  await writeFile(join(source, "CONTEXT.md"), "PRIVATE_BLANK_CONTEXT\n");
+  await writeFile(
+    skillPath,
+    "---\nname: greeting\ndescription: 回答日常问候\ntriggers: 你好\n---\n读取本地资料后礼貌回答。\n",
+  );
+  const models = await startModelServer({
+    failModels: ["broken-quick", "broken-approval"],
+    mainReply: (payload) => {
+      const text = JSON.stringify(payload.messages);
+      return payload.model === "quick-model" && text.includes("分诊") ? "QUICK" : "ok";
+    },
+  });
+  t.after(() => models.close());
+  const instanceDir = join(root, "blank");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  const initialized = await initInstance({
+    instanceDir,
+    template: "blank",
+    sources: [{ path: source, scope: "private" }],
+    baseUrl: models.baseUrl,
+    apiKey: "fake-main-key",
+    model: "main-model",
+    quickBaseUrl: models.baseUrl,
+    quickApiKey: "fake-quick-key",
+    quickModel: "quick-model",
+    guardBaseUrl: models.baseUrl,
+    guardApiKey: "fake-guard-key",
+    guardModel: "guard-model",
+    approvalBaseUrl: models.baseUrl,
+    approvalApiKey: "fake-approval-key",
+    approvalModel: "approval-model",
+  });
+
+  assert.equal(initialized.ready, true);
+  for (const check of ["mainModel", "quickModel", "approvalModel", "guardModel", "knowledge", "skills", "executionApproval", "exampleTask"]) {
+    assert.equal(initialized.checks[check].status, "ok", `${check} 应实际通过`);
+    assert.notEqual(initialized.checks[check].executed, false, `${check} 不能把未执行写成通过`);
+  }
+  const piModels = JSON.parse(await readFile(join(instanceDir, "agent/models.json"), "utf8"));
+  assert.equal(piModels.providers["local-instance"].models[0].id, "main-model");
+  assert.equal(piModels.providers["local-instance-quick"].models[0].id, "quick-model");
+  assert.equal(piModels.providers["local-instance-quick"].apiKey, "fake-quick-key");
+  assert.equal(piModels.providers["local-instance-approval"].models[0].id, "approval-model");
+  assert.equal(piModels.providers["local-instance-guard"].models[0].id, "guard-model");
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.deepEqual(saved.models.quick, { baseUrl: models.baseUrl, model: "quick-model" });
+
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ provider: args[args.indexOf("--provider") + 1], model: args[args.indexOf("--model") + 1], thinking: args[args.indexOf("--thinking") + 1] }) + "\\n");
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "你好" }] } }));
+`,
+    { mode: 0o755 },
+  );
+  await runCli(["ask", "--instance-dir", instanceDir, "--question", "你好", "--session-key", "quick"], {
+    env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog },
+  });
+  const quickCall = JSON.parse((await readFile(piLog, "utf8")).trim());
+  assert.deepEqual(quickCall, { provider: "local-instance-quick", model: "quick-model", thinking: "low" });
+
+  const brokenDir = join(root, "broken");
+  const broken = await initInstance({
+    instanceDir: brokenDir,
+    sources: [{ path: source, scope: "private" }],
+    baseUrl: models.baseUrl,
+    quickModel: "broken-quick",
+    approvalModel: "broken-approval",
+    allowFailure: true,
+  });
+  assert.equal(broken.ready, false);
+  assert.equal(broken.checks.quickModel.status, "error");
+  assert.match(broken.checks.quickModel.reason, /HTTP 401/);
+  assert.equal(broken.checks.approvalModel.status, "error");
+  assert.match(broken.checks.approvalModel.reason, /HTTP 401/);
+  assert.equal(broken.checks.executionApproval.status, "error");
+  assert.equal(broken.checks.mainModel.status, "ok");
+  assert.equal(broken.checks.guardModel.status, "ok");
+  assert.equal(broken.checks.knowledge.status, "skipped");
+  assert.equal(broken.checks.skills.status, "skipped");
+  assert.equal(broken.checks.exampleTask.status, "skipped");
+  assert.equal(broken.checks.exampleTask.executed, false);
+});
+
+test("初始化通过真实 pi 观察知识与 Skill 正文、04 审批链和公开 ask 示例编排", { timeout: 60000 }, async (t) => {
+  const realPi = join(homedir(), ".pi-support/bin/pi");
+  if (!existsSync(realPi)) {
+    t.skip("本机未安装隔离 pi，跳过真实初始化工具链验收");
+    return;
+  }
+  const root = await makeTempDir(t);
+  const source = join(root, "shared");
+  const instanceDir = join(root, "instance");
+  const knowledgePath = join(source, "wiki/概念/初始化.md");
+  const skillPath = join(source, "skills/init-check/SKILL.md");
+  await mkdir(dirname(knowledgePath), { recursive: true });
+  await mkdir(dirname(skillPath), { recursive: true });
+  await writeFile(knowledgePath, "INIT_KNOWLEDGE_BODY：初始化知识可检索。\n");
+  await writeFile(
+    skillPath,
+    "---\nname: init-check\ndescription: 验证初始化示例任务\ntriggers: 初始化示例\n---\nINIT_SKILL_BODY：读取知识后回答示例任务完成。\n",
+  );
+  const models = await startModelServer();
+  t.after(() => models.close());
+
+  const initialized = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    approvalModel: "approval-model",
+  });
+
+  assert.equal(initialized.ready, true);
+  const localKnowledge = join(instanceDir, "context/001-shared/wiki/概念/初始化.md");
+  const localSkill = join(instanceDir, "context/001-shared/skills/init-check/SKILL.md");
+  assert.deepEqual(initialized.checks.knowledge.loadedResources, [localKnowledge]);
+  assert.deepEqual(initialized.checks.skills.loadedResources, [localSkill]);
+  assert.equal(initialized.checks.exampleTask.answer, "示例任务完成");
+  const observedModelInput = JSON.stringify(models.calls.filter((call) => call.stream).map((call) => call.messages));
+  assert.match(observedModelInput, /INIT_KNOWLEDGE_BODY/);
+  assert.match(observedModelInput, /INIT_SKILL_BODY/);
+  const approvals = initialized.checks.executionApproval.approvals;
+  const allowed = approvals.find((entry) => entry.verdict === "ALLOW");
+  const denied = approvals.find((entry) => entry.verdict === "DENY");
+  assert.equal(allowed.source, "model");
+  assert.equal(allowed.toolName, "write");
+  assert.ok(allowed.target.startsWith(`${join(instanceDir, "workspace")}/`));
+  assert.equal(denied.source, "hard-rule");
+  assert.equal(denied.toolName, "write");
+  assert.equal(denied.target.startsWith(`${join(instanceDir, "workspace")}/`), false);
+  assert.equal(existsSync(allowed.target), false, "临时检查产物应清理");
+  assert.equal(existsSync(denied.target), false, "越界检查产物必须硬拒绝");
+  const approvalCalls = models.calls.filter((call) =>
+    call.model === "approval-model" &&
+    call.messages.some((message) => typeof message.content === "string" && message.content.includes("你是独立的执行审批模型")),
+  );
+  assert.equal(approvalCalls.length, 1, "只有获批写入进入模型审批，越界写入必须由硬规则直接拒绝");
+});
+
+test("未安装 pi 时初始化明确失败，不把目录计数或直连模型写成工具链通过", async (t) => {
+  const root = await makeTempDir(t);
+  const source = join(root, "docs.md");
+  const instanceDir = join(root, "instance");
+  await writeFile(source, "LOCAL_CONTEXT\n");
+  const models = await startModelServer();
+  t.after(() => models.close());
+
+  const initialized = await initInstance({
+    instanceDir,
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    env: { ...process.env, WECOM_BOT_PI_BINARY: join(root, "missing-pi") },
+    allowFailure: true,
+  });
+
+  assert.equal(initialized.ready, false);
+  assert.notEqual(initialized.checks.knowledge.status, "ok");
+  assert.notEqual(initialized.checks.exampleTask.status, "ok");
+  assert.notEqual(initialized.checks.executionApproval.status, "ok");
+  assert.equal(initialized.checks.exampleTask.executed, true);
+  assert.equal(initialized.checks.executionApproval.executed, true);
+});
+
+test("GitLab 本地、HTTP 与 SSH 来源只读克隆同步，失败清理且 URL 凭证不泄露", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const repository = join(root, "fake-gitlab-repository");
+  const instanceDir = join(root, "instance");
+  await mkdir(repository);
+  await writeFile(join(repository, "CONTEXT.md"), "GITLAB_FAKE_V1\n");
+  await execFileAsync("git", ["init", "-q", repository]);
+  await execFileAsync("git", ["-C", repository, "add", "CONTEXT.md"]);
+  await execFileAsync("git", ["-C", repository, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "v1"]);
+
+  const initialized = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: repository, scope: "shared", type: "gitlab" }],
+    baseUrl: models.baseUrl,
+  });
+  assert.equal(initialized.ready, true);
+  assert.equal(await readFile(join(instanceDir, "context/001-fake-gitlab-repository/CONTEXT.md"), "utf8"), "GITLAB_FAKE_V1\n");
+  assert.equal(existsSync(join(instanceDir, "context/001-fake-gitlab-repository/.git")), false);
+
+  await writeFile(join(repository, "CONTEXT.md"), "GITLAB_FAKE_V2\n");
+  await execFileAsync("git", ["-C", repository, "add", "CONTEXT.md"]);
+  await execFileAsync("git", ["-C", repository, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "v2"]);
+  const synced = await runCli([
+    "sync",
+    "--instance-dir",
+    instanceDir,
+    "--source",
+    repository,
+    "--scope",
+    "shared",
+    "--source-type",
+    "gitlab",
+  ]);
+  assert.equal(synced.status, "ok");
+  assert.equal(await readFile(join(instanceDir, "context/001-fake-gitlab-repository/CONTEXT.md"), "utf8"), "GITLAB_FAKE_V2\n");
+  assert.equal(await readFile(join(repository, "CONTEXT.md"), "utf8"), "GITLAB_FAKE_V2\n");
+
+  const fakeBin = join(root, "fake-bin");
+  const fakeGitLog = join(root, "fake-git-log.jsonl");
+  const remoteFixture = join(root, "remote-fixture");
+  await mkdir(fakeBin);
+  await mkdir(remoteFixture);
+  await writeFile(join(remoteFixture, "CONTEXT.md"), "GITLAB_HTTP_V1\n");
+  await writeFile(
+    join(fakeBin, "git"),
+    `#!/usr/bin/env node
+import { appendFileSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_GIT_LOG, JSON.stringify({ args, allowProtocol: process.env.GIT_ALLOW_PROTOCOL }) + "\\n");
+const source = args.at(-2);
+const checkout = args.at(-1);
+mkdirSync(checkout, { recursive: true });
+if (source.includes("failure")) {
+  writeFileSync(join(checkout, "partial.md"), "PARTIAL_CLONE\\n");
+  process.stderr.write("clone failed for " + source + "\\n");
+  process.exit(1);
+}
+copyFileSync(join(process.env.FAKE_GIT_FIXTURE, "CONTEXT.md"), join(checkout, "CONTEXT.md"));
+mkdirSync(join(checkout, ".git"));
+writeFileSync(join(checkout, ".git/config"), "fake metadata\\n");
+`,
+    { mode: 0o755 },
+  );
+  const remoteEnv = {
+    ...process.env,
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    FAKE_GIT_LOG: fakeGitLog,
+    FAKE_GIT_FIXTURE: remoteFixture,
+  };
+  const httpSource = "https://url-user:url-pass@gitlab.example.invalid/team/http-resources.git";
+  const remoteInstance = join(root, "remote-instance");
+  const remoteInitialized = await initInstance({
+    instanceDir: remoteInstance,
+    template: "team",
+    sources: [{ path: httpSource, scope: "shared", type: "gitlab", ref: "main" }],
+    baseUrl: models.baseUrl,
+    env: remoteEnv,
+  });
+  assert.equal(remoteInitialized.ready, true);
+  assert.equal(
+    await readFile(join(remoteInstance, "context/001-http-resources/CONTEXT.md"), "utf8"),
+    "GITLAB_HTTP_V1\n",
+  );
+  assert.equal(existsSync(join(remoteInstance, "context/001-http-resources/.git")), false);
+  assert.equal(JSON.stringify(remoteInitialized).includes("url-pass"), false);
+  const remoteConfig = JSON.parse(await readFile(join(remoteInstance, "instance.json"), "utf8"));
+  assert.equal(JSON.stringify(remoteConfig).includes(httpSource), false);
+
+  await writeFile(join(remoteFixture, "CONTEXT.md"), "GITLAB_SSH_V2\n");
+  const sshSource = "git@gitlab.example.invalid:team/ssh-resources.git";
+  const remoteSynced = await runCli(
+    [
+      "sync",
+      "--instance-dir",
+      remoteInstance,
+      "--source",
+      sshSource,
+      "--scope",
+      "shared",
+      "--source-type",
+      "gitlab",
+    ],
+    { env: remoteEnv },
+  );
+  assert.equal(remoteSynced.status, "ok");
+  assert.equal(
+    await readFile(join(remoteInstance, "context/001-ssh-resources/CONTEXT.md"), "utf8"),
+    "GITLAB_SSH_V2\n",
+  );
+  assert.equal(await readFile(join(remoteFixture, "CONTEXT.md"), "utf8"), "GITLAB_SSH_V2\n");
+  const gitCalls = (await readFile(fakeGitLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(gitCalls.map((call) => call.args[0]), ["clone", "clone"]);
+  assert.equal(gitCalls[0].args.includes(httpSource), true);
+  assert.equal(gitCalls[1].args.includes(sshSource), true);
+  assert.equal(gitCalls[0].args.includes("main"), true);
+  assert.match(gitCalls[0].allowProtocol, /https/);
+  assert.match(gitCalls[1].allowProtocol, /ssh/);
+
+  const failedRemote = await runCli(
+    [
+      "sync",
+      "--instance-dir",
+      remoteInstance,
+      "--source",
+      "https://url-user:url-pass@gitlab.example.invalid/team/failure.git",
+      "--scope",
+      "shared",
+      "--source-type",
+      "gitlab",
+    ],
+    { allowFailure: true, env: remoteEnv },
+  );
+  assert.equal(failedRemote.status, "error");
+  assert.equal(failedRemote.reason.includes("url-pass"), false);
+  assert.equal(failedRemote.reason.includes("url-user:url-pass"), false);
+  assert.equal(
+    await readFile(join(remoteInstance, "context/001-ssh-resources/CONTEXT.md"), "utf8"),
+    "GITLAB_SSH_V2\n",
+  );
+  assert.equal((await readdir(remoteInstance)).some((name) => name.startsWith(".resources-")), false);
+  const savedFailure = await readFile(join(remoteInstance, "sync-status.json"), "utf8");
+  assert.equal(savedFailure.includes("url-pass"), false);
+});
+
+test("sync-status 提交失败时整个同步事务回滚到 V1 并清理临时文件", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared");
+  const instanceDir = join(root, "instance");
+  await mkdir(source);
+  await writeFile(join(source, "CONTEXT.md"), "TRANSACTION_V1\n");
+  await writeFile(join(source, "keep.md"), "KEEP_V1\n");
+  const initialized = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const previousConfig = await readFile(join(instanceDir, "instance.json"), "utf8");
+  const previousSyncStatus = await readFile(join(instanceDir, "sync-status.json"), "utf8");
+
+  await writeFile(join(source, "CONTEXT.md"), "TRANSACTION_V2\n");
+  await rm(join(source, "keep.md"));
+  const failed = await runCli(
+    ["sync", "--instance-dir", instanceDir, "--source", source, "--scope", "shared"],
+    {
+      allowFailure: true,
+      env: { ...process.env, WECOM_BOT_TEST_FAIL_SYNC_STATUS_COMMIT: "1" },
+    },
+  );
+
+  assert.equal(failed.status, "error");
+  assert.match(failed.reason, /sync-status/);
+  assert.equal(failed.version, initialized.resources.version);
+  assert.equal(await readFile(join(instanceDir, "context/001-shared/CONTEXT.md"), "utf8"), "TRANSACTION_V1\n");
+  assert.equal(await readFile(join(instanceDir, "context/001-shared/keep.md"), "utf8"), "KEEP_V1\n");
+  assert.equal(await readFile(join(instanceDir, "instance.json"), "utf8"), previousConfig);
+  assert.equal(await readFile(join(instanceDir, "sync-status.json"), "utf8"), previousSyncStatus);
+  assert.equal(await readFile(join(source, "CONTEXT.md"), "utf8"), "TRANSACTION_V2\n");
+  const instanceEntries = await readdir(instanceDir);
+  assert.equal(instanceEntries.some((name) => name.startsWith(".resources-") || name.includes(".tmp")), false);
+  const status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.resources.version, initialized.resources.version);
+  assert.equal(status.resources.actualVersion, initialized.resources.version);
+  assert.equal(status.resources.consistent, true);
+  assert.equal(status.lastSync.status, "ok");
+  assert.equal(status.lastSync.version, initialized.resources.version);
+});
+
+test("同步失败不半更新，源目标重叠被拒绝，status 报告实际副本损坏", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared");
+  const instanceDir = join(root, "instance");
+  await mkdir(source);
+  await writeFile(join(source, "CONTEXT.md"), "STABLE_V1\n");
+  await writeFile(join(source, "keep.md"), "KEEP_V1\n");
+  const initialized = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  await writeFile(join(source, "CONTEXT.md"), "UNCOMMITTED_V2\n");
+  await rm(join(source, "keep.md"));
+  const failed = await runCli(
+    [
+      "sync",
+      "--instance-dir",
+      instanceDir,
+      "--source",
+      source,
+      "--scope",
+      "shared",
+      "--source",
+      join(root, "missing"),
+      "--scope",
+      "shared",
+    ],
+    { allowFailure: true },
+  );
+  assert.equal(failed.status, "error");
+  assert.equal(await readFile(join(instanceDir, "context/001-shared/CONTEXT.md"), "utf8"), "STABLE_V1\n");
+  assert.equal(await readFile(join(instanceDir, "context/001-shared/keep.md"), "utf8"), "KEEP_V1\n");
+  assert.equal(await readFile(join(source, "CONTEXT.md"), "utf8"), "UNCOMMITTED_V2\n");
+
+  const overlap = await runCli(
+    ["sync", "--instance-dir", instanceDir, "--source", join(instanceDir, "context/001-shared"), "--scope", "shared"],
+    { allowFailure: true },
+  );
+  assert.equal(overlap.status, "error");
+  assert.match(overlap.reason, /不能相同或互相包含/);
+  const protectedRoot = await runCli(
+    ["sync", "--instance-dir", instanceDir, "--source", projectDir, "--scope", "shared"],
+    { allowFailure: true },
+  );
+  assert.equal(protectedRoot.status, "error");
+  assert.match(protectedRoot.reason, /保护根/);
+  let status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.resources.version, initialized.resources.version);
+  assert.equal(status.resources.consistent, true);
+  assert.equal(status.lastSync.status, "error");
+  assert.match(status.lastSync.reason, /保护根/);
+
+  await rm(join(instanceDir, "context/001-shared/keep.md"));
+  status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.resources.consistent, false);
+  assert.ok(status.loadFailures.some((failure) => /版本|缺失|不存在/.test(failure.reason)));
+  assert.equal(status.coverage.sources[0].files, 1);
+});
+
+test("公开同步按真实路径拒绝符号链接重叠、保护根别名和未创建尾路径", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared");
+  const instanceDir = join(root, "instance");
+  const instanceAlias = join(root, "instance-alias");
+  await mkdir(source);
+  await writeFile(join(source, "CONTEXT.md"), "REALPATH_V1\n");
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  await symlink(instanceDir, instanceAlias, "dir");
+
+  const aliasedOverlap = await runCli(
+    [
+      "sync",
+      "--instance-dir",
+      instanceAlias,
+      "--source",
+      join(instanceDir, "context/001-shared"),
+      "--scope",
+      "shared",
+    ],
+    { allowFailure: true },
+  );
+  assert.equal(aliasedOverlap.status, "error");
+  assert.match(aliasedOverlap.reason, /真实路径|不能相同或互相包含/);
+  assert.equal(await readFile(join(instanceDir, "context/001-shared/CONTEXT.md"), "utf8"), "REALPATH_V1\n");
+
+  await writeFile(join(source, "CONTEXT.md"), "REALPATH_V2\n");
+  const independent = await runCli([
+    "sync",
+    "--instance-dir",
+    instanceAlias,
+    "--source",
+    source,
+    "--scope",
+    "shared",
+  ]);
+  assert.equal(independent.status, "ok");
+  assert.equal(await readFile(join(instanceDir, "context/001-shared/CONTEXT.md"), "utf8"), "REALPATH_V2\n");
+  const independentStatus = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(independentStatus.resources.consistent, true);
+
+  const sourceAlias = join(root, "source-alias");
+  await symlink(join(instanceDir, "context/001-shared"), sourceAlias, "dir");
+  const aliasedSource = await runCli(
+    ["sync", "--instance-dir", instanceDir, "--source", sourceAlias, "--scope", "shared"],
+    { allowFailure: true },
+  );
+  assert.equal(aliasedSource.status, "error");
+  assert.match(aliasedSource.reason, /真实路径|不能相同或互相包含/);
+
+  const protectedAlias = join(root, "protected-alias");
+  await symlink(projectDir, protectedAlias, "dir");
+  const protectedSource = await runCli(
+    ["sync", "--instance-dir", instanceDir, "--source", protectedAlias, "--scope", "shared"],
+    { allowFailure: true },
+  );
+  assert.equal(protectedSource.status, "error");
+  assert.match(protectedSource.reason, /保护根/);
+
+  const futureParent = join(root, "future-parent");
+  const futureSource = futureParent;
+  const futureAlias = join(root, "future-alias");
+  const futureInstance = join(futureAlias, "not-created-yet");
+  await mkdir(futureSource, { recursive: true });
+  await writeFile(join(futureSource, "CONTEXT.md"), "FUTURE_SOURCE\n");
+  await symlink(futureParent, futureAlias, "dir");
+  const future = await initInstance({
+    instanceDir: futureInstance,
+    template: "team",
+    sources: [{ path: futureSource, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    allowFailure: true,
+  });
+  assert.equal(future.ready, false);
+  assert.match(future.checks.contextSources[0].reason, /真实路径|不能相同或互相包含/);
+});
+
+test("共享来源中的符号链接不会把目录外私人文件纳入团队副本", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared");
+  const privateFile = join(root, "private.md");
+  const instanceDir = join(root, "instance");
+  await mkdir(source);
+  await writeFile(join(source, "CONTEXT.md"), "SHARED\n");
+  await writeFile(privateFile, "PRIVATE_OUTSIDE_SHARED_ROOT\n");
+  await symlink(privateFile, join(source, "private-link.md"));
+
+  const result = await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+    allowFailure: true,
+  });
+  assert.equal(result.ready, false);
+  assert.match(result.checks.contextSources[0].reason, /符号链接/);
+  assert.equal(existsSync(join(instanceDir, "context/001-shared/private-link.md")), false);
+  assert.equal(await readFile(privateFile, "utf8"), "PRIVATE_OUTSIDE_SHARED_ROOT\n");
 });

@@ -117,9 +117,11 @@ WECOM_BOT_SECRETS=config/secrets.dev.json npm start
 | `inbox.recoveryWindowMs` / `inbox.retentionMs` | 补跑窗口（30 分钟）/ 收件箱保留期（24 小时） |
 | `surface.*` | 用户可见文案 |
 
-## 本地实例初始化
+## 本地实例初始化与同步
 
-不用手改实例配置。通过公开初始化命令选择目录、单文件或 zip 资源包，并逐项指定 `shared` / `private` 范围；主模型和 Guard 模型连接测试通过后实例才会启用。团队模板（`--template team`）只接受 `shared` 来源，空白模板可省略 `--template`。
+不用手改实例配置。通过公开初始化命令选择目录、单文件或 zip 资源包，并逐项指定 `shared` / `private` 范围。团队模板（`--template team`）只接受 `shared` 来源，空白模板可省略 `--template`；既有实例用 `--template import --package <分发包>` 导入。
+
+主模型、快速模型、执行审批模型与 Guard 模型默认共用 `--base-url` / `--api-key` / `--model`。需要独立配置时分别使用 `--quick-*`、`--approval-*`、`--guard-*` 三组选项。初始化会逐项检查四个模型，并通过真实 pi 读取本地知识与 Skill 正文、走完执行审批链和与 `ask` 相同的示例任务编排；临时检查产物会清理。未安装 pi、模型失败或未执行的检查会明确显示 `error` / `skipped`，不会冒充通过。
 
 ```bash
 npm run instance -- init \
@@ -130,7 +132,29 @@ npm run instance -- init \
   --base-url http://127.0.0.1:3425/v1 \
   --api-key <模型凭证> \
   --model <主模型> \
+  --quick-model <快速模型> \
+  --approval-model <执行审批模型> \
   --guard-model <Guard 模型>
+
+# 以本次明确选择的来源完整更新标准资源副本；workspace、data 和会话不动
+npm run instance -- sync \
+  --instance-dir ./instances/team \
+  --source /path/to/shared-docs --scope shared
+
+# 查看资源版本、目录/副本一致性、本地修改漂移、最近同步和加载失败
+npm run instance -- status --instance-dir ./instances/team
+
+# 生成仅含共享资源的团队包；不含凭证、私人来源、workspace、会话或运行状态
+npm run instance -- export \
+  --instance-dir ./instances/team \
+  --output ./team-instance.zip
+
+# 导入时生成新实例身份，复用脱敏模型设置，但必须提供新的模型凭证
+npm run instance -- init \
+  --instance-dir ./instances/imported \
+  --template import \
+  --package ./team-instance.zip \
+  --api-key <新模型凭证>
 
 npm run instance -- ask \
   --instance-dir ./instances/team \
@@ -138,7 +162,9 @@ npm run instance -- ask \
   --session-key <同事标识>
 ```
 
-初始化会把来源复制到实例的 `context/`。问答只读取这些副本，并使用实例自己的 `agent/` 与 `data/session-state.json`；原始目录、GitLab 和主工作区不是运行时来源。Guard 地址或凭证不同时，可追加 `--guard-base-url` 与 `--guard-api-key`。zip 解包使用本机已有的 `unzip`，不会安装新依赖。
+初始化与同步只写实例的 `context/` 标准副本，问答只读取该副本和独立 `workspace/`；原始目录、GitLab 和主工作区不是运行时来源。同步先构建并校验暂存副本，再把 context、资源 manifest、实例配置与 sync-status 作为一个事务提交；任一步失败都会恢复旧副本和旧状态。目录在每次问答/status 时从实际副本重建，源中删除的文件不会残留为目录项。
+
+`--source-type gitlab` 接受本地路径、`file://`、HTTP(S) 与 SSH 仓库，可用 `--ref` 选择分支；实现只执行 clone 到临时副本后校验和单向同步，不 push、不回写来源，也不保存或在错误日志中暴露 URL 凭证。HTTP/SSH 自动化验收通过 PATH 中的假 git 完成，真实 GitLab 联网尚未验收。zip 解包和团队打包使用本机已有的 `unzip` / `zip`，不会安装新依赖。
 
 ## 已知限制
 

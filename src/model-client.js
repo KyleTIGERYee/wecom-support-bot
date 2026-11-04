@@ -61,6 +61,15 @@ export async function createGuardClient({ config, agentDir }) {
 }
 
 /**
+ * 快速模型负责分诊与 QUICK 轮次，连接信息与主模型、Guard 相互独立。
+ *
+ * @param {{config: any, agentDir: string}} options
+ */
+export async function createQuickClient({ config, agentDir }) {
+  return createOpenAICompatibleClient({ modelConfig: config.quick, provider: "local-instance-quick", agentDir });
+}
+
+/**
  * 独立执行审批模型客户端，只返回模型文本，不执行工具。
  *
  * @param {{config: any, agentDir: string}} options

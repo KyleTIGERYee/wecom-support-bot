@@ -17,9 +17,9 @@
 | S11 图片下载 | `src/images.js` | `downloadImages({client, images, dir, msgid, maxBytes}) → string[]` | 下载解密后落盘并返回路径；超限拒绝；非常见后缀归一为 .jpg；多张按序号命名 |
 | S12 消息归一化 | `src/wecom.js` | `normalizeMessage(frame) → {text, userId, chatType, chatId, msgid, images} \| null` | 文本/语音/图文混排提取文字；纯图与混排取图；无文字且无图返回 null；会话指令识别与 @提及剥离 |
 | S13 执行审批 | `extensions/bash-whitelist.ts` | 真实 pi `tool_call` 钩子：write/edit/bash → 放行或 `{block, reason}`；`processApprovedToolCall({event, task, callModel, execute, ...}) → {verdict, source, reason, riskCategory, executionResult?}` | ALLOW 后执行；DENY 理由回主 Agent；硬规则不可被模型覆盖；异常、超时、无效输出 fail-closed；逐次审批不扩散；写目标限写根，cp 源限读根，mv 源与目标均限写根且避开保护根；默认企微只读 |
-| S14 本地实例公开工作流程 | `scripts/local-instance.js` | `npm run instance -- init [选项]` / `npm run instance -- ask [选项]` → JSON 结果 | 目录、文件、zip 来源复制与共享范围；主模型/Guard 连接测试；未就绪检查；运行时仅访问本地实例副本与独立 workspace；真实 pi 使用生成的模型配置；默认主工作区文件在本地实例中不可读；审批模型与写根注入；真实 Skill 正文/引用渐进加载、文档产物和查数组合；配置跨重启与实例间会话隔离；现有 Guard 重写保持可用 |
+| S14 本地实例公开工作流程 | `scripts/local-instance.js` | `npm run instance -- init|ask|sync|status|export [选项]` → JSON 结果 | 目录、文件、zip 与本地/file/HTTP(S)/SSH GitLab 来源的单向复制；团队/空白/导入模板；四模型连接测试与真实 pi 配置；知识、Skills、04 执行审批与示例任务逐项真实检查；事务式同步保留 workspace、会话和运行状态；团队包剔除凭证、私人来源与运行状态；status 公开资源版本、目录一致性、副本漂移、最近同步、加载失败和实际覆盖；运行时仅访问本地副本与独立 workspace；现有 Guard 重写保持可用 |
 
-S14 不新增内部函数测试缝：测试只驱动公开 CLI，以临时目录和本地假 OpenAI 兼容服务替代外部模型。真实 pi 查数验收通过现有 binary 注入点使用默认只读模式，测试扩展副本仅把 04 既有默认 Wiki 脚本目录重定位到隔离 HOME 的只读假数据脚本，不设置环境变量脚本白名单、不访问真实 BI；真实 pi 文档验收仍逐次验证 write/edit 审批。本机存在隔离 pi 时，同时使用真实 pi binary 验证模型配置、文件白名单、文档产物与查数组合，不存在时仅跳过对应真实 pi 验收。S13 使用真实 TS 扩展公开 `tool_call` 行为，并以临时目录、本地假模型和假执行器覆盖执行结果，不访问真实企微、生产或主工作区。
+S14 不新增内部函数测试缝：测试只驱动公开 CLI，以临时目录和本地假 OpenAI 兼容服务替代外部模型；GitLab HTTP/SSH 通过 PATH 中的假 git 验证 clone 参数、临时副本、失败清理与凭证脱敏，不访问真实远端。真实 pi 查数验收通过现有 binary 注入点使用默认只读模式，测试扩展副本仅把 04 既有默认 Wiki 脚本目录重定位到隔离 HOME 的只读假数据脚本，不设置环境变量脚本白名单、不访问真实 BI；真实 pi 文档验收仍逐次验证 write/edit 审批。本机存在隔离 pi 时，同时使用真实 pi binary 验证模型配置、文件白名单、文档产物与查数组合，不存在时仅跳过对应真实 pi 验收。S13 使用真实 TS 扩展公开 `tool_call` 行为，并以临时目录、本地假模型和假执行器覆盖执行结果，不访问真实企微、生产或主工作区。
 
 依赖注入约定：S2 的 `runner`、S3/S10 的 `callModel`、S4 的 `deps`、S7 的 `stream`/`push`/`wait`、S8 的 `execute`/`surface`、S11 的 `client` 都是注入点，测试用假实现替换真实的外部边界（子进程、HTTP、企微 SDK、时钟）。项目自身模块一律不 mock。
 
