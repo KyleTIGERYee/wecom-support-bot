@@ -347,8 +347,8 @@ test("初始化后删除原始目录仍可从本地副本完成问答和 Guard �
   const instanceDir = join(root, "instance");
   const fakePi = join(root, "fake-pi.js");
   const piLog = join(root, "pi-log.jsonl");
-  await mkdir(source);
-  await writeFile(join(source, "handbook.md"), "LOCAL_ONLY_RULE：退租审批需要两级审批。\n");
+  await mkdir(join(source, "raw"), { recursive: true });
+  await writeFile(join(source, "raw/handbook.md"), "LOCAL_ONLY_RULE：退租审批需要两级审批。\n");
   await initInstance({
     instanceDir,
     template: "team",
@@ -357,15 +357,20 @@ test("初始化后删除原始目录仍可从本地副本完成问答和 Guard �
     guardModel: "guard-model",
   });
   await rm(source, { recursive: true });
+  const localHandbookPath = join(instanceDir, "context/001-shared-docs/raw/handbook.md");
   await writeFile(
     fakePi,
     `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const prompt = args.at(-1);
 appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ prompt, agentDir: process.env.PI_CODING_AGENT_DIR, roots: JSON.parse(process.env.WECOM_BOT_ROOTS || "[]") }) + "\\n");
 const rework = prompt.includes("上一条答复未通过隐私检查");
-const found = prompt.includes("LOCAL_ONLY_RULE：退租审批需要两级审批。");
+const found = rework || readFileSync(${JSON.stringify(localHandbookPath)}, "utf8").includes("LOCAL_ONLY_RULE");
+if (!rework) {
+  console.log(JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: ${JSON.stringify(localHandbookPath)} } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolName: "read", args: { path: ${JSON.stringify(localHandbookPath)} }, isError: false }));
+}
 const answer = rework ? "退租审批需要两级审批。" : found ? "退租审批需要两级审批。13800138000" : "没有找到本地资料";
 console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }], usage: { input: 10 } } }));
@@ -381,16 +386,85 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   assert.equal(result.finalText, "退租审批需要两级审批。");
   assert.equal(result.rounds, 2);
   assert.equal(result.guarded, true);
+  assert.equal(result.loadDepth, "raw");
+  assert.equal(result.loadedResources[0].path, localHandbookPath);
   const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
   assert.equal(calls.length, 2);
+  assert.equal(calls[0].prompt.includes("LOCAL_ONLY_RULE"), false);
   for (const call of calls) {
-    assert.match(call.prompt, /LOCAL_ONLY_RULE/);
     assert.equal(call.prompt.includes(source), false);
     assert.equal(call.agentDir, join(instanceDir, "agent"));
     assert.deepEqual(call.roots, [join(instanceDir, "context")]);
   }
   const state = JSON.parse(await readFile(join(instanceDir, "data/session-state.json"), "utf8"));
   assert.equal(Object.keys(state.generation).length, 1);
+});
+
+test("本地简单概念首轮只见目录，读取概念页后公开来源时间和深度", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared-docs");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  const conceptDir = join(source, "wiki/概念");
+  const rawDir = join(source, "raw/退租");
+  await mkdir(conceptDir, { recursive: true });
+  await mkdir(rawDir, { recursive: true });
+  await writeFile(
+    join(conceptDir, "退租.md"),
+    "---\nsummary: 退租概念摘要\nupdated: 2026-10-01\nstatus: current\nraw_source:\n  - raw/退租/审批.md\n---\nCONCEPT_FULL_BODY：退租是结束租赁关系。\n",
+  );
+  await writeFile(join(rawDir, "审批.md"), "RAW_FULL_BODY：退租审批需要两级审批。\n");
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const localConceptPath = join(instanceDir, "context/001-shared-docs/wiki/概念/退租.md");
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const prompt = args.at(-1);
+const systemPromptPath = args[args.indexOf("--append-system-prompt") + 1];
+const systemPrompt = readFileSync(systemPromptPath, "utf8");
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ prompt, systemPrompt }) + "\\n");
+const concept = readFileSync(${JSON.stringify(localConceptPath)}, "utf8");
+console.log(JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: ${JSON.stringify(localConceptPath)} } }));
+console.log(JSON.stringify({ type: "tool_execution_end", toolName: "read", args: { path: ${JSON.stringify(localConceptPath)} }, isError: false }));
+const answer = concept.includes("CONCEPT_FULL_BODY") ? "退租是结束租赁关系。" : "没有找到概念资料";
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "退租是什么？", "--session-key", "concept-colleague"],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog } },
+  );
+
+  assert.equal(result.finalText, "退租是结束租赁关系。");
+  assert.equal(result.loadDepth, "concept");
+  assert.equal(result.loadedResources.length, 1);
+  assert.equal(result.loadedResources[0].source, "shared-docs");
+  assert.equal(result.loadedResources[0].path, localConceptPath);
+  assert.equal(result.loadedResources[0].depth, "concept");
+  assert.equal(result.loadedResources[0].sourceTime, "2026-10-01");
+  assert.equal(result.loadedResources[0].validity, "current");
+  const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].prompt, /wiki\/概念\/退租\.md/);
+  assert.match(calls[0].prompt, /2026-10-01/);
+  assert.equal(calls[0].prompt.includes("CONCEPT_FULL_BODY"), false);
+  assert.equal(calls[0].prompt.includes("RAW_FULL_BODY"), false);
+  const rawCatalogLine = calls[0].prompt.split("\n").find((line) => line.includes("raw/退租/审批.md | depth: raw"));
+  assert.match(rawCatalogLine, /source_time: null/);
+  assert.equal(calls[0].systemPrompt.includes("CONCEPT_FULL_BODY"), false);
+  assert.equal(calls[0].systemPrompt.includes("RAW_FULL_BODY"), false);
 });
 
 test("空白实例的来源也必须明确共享或个人私有范围", async (t) => {
@@ -422,11 +496,17 @@ test("实例配置可跨进程重读且两个实例的会话与运行状态独�
   await writeFile(
     fakePi,
     `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const prompt = args.at(-1);
 appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ sessionId: args[args.indexOf("--session-id") + 1], agentDir: process.env.PI_CODING_AGENT_DIR }) + "\\n");
-const answer = prompt.includes("RULE_A") ? "答案 A" : prompt.includes("RULE_B") ? "答案 B" : "没有资料";
+const resourcePath = prompt.match(/\\| path: ([^|]+?) \\| depth:/)?.[1]?.trim();
+const resource = resourcePath ? readFileSync(resourcePath, "utf8") : "";
+if (resourcePath) {
+  console.log(JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: resourcePath } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolName: "read", args: { path: resourcePath }, isError: false }));
+}
+const answer = resource.includes("RULE_A") ? "答案 A" : resource.includes("RULE_B") ? "答案 B" : "没有资料";
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } }));
 `,
     { mode: 0o755 },
@@ -480,7 +560,27 @@ test("真实 pi 使用初始化生成的模型配置读取本地副本", { timeo
     return;
   }
   const root = await makeTempDir(t);
-  const models = await startModelServer({ mainReply: "REAL_PI_LOCAL_OK" });
+  let localCopyPath = "";
+  const models = await startModelServer({
+    mainReply: (payload) => {
+      const toolMessages = payload.messages.filter((message) => message.role === "tool");
+      if (toolMessages.length === 0) {
+        return {
+          toolCalls: [
+            {
+              index: 0,
+              id: "call-read-local-copy",
+              type: "function",
+              function: { name: "read", arguments: JSON.stringify({ path: localCopyPath }) },
+            },
+          ],
+        };
+      }
+      return JSON.stringify(toolMessages).includes("REAL_PI_CONTEXT_MARKER")
+        ? "REAL_PI_LOCAL_OK"
+        : "REAL_PI_LOCAL_READ_MISSING";
+    },
+  });
   t.after(() => models.close());
   const source = join(root, "docs.md");
   const instanceDir = join(root, "instance");
@@ -494,6 +594,7 @@ test("真实 pi 使用初始化生成的模型配置读取本地副本", { timeo
     model: "real-main-model",
     guardModel: "real-guard-model",
   });
+  localCopyPath = join(instanceDir, "context/001-docs.md");
 
   const result = await runCli(
     ["ask", "--instance-dir", instanceDir, "--question", "本地资料写了什么？"],
@@ -501,10 +602,13 @@ test("真实 pi 使用初始化生成的模型配置读取本地副本", { timeo
   );
 
   assert.equal(result.finalText, "REAL_PI_LOCAL_OK");
-  const mainCall = models.calls.find((call) => call.model === "real-main-model" && call.stream);
-  assert.ok(mainCall, "真实 pi 应调用初始化配置的主模型");
-  assert.equal(mainCall.authorization, "Bearer real-pi-key");
-  assert.match(JSON.stringify(mainCall.messages), /REAL_PI_CONTEXT_MARKER/);
+  assert.equal(result.loadDepth, "concept");
+  assert.equal(result.loadedResources[0].path, localCopyPath);
+  const mainCalls = models.calls.filter((call) => call.model === "real-main-model" && call.stream);
+  assert.equal(mainCalls.length, 2);
+  assert.equal(mainCalls[0].authorization, "Bearer real-pi-key");
+  assert.equal(JSON.stringify(mainCalls[0].messages).includes("REAL_PI_CONTEXT_MARKER"), false);
+  assert.match(JSON.stringify(mainCalls[1].messages), /REAL_PI_CONTEXT_MARKER/);
   assert.ok(models.calls.some((call) => call.model === "real-guard-model"));
 });
 

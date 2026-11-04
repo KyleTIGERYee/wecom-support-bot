@@ -14,6 +14,7 @@ import { runAgentTurn, killAllChildren } from "./agent.js";
 import { reviewReply } from "./guard.js";
 import { classifyQuestion } from "./route.js";
 import { handleTurn } from "./orchestrate.js";
+import { createDefaultResourceCatalog } from "./resource-catalog.js";
 import { runTurnLifecycle } from "./turn-lifecycle.js";
 import { deliverFinal } from "./deliver.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
@@ -37,6 +38,7 @@ const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
 async function main() {
   const config = await loadConfig(projectDir);
+  const resourceContext = createDefaultResourceCatalog(config.namedRoots, projectDir);
   const log = createLogger({ logPath: join(projectDir, "logs/bot.log") });
 
   // 企微同一个机器人只能有一条长连接，两份进程会互相踢线，所以先拿锁
@@ -264,6 +266,7 @@ async function main() {
         sessionKey,
         deps: {
           state,
+          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook },
           runAgent: async ({ prompt, sessionId }) => {
             const agentStartedAt = Date.now();
             const agentTurn = await runAgentTurn({
@@ -271,6 +274,7 @@ async function main() {
               sessionId,
               config,
               projectDir,
+              resourceCatalog: resourceContext.entries,
               idleTimeoutMs: config.pi.idleTimeoutMs,
               hardTimeoutMs: config.pi.timeoutMs,
               thinkingLevel,
@@ -363,6 +367,8 @@ async function main() {
       timedOut: Boolean(outcome.result.timedOut),
       stalled: Boolean(outcome.result.stalled),
       stallRetries: outcome.result.stallRetries ?? 0,
+      loadDepth: outcome.result.loadDepth,
+      loadedResources: outcome.result.loadedResources,
       inputTokens: lastInputTokens,
       outLength: text.length,
       totalMs: Date.now() - startedAt,

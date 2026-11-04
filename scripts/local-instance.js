@@ -11,6 +11,7 @@ import { createGuardClient } from "../src/model-client.js";
 import { handleTurn } from "../src/orchestrate.js";
 import { reviewReply } from "../src/guard.js";
 import { createSessionState } from "../src/session-state.js";
+import { createLocalResourceCatalog } from "../src/resource-catalog.js";
 
 const execFileAsync = promisify(execFile);
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -95,6 +96,7 @@ async function main() {
     version: 1,
     ready,
     instance: { id: randomUUID(), template: options.template },
+    initializedAt: new Date().toISOString(),
     models: {
       main: { baseUrl: options.baseUrl, model: options.model },
       guard: { baseUrl: options.guardBaseUrl, model: options.guardModel },
@@ -163,7 +165,7 @@ async function ask(args) {
     },
   };
 
-  const context = await loadLocalContext(instanceDir, saved.contextSources);
+  const context = await createLocalResourceCatalog(instanceDir, saved.contextSources, saved.initializedAt ?? null);
   const state = createSessionState({
     storePath: join(instanceDir, "data/session-state.json"),
     rotation: config.rotation,
@@ -179,12 +181,14 @@ async function ask(args) {
     sessionKey,
     deps: {
       state,
+      context: { catalog: context.text, dataPlaybook: context.dataPlaybook },
       runAgent: async ({ prompt, sessionId }) => {
         const turn = await runAgentTurn({
-          prompt: `${prompt}\n\n[本地实例上下文]\n以下内容每轮只从初始化时选择的本地副本读取。不得访问原始目录、GitLab或虎老师主工作区。\n${context}`,
+          prompt,
           sessionId,
           config,
           projectDir,
+          resourceCatalog: context.entries,
           idleTimeoutMs: config.pi.idleTimeoutMs,
           hardTimeoutMs: config.pi.timeoutMs,
           thinkingLevel: config.pi.thinkingLevel,
@@ -220,21 +224,6 @@ function parseAskArgs(args) {
   }
   if (!options.instanceDir || !options.question) throw new Error("ask 需要 --instance-dir 与 --question");
   return options;
-}
-
-async function loadLocalContext(instanceDir, sources) {
-  const sections = [];
-  for (const source of sources.filter((entry) => entry.status === "ok")) {
-    const files = await readLocalFiles(join(instanceDir, source.localPath));
-    if (files.length === 0) throw new Error(`本地来源没有可读取的文件：${source.name}`);
-    sections.push(
-      `## 来源：${source.name}（${source.scope}）\n${files
-        .map((file) => `### ${file.name}\n${file.content}`)
-        .join("\n")}`,
-    );
-  }
-  if (sections.length === 0) throw new Error("实例没有可读取的本地上下文来源");
-  return sections.join("\n\n");
 }
 
 async function readLocalFiles(path, prefix = "") {

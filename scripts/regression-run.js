@@ -1,8 +1,8 @@
 /**
  * 回归题集跑批：直连隔离 pi，逐题提问并记录耗时、答复、token 数。
  *
- * 与线上网关的差别只在「不经过企微、不过 guard」——agent 启动参数与 agent.js 完全一致，
- * 所以给出的耗时与答案可以直接和改造后对比。
+ * 与线上网关的差别只在「不经过企微、不调用真实 Guard 模型」——agent 启动参数与 agent.js 完全一致，
+ * 轮次仍经过 handleTurn，因此概念/规则深化与加载观测和线上使用同一条链路。
  *
  * 用法：
  *   node scripts/regression-run.js                     # 跑全部题目
@@ -14,6 +14,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { runAgentTurn } from "../src/agent.js";
+import { handleTurn } from "../src/orchestrate.js";
+import { createDefaultResourceCatalog } from "../src/resource-catalog.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -43,32 +45,58 @@ const outIndex = args.indexOf("--out");
 const outPath = outIndex >= 0 ? args[outIndex + 1] : join(projectDir, "docs/regression-baseline.json");
 
 const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
-const config = { ...defaults, projectDir };
+const config = {
+  ...defaults,
+  projectDir,
+  roots: Object.values(defaults.roots),
+  pi: { ...defaults.pi, binary: process.env.WECOM_BOT_PI_BINARY || defaults.pi.binary },
+};
+const resourceContext = createDefaultResourceCatalog(defaults.roots, projectDir);
 
 const picked = QUESTIONS.filter((item) => !only || only.has(item.id));
 const results = [];
 
 for (const item of picked) {
   const startedAt = Date.now();
-  const turn = await runAgentTurn({
-    prompt: item.question,
-    sessionId: `regress-${item.id}-${Date.now()}`,
-    config,
-    projectDir,
-    timeoutMs: Number(process.env.REGRESS_TIMEOUT_MS ?? 300000),
+  let biTouched = false;
+  let failed = false;
+  const turn = await handleTurn({
+    question: item.question,
+    sessionKey: `regress-${item.id}-${Date.now()}`,
+    deps: {
+      // 每题独立状态；review 是不调用真实 Guard 模型的 ALLOW 替身。
+      state: { isBiTouched: () => false, markBiTouched: () => {}, flush: async () => {} },
+      context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook },
+      runAgent: async ({ prompt, sessionId }) => {
+        const agentTurn = await runAgentTurn({
+          prompt,
+          sessionId,
+          config,
+          projectDir,
+          resourceCatalog: resourceContext.entries,
+          timeoutMs: Number(process.env.REGRESS_TIMEOUT_MS ?? 300000),
+        });
+        biTouched ||= agentTurn.biTouched;
+        failed = agentTurn.failed;
+        return agentTurn;
+      },
+      review: async () => ({ verdict: "ALLOW" }),
+    },
   });
   const record = {
     id: item.id,
     question: item.question,
     elapsedMs: Date.now() - startedAt,
-    biTouched: turn.biTouched,
-    timedOut: turn.timedOut,
-    failed: turn.failed,
-    answer: turn.text,
+    biTouched,
+    timedOut: Boolean(turn.timedOut),
+    failed,
+    loadedResources: turn.loadedResources,
+    loadDepth: turn.loadDepth,
+    answer: turn.finalText,
   };
   results.push(record);
   process.stdout.write(
-    `${item.id} ${record.elapsedMs}ms bi=${record.biTouched} timedOut=${record.timedOut} failed=${record.failed} len=${turn.text.length}\n`,
+    `${item.id} ${record.elapsedMs}ms bi=${record.biTouched} timedOut=${record.timedOut} failed=${record.failed} len=${turn.finalText.length}\n`,
   );
 }
 

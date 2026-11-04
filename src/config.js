@@ -27,6 +27,7 @@ export async function loadConfig(projectDir, { env = process.env } = {}) {
     projectDir,
     wecom: { botId: secrets.botId, secret: secrets.secret },
     roots: Object.values(defaults.roots),
+    namedRoots: defaults.roots,
   };
 }
 

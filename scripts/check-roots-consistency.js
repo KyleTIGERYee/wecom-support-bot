@@ -10,6 +10,8 @@ import { readFile, access } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { createDefaultResourceCatalog } from "../src/resource-catalog.js";
+
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const config = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
@@ -36,12 +38,12 @@ if (missingInExtension.length || missingInConfig.length) {
 
 const filesMatch = extensionSource.match(/const DEFAULT_ALLOWED_READ_FILES = \[([\s\S]*?)\];/);
 const allowedFiles = filesMatch ? [...filesMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
-const corePrompt = await readFile(join(projectDir, "prompts/core.md"), "utf8");
+const resourceCatalog = createDefaultResourceCatalog(config.roots, projectDir);
 
-// 默认模式的手册路径物理上存在于两处（扩展放行清单、核心提示词里的指引），写错一处 agent 就读不到
-const unlisted = allowedFiles.filter((file) => !corePrompt.includes(file));
+// 放行文件必须进入动态资源目录；主提示词只引用目录，不再复制固定绝对路径。
+const unlisted = allowedFiles.filter((file) => !resourceCatalog.entries.some((entry) => entry.path === file));
 if (unlisted.length) {
-  console.error("默认模式放行文件未在核心提示词中出现：\n  " + unlisted.join("\n  "));
+  console.error("默认模式放行文件未进入动态资源目录：\n  " + unlisted.join("\n  "));
   process.exit(1);
 }
 

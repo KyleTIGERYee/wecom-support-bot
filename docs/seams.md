@@ -5,9 +5,9 @@
 | 缝 | 模块 | 公开签名 | 验证的行为 |
 |---|---|---|---|
 | S1 命令白名单 | `src/command-whitelist.js` | `isCommandAllowed(command, roots) → {allowed, reason}` | 合法脚本放行；写入、外传、越界路径、读凭证全部拒绝 |
-| S2 Agent 调用 | `src/agent.js` | `runAgentTurn({prompt, sessionId, runner, timeoutMs, idleTimeoutMs, hardTimeoutMs, thinkingLevel, config, projectDir}) → {text, biTouched, timedOut, stalled, failed, inputTokens}` | 从事件流提取最终答复；识别 bi_query.py；事件流持续吐时不超时；静默超过 idle 判 stalled；超过 hard 判 timedOut；回传输入 token 数；思考强度透传给 runner |
+| S2 Agent 调用 | `src/agent.js` | `runAgentTurn({prompt, sessionId, runner, timeoutMs, idleTimeoutMs, hardTimeoutMs, thinkingLevel, config, projectDir, resourceCatalog?}) → {text, biTouched, timedOut, stalled, failed, inputTokens, contextInsufficient, loadedResources}` | 从事件流提取最终答复；识别 bi_query.py；事件流持续吐时不超时；静默超过 idle 判 stalled；超过 hard 判 timedOut；回传输入 token 数；思考强度透传给 runner；识别概念内容不足信号；记录目录内成功完成的 read 及资源类型/深度 |
 | S3 守卫判定 | `src/guard.js` | `reviewReply({answer, callModel}) → {verdict, reason}` | ALLOW/DENY 解析；模型故障时 fail-closed；只判答复、不接收提问 |
-| S4 轮次编排 | `src/orchestrate.js` | `handleTurn({question, sessionKey, deps}) → {finalText, rounds, guarded, exhausted, timedOut, stalled, stallRetries}` | DENY 后重写一次即通过；连续 3 次 DENY 走兜底；未碰 BI 时不调用 guard；卡住自动重试一次，仍卡住给超时话术 |
+| S4 轮次编排 | `src/orchestrate.js` | `handleTurn({question, sessionKey, deps}) → {finalText, rounds, guarded, exhausted, timedOut, stalled, stallRetries, loadedResources, loadDepth}`；`deps.context` 提供薄资源目录与查数手册可用性 | DENY 后重写一次即通过；连续 3 次 DENY 走兜底；未碰 BI 时不调用 guard；卡住自动重试一次，仍卡住给超时话术；简单概念不强制 raw，具体规则按概念内容充分性深化，查数按需读手册；公开实际加载来源、时间、资源类型与最深深度 |
 | S5 会话标记 | `src/session-state.js` | `createSessionState({storePath, rotation}) → {resolveSessionId(userKey, now), recordActivity, startNewSession, markBiTouched, isBiTouched, flush}` | 跨进程重启保留；文件损坏时保守地全量过 guard；会话满 24 小时 / 闲置满 24 小时 / 上下文超阈值自动换代；老状态文件首次访问换一次；旧代粘性标记随之作废 |
 | S6 收件箱 | `src/inbox.js` | `createInbox({storePath}) → {load, accept(msg) → {isNew}, markRunning, markAnswered, markFailed, recoverable(now, windowMs) → msg[], stale(now, windowMs) → msg[], compact, flush}` | 同 msgid 只接受一次；重启后读回未答问题；超出窗口不返回；坏行不崩；清理按保留期丢记录 |
 | S7 投递 | `src/deliver.js` | `deliverFinal({text, stream, push, retries, wait}) → {channel, reason?}` | 流式成功走 stream；流式失败改走 push；push 按次数重试；全失败返回 none 且不抛异常 |

@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 
+import { findCatalogResource } from "./resource-catalog.js";
+
 /** 判定本轮是否触碰生产数据的脚本名。 */
 const BI_SCRIPT = "bi_query.py";
+const CONTEXT_INSUFFICIENT = "CONTEXT_INSUFFICIENT";
 
 /**
  * 在跑的 pi 子进程。父进程退出不会自动带走子进程，强杀场景下它们会变成孤儿继续占着会话，
@@ -98,9 +101,10 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel }
  *   hardTimeoutMs?: number,
  *   thinkingLevel?: string,
  *   config?: any,
- *   projectDir?: string
+ *   projectDir?: string,
+ *   resourceCatalog?: Array<any>
  * }} options
- * @returns {Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, inputTokens: number}>}
+ * @returns {Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, inputTokens: number, contextInsufficient: boolean, loadedResources: Array<any>}>}
  */
 export async function runAgentTurn({
   prompt,
@@ -112,6 +116,7 @@ export async function runAgentTurn({
   thinkingLevel,
   config,
   projectDir,
+  resourceCatalog = [],
 }) {
   /** @param {{prompt: string, sessionId: string}} options */
   const defaultLaunch = (options) => {
@@ -127,9 +132,14 @@ export async function runAgentTurn({
     let text = "";
     let biTouched = false;
     let inputTokens = 0;
+    let contextInsufficient = false;
     let timedOut = false;
     let stalled = false;
     let settled = false;
+    /** @type {Array<any>} */
+    const loadedResources = [];
+    /** @type {Map<string, string>} */
+    const pendingReads = new Map();
     /** @type {NodeJS.Timeout | undefined} */
     let idleTimer;
 
@@ -140,7 +150,17 @@ export async function runAgentTurn({
       settled = true;
       clearTimeout(hardTimer);
       if (idleTimer) clearTimeout(idleTimer);
-      resolvePromise({ text, biTouched, inputTokens, timedOut, stalled, failed: false, ...extra });
+      resolvePromise({
+        text,
+        biTouched,
+        inputTokens,
+        contextInsufficient,
+        timedOut,
+        stalled,
+        failed: false,
+        loadedResources: loadedResources.map((resource) => ({ ...resource })),
+        ...extra,
+      });
     };
 
     const hardTimer = setTimeout(() => {
@@ -172,8 +192,21 @@ export async function runAgentTurn({
           const parsed = parseEvent(line);
           if (parsed) {
             if (parsed.biTouched) biTouched = true;
-            if (parsed.text !== undefined) text = parsed.text;
+            if (parsed.text !== undefined) {
+              text = parsed.text;
+              contextInsufficient = Boolean(parsed.contextInsufficient);
+            }
             if (parsed.inputTokens) inputTokens = parsed.inputTokens;
+            if (parsed.readStarted) {
+              if (parsed.pendingReadId && parsed.readPath) pendingReads.set(parsed.pendingReadId, parsed.readPath);
+            } else if (parsed.readCompleted) {
+              const path = parsed.readPath ?? pendingReads.get(parsed.completedReadId ?? "");
+              if (parsed.completedReadId) pendingReads.delete(parsed.completedReadId);
+              const resource = path && !parsed.readFailed ? findCatalogResource(path, resourceCatalog) : null;
+              if (resource && !loadedResources.some((loaded) => loaded.path === resource.path)) {
+                loadedResources.push(resource);
+              }
+            }
           }
           newlineIndex = buffer.indexOf("\n");
         }
@@ -193,7 +226,7 @@ export async function runAgentTurn({
  * 解析单行 JSONL 事件，提取对该轮有意义的信息。
  *
  * @param {string} line
- * @returns {{text?: string, biTouched?: boolean, inputTokens?: number} | null}
+ * @returns {{text?: string, contextInsufficient?: boolean, biTouched?: boolean, inputTokens?: number, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean} | null}
  */
 function parseEvent(line) {
   const trimmed = line.trim();
@@ -214,12 +247,34 @@ function parseEvent(line) {
     return null;
   }
 
+  if (event?.type === "tool_execution_start" && event.toolName === "read") {
+    const path = event.args?.path ?? event.input?.path;
+    return typeof path === "string"
+      ? { readStarted: true, readPath: path, pendingReadId: event.toolCallId }
+      : null;
+  }
+
+  if (event?.type === "tool_execution_end" && event.toolName === "read") {
+    const path = event.args?.path ?? event.input?.path;
+    return {
+      readCompleted: true,
+      completedReadId: event.toolCallId,
+      ...(typeof path === "string" ? { readPath: path } : {}),
+      readFailed: Boolean(event.isError),
+    };
+  }
+
   if (event?.type === "message_end" && event.message?.role === "assistant") {
     const messageText = extractText(event.message.content);
+    const contextInsufficient = messageText.startsWith(CONTEXT_INSUFFICIENT);
+    const cleanText = contextInsufficient
+      ? messageText.replace(/^CONTEXT_INSUFFICIENT\s*:?\s*/, "")
+      : messageText;
     const inputTokens = Number(event.message.usage?.input ?? 0);
-    /** @type {{text?: string, inputTokens?: number}} */
+    /** @type {{text?: string, contextInsufficient?: boolean, inputTokens?: number}} */
     const parsed = {};
-    if (messageText) parsed.text = messageText;
+    if (messageText) parsed.text = cleanText;
+    if (contextInsufficient) parsed.contextInsufficient = true;
     if (inputTokens > 0) parsed.inputTokens = inputTokens;
     return Object.keys(parsed).length ? parsed : null;
   }

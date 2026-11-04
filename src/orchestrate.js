@@ -5,6 +5,8 @@
  * 让它重写，绝不把原答复带给调用方。
  */
 
+import { getLoadDepth } from "./resource-catalog.js";
+
 const DEFAULT_MAX_ROUNDS = 3;
 const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
 const DEFAULT_ERROR_TEXT = "刚才没处理好，你再问一次？";
@@ -16,13 +18,14 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   sessionKey: string,
  *   deps: {
  *     state: {isBiTouched: (key: string) => boolean, markBiTouched: (key: string) => void, flush: () => Promise<void>},
- *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean}>,
- *     review: (options: {answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>
+ *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, contextInsufficient?: boolean, loadedResources?: Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>}>,
+ *     review: (options: {answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>,
+ *     context?: {catalog?: string, dataPlaybook?: boolean}
  *   },
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
  * }} options
- * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string}>}
+ * @returns {Promise<{finalText: string, rounds: number, guarded: boolean, exhausted: boolean, timedOut?: boolean, stalled?: boolean, stallRetries?: number, lastDenyReason?: string, loadedResources: Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>, loadDepth: string}>}
  */
 export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAULT_MAX_ROUNDS, messages = {} }) {
   const { state, runAgent, review } = deps;
@@ -30,17 +33,27 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
   const errorText = messages.errorText ?? DEFAULT_ERROR_TEXT;
   const timeoutText = messages.timeoutText ?? DEFAULT_TIMEOUT_TEXT;
 
-  let prompt = question;
+  let prompt = buildInitialPrompt(question, deps.context?.catalog);
   let lastDenyReason = "";
   let rounds = 0;
   let stallRetries = 0;
   let needGuard = state.isBiTouched(sessionKey);
+  /** @type {Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>} */
+  const loadedResources = [];
+  const observation = () => ({
+    loadedResources: loadedResources.map((resource) => ({ ...resource })),
+    loadDepth: getLoadDepth(loadedResources),
+  });
 
   while (rounds < maxRounds) {
     rounds += 1;
     const isRework = rounds > 1;
 
-    const { turn, retries } = await runWithStallRetry(runAgent, { prompt, sessionId: sessionKey, isRework });
+    const { turn, retries } = await runWithProgressiveDepth(
+      runAgent,
+      { prompt, sessionId: sessionKey, isRework },
+      { question, catalog: deps.context?.catalog, dataPlaybook: deps.context?.dataPlaybook, loadedResources },
+    );
     stallRetries += retries;
 
     // 超时和失败给不同的话术：超时说明查得太久，失败说明出了岔子
@@ -54,10 +67,11 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
         timedOut: true,
         stalled: Boolean(turn.stalled),
         stallRetries,
+        ...observation(),
       };
     }
     if (turn.failed) {
-      return { finalText: errorText, rounds, guarded: needGuard, exhausted: false };
+      return { finalText: errorText, rounds, guarded: needGuard, exhausted: false, ...observation() };
     }
 
     if (turn.biTouched && !needGuard) {
@@ -67,12 +81,12 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     }
 
     if (!needGuard) {
-      return { finalText: turn.text, rounds, guarded: false, exhausted: false, stallRetries };
+      return { finalText: turn.text, rounds, guarded: false, exhausted: false, stallRetries, ...observation() };
     }
 
     const verdict = await review({ answer: turn.text });
     if (verdict.verdict === "ALLOW") {
-      return { finalText: turn.text, rounds, guarded: true, exhausted: false, stallRetries };
+      return { finalText: turn.text, rounds, guarded: true, exhausted: false, stallRetries, ...observation() };
     }
 
     lastDenyReason = verdict.reason ?? "答复包含敏感个人信息";
@@ -85,7 +99,89 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     guarded: true,
     exhausted: true,
     lastDenyReason,
+    ...observation(),
   };
+}
+
+/**
+ * 首轮只带选择资源所需的目录，不注入资源正文。
+ *
+ * @param {string} question
+ * @param {string|undefined} catalog
+ */
+function buildInitialPrompt(question, catalog) {
+  if (!catalog) return question;
+  return [
+    question,
+    "",
+    "[渐进式资源目录]",
+    "以下目录只用于选择资料，不是资料正文。先用目录和摘要定位，再按需读取概念页；只有当前内容不足以可靠回答时才继续读取相关原始资料。",
+    "如果读完概念内容仍不足以可靠回答，请在答复第一行输出 CONTEXT_INSUFFICIENT 并说明缺口；内容充分时正常回答，不输出该标记。",
+    catalog,
+  ].join("\n");
+}
+
+/**
+ * 合并实际读取记录，保留来源、时间和每次读取的深度。
+ *
+ * @param {Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>} target
+ * @param {Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>|undefined} incoming
+ */
+function mergeLoadedResources(target, incoming) {
+  for (const resource of incoming ?? []) {
+    const key = `${resource.source}\0${resource.path}\0${resource.depth}`;
+    if (target.some((existing) => `${existing.source}\0${existing.path}\0${existing.depth}` === key)) continue;
+    target.push({ ...resource });
+  }
+}
+
+/**
+ * 内容不足时，在同一 agent 会话继续读取当前任务需要的资源。
+ * 这是资料深化，不是 Guard 打回，因此不占用 maxRounds。
+ *
+ * @param {(options: any) => Promise<any>} runAgent
+ * @param {any} options
+ * @param {{question: string, catalog?: string, dataPlaybook?: boolean, loadedResources: Array<{source: string, path: string, depth: string, sourceTime?: string|null, copiedAt?: string|null}>}} context
+ */
+async function runWithProgressiveDepth(
+  runAgent,
+  options,
+  { question, catalog, dataPlaybook, loadedResources },
+) {
+  const first = await runWithStallRetry(runAgent, options);
+  for (const attempt of first.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  if (!catalog || options.isRework || first.turn.failed || first.turn.timedOut || first.turn.stalled) return first;
+
+  const rawNeeded = first.turn.contextInsufficient && !loadedResources.some((resource) => resource.depth === "raw");
+  const playbookNeeded =
+    dataPlaybook &&
+    needsDataPlaybook(question) &&
+    first.turn.contextInsufficient &&
+    !loadedResources.some((resource) => resource.depth === "playbook");
+  if (!rawNeeded && !playbookNeeded) return first;
+
+  const instructions = [`原始问题：${question}`];
+  if (playbookNeeded) {
+    instructions.push("这是查数或数据口径任务。先读取目录中的 data-playbook 查数手册，再按手册完成回答；不要凭记忆直接给数字。");
+  }
+  if (rawNeeded) {
+    instructions.push(
+      "当前概念页或摘要不足以可靠回答具体规则。请只继续读取目录中与本问题相关的 raw 原始资料（优先概念页列出的 raw_source），保留资料的来源和时间。",
+    );
+  }
+  instructions.push("不要读取无关资料；资源仍不足时明确说缺少哪部分。完成后给出完整答复。");
+
+  const second = await runWithStallRetry(runAgent, { ...options, prompt: instructions.join("\n") });
+  for (const attempt of second.attempts) mergeLoadedResources(loadedResources, attempt.loadedResources);
+  return {
+    turn: { ...second.turn, biTouched: Boolean(first.turn.biTouched || second.turn.biTouched) },
+    retries: first.retries + second.retries,
+  };
+}
+
+/** @param {string} question */
+function needsDataPlaybook(question) {
+  return /生产数据|查数|统计|口径|SQL|签约量|预约量|出租率|退租率|续约率|多少/i.test(question);
 }
 
 /**
@@ -99,8 +195,13 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
  */
 async function runWithStallRetry(runAgent, options) {
   const first = await runAgent(options);
-  if (!first.stalled) return { turn: first, retries: 0 };
-  return { turn: await runAgent(options), retries: 1 };
+  if (!first.stalled) return { turn: first, retries: 0, attempts: [first] };
+  const second = await runAgent(options);
+  return {
+    turn: { ...second, biTouched: Boolean(first.biTouched || second.biTouched) },
+    retries: 1,
+    attempts: [first, second],
+  };
 }
 
 /**
