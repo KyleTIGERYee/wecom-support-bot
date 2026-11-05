@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { execFile } from "node:child_process";
 import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -832,7 +833,11 @@ async function runInitializationChecks({
           ? {}
           : { reason: exampleError ?? "真实 pi 示例任务未产生预期回答或执行失败" }),
       };
-  const knowledgeLoadedPaths = loadedResources.filter((resource) => !resource.skillName).map((resource) => resource.path);
+  // 知识正文不限于 Skill 根之外的文件：实体知识库通常整个目录就是一个 Skill，
+  // 根内的指标卡、SQL、表文档同样是知识正文。这里只要读到的不是 SKILL.md 本身即可。
+  const knowledgeLoadedPaths = loadedResources
+    .filter((resource) => (resource.resourceType ?? resource.depth) !== "skill")
+    .map((resource) => resource.path);
   const knowledgeLoaded = knowledgeLoadedPaths.length > 0;
   const knowledge = !knowledgeEntry
     ? catalog && catalog.skills.length > 0
@@ -1227,7 +1232,9 @@ async function manifestHashes(rootDir, sources) {
 
 /** @param {string} path */
 async function hashFile(path) {
-  return createHash("sha256").update(await readFile(path)).digest("hex");
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 /**
@@ -1295,13 +1302,13 @@ async function status(args) {
       continue;
     }
     try {
-      const files = await readLocalFiles(resolve(instanceDir, source.localPath));
+      const files = await listLocalFiles(resolve(instanceDir, source.localPath));
       coverageSources.push({
         name: source.name,
         scope: source.scope,
         status: "ok",
         files: files.length,
-        skills: files.filter((file) => basename(file.name) === "SKILL.md").length,
+        skills: files.filter((file) => basename(file) === "SKILL.md").length,
         ...planFields,
       });
     } catch (error) {
@@ -1418,9 +1425,9 @@ async function exportInstance(args) {
 
 async function readImportedPackage(packageDir) {
   await assertNoSymlinks(packageDir);
-  const files = await readLocalFiles(packageDir);
+  const files = await listLocalFiles(packageDir);
   for (const file of files) {
-    const name = file.name.replaceAll("\\", "/");
+    const name = file.replaceAll("\\", "/");
     if (name !== "instance.json" && name !== "instance-package.json" && !name.startsWith("context/")) {
       throw new Error(`导入包包含不允许的实例状态或凭证：${name}`);
     }
@@ -1675,7 +1682,7 @@ async function copySources({ instanceDir, stagingDir, sources, template, existin
           includeSecrets: spec.includeSecrets,
         });
       }
-      if (detectedType !== "file" && (await readLocalFiles(targetPath)).length === 0) {
+      if (detectedType !== "file" && (await listLocalFiles(targetPath)).length === 0) {
         throw new Error("本地来源为空，没有可读取的文件");
       }
       contextSources.push({
@@ -2654,11 +2661,9 @@ function parseAskArgs(args) {
   return options;
 }
 
-async function readLocalFiles(path, prefix = "") {
+async function listLocalFiles(path, prefix = "") {
   const info = await stat(path);
-  if (info.isFile()) {
-    return [{ name: prefix || basename(path), content: await readFile(path, "utf8") }];
-  }
+  if (info.isFile()) return [prefix || basename(path)];
   if (!info.isDirectory()) throw new Error(`不支持的本地来源：${path}`);
   const entries = await readdir(path, { withFileTypes: true });
   const files = [];
@@ -2666,8 +2671,8 @@ async function readLocalFiles(path, prefix = "") {
     if (entry.isSymbolicLink()) continue;
     const childPath = join(path, entry.name);
     const childPrefix = prefix ? join(prefix, entry.name) : entry.name;
-    if (entry.isDirectory()) files.push(...(await readLocalFiles(childPath, childPrefix)));
-    else if (entry.isFile()) files.push({ name: childPrefix, content: await readFile(childPath, "utf8") });
+    if (entry.isDirectory()) files.push(...(await listLocalFiles(childPath, childPrefix)));
+    else if (entry.isFile()) files.push(childPrefix);
   }
   return files;
 }

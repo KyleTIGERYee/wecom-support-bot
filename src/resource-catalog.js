@@ -1,5 +1,7 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
+
+const PER_FILE_CATALOG_LIMIT = 1000;
 
 const RESOURCE_PATH = {
   playbook: /data-playbook|查数手册/i,
@@ -105,10 +107,14 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
   const entries = [];
   /** @type {Array<any>} */
   const skills = [];
+  /** @type {Array<any>} 每个来源的目录级摘要，供目录文本使用 */
+  const sourceSummaries = [];
   for (const source of sources) {
     if (source.status !== "ok" || !source.localPath) continue;
     const root = resolve(instanceDir, source.localPath);
     const files = await listFiles(root);
+    /** @type {{name: string, scope: string, root: string, files: number, skills: number, types: Record<string, number>, groups: Map<string, {files: number, types: Record<string, number>, samples: string[]}>}} */
+    const summary = { name: source.name, scope: source.scope, root, files: 0, skills: 0, types: {}, groups: new Map() };
     const skillFiles = files.filter((path) => basename(path) === "SKILL.md");
     const skillMetadata = new Map();
     for (const path of skillFiles) {
@@ -132,16 +138,32 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
         copiedAt,
         validity: metadata.validity ?? owningSkill?.validity ?? inferValidity(path),
       };
+      const relativePath = relative(root, path) || basename(path);
+      const resourceType = classifyResourceType(path);
+      // 目录文本的计数必须包含 Skill 根内的知识文件，否则真实知识库会显示成几十个文件。
+      const segments = relativePath.split("/");
+      const group = segments.length === 1 ? "." : segments.slice(0, Math.max(1, Math.min(2, segments.length - 1))).join("/");
+      summary.files += 1;
+      summary.types[resourceType] = (summary.types[resourceType] ?? 0) + 1;
+      const bucket = summary.groups.get(group) ?? { files: 0, types: {}, samples: [] };
+      bucket.files += 1;
+      bucket.types[resourceType] = (bucket.types[resourceType] ?? 0) + 1;
+      // 样例只取可读的知识文件，跳过 .gitignore/.obsidian 之类，避免把模型引到无用路径。
+      const hidden = relativePath.split("/").some((segment) => segment.startsWith("."));
+      const sampleWorthy = ["concept", "metrics", "table", "sql", "experience", "playbook", "timeline", "record", "decision", "project"].includes(resourceType);
+      if (!hidden && sampleWorthy && bucket.samples.length < 3) bucket.samples.push(relativePath);
+      summary.groups.set(group, bucket);
       if (skillRoot) {
         const skillName = owningSkill.name;
         const isBody = path === join(skillRoot, "SKILL.md");
         const skillResourceType = isBody ? "skill" : classifySkillResource(skillRoot, path);
-        const resourceType = isBody ? "skill" : classifyResourceType(path);
         entries.push({
           ...common,
-          relativePath: relative(root, path) || basename(path),
+          relativePath,
           depth: skillResourceType,
-          resourceType,
+          // Skill 正文必须保持 resourceType=skill，loadedSkills 与技能检查都依赖它；
+          // 目录摘要里的类型计数仍然按知识类型统计。
+          resourceType: isBody ? "skill" : resourceType,
           skillResourceType,
           skillName,
           summary: metadata.summary || owningSkill.summary,
@@ -159,20 +181,26 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
         }
         continue;
       }
-      const relativePath = relative(root, path) || basename(path);
       entries.push({
         ...common,
         relativePath,
         depth: classifyResourceDepth(path),
-        resourceType: classifyResourceType(path),
+        resourceType,
         summary: metadata.summary,
         verification: metadata.verification,
         rawSources: metadata.rawSources,
         rawBase: rawBaseFor(root, path),
       });
     }
+    summary.skills = skills.filter((skill) => skill.source === source.name).length;
+    sourceSummaries.push(summary);
   }
   if (entries.length === 0) throw new Error("实例没有可读取的本地上下文来源");
+
+  const listed = entries.filter((entry) => !entry.skillName);
+  // 小来源逐文件列出，便于直接定位；文件多时只给目录摘要。逐文件清单在真实知识库上
+  // 会到几 MB，既超出命令行参数上限，也塞不进模型上下文。
+  const useDirectorySummary = listed.length > PER_FILE_CATALOG_LIMIT;
 
   return {
     entries,
@@ -181,11 +209,38 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
     text: [
       "以下来源均为初始化时选择的本地副本；只能读取目录中的路径。source_time 是资料自身时间，未知为 null；copied_at 是实例复制时间。",
       "validity=history 表示历史资料；validity=current 表示明确标记的当前口径；unmarked 不得在历史冲突时直接当作最新口径。",
-      ...entries.filter((entry) => !entry.skillName).map(formatEntry),
+      ...(useDirectorySummary
+        ? [
+            "目录只给到二级摘要（来源 → 目录 → 文件数与类型计数）。需要具体文件时先用只读命令探索，例如 `ls <root>/数据库/<db-wiki>/metrics`、`find <root> -name '*.md' | head`、`grep -rl 关键词 <root>`，再 read 命中的文件；不要凭摘要编造路径。",
+            ...sourceSummaries.map(formatSourceSummary),
+          ]
+        : listed.map(formatEntry)),
       "Skill 目录只含名称、触发描述、必要能力摘要与正文入口；未命中时不读取正文，命中后按需读取引用资源。",
       ...(skills.length > 0 ? skills.map(formatSkillEntry) : ["Skill 目录：当前未配置可加载 Skills。"]),
     ].join("\n"),
   };
+}
+
+/** @param {{name: string, scope: string, root: string, files: number, skills: number, types: Record<string, number>, groups: Map<string, {files: number, types: Record<string, number>, samples?: string[]}>}} summary */
+function formatSourceSummary(summary) {
+  const counts = Object.entries(summary.types)
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, count]) => `${type}=${count}`)
+    .join(", ");
+  const groups = [...summary.groups.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([group, bucket]) => {
+      const detail = Object.entries(bucket.types)
+        .sort((a, b) => b[1] - a[1])
+        .map(([type, count]) => `${type}=${count}`)
+        .join(", ");
+      const samples = bucket.samples?.length ? `; 样例: ${bucket.samples.join(", ")}` : "";
+      return `  - ${group}/ (${bucket.files} 个文件; ${detail}${samples})`;
+    });
+  return [
+    `- source: ${summary.name} | scope: ${summary.scope} | root: ${summary.root} | files: ${summary.files} | skills: ${summary.skills} | types: ${counts || "none"}`,
+    ...groups,
+  ].join("\n");
 }
 
 /** @param {any} skill */
@@ -234,14 +289,15 @@ function formatEntry(entry) {
 async function readMetadata(path) {
   const empty = { name: undefined, summary: "", capabilities: undefined, sourceTime: undefined, validity: undefined, verification: undefined, rawSources: [], triggers: [], tasks: [] };
   if (/\.sql$/i.test(path)) {
-    const header = (await readFile(path, "utf8")).split("\n").slice(0, 12).join("\n");
+    const content = await readHead(path);
+    const header = content.split("\n").slice(0, 12).join("\n");
     return {
       ...empty,
       verification: parseSqlVerification(header),
     };
   }
   if (!/\.(?:md|markdown|txt)$/i.test(path)) return empty;
-  const content = await readFile(path, "utf8");
+  const content = await readHead(path);
   const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/)?.[1];
   if (!frontmatter) return empty;
 
@@ -469,4 +525,23 @@ async function listFiles(path) {
     else if (entry.isFile()) files.push(child);
   }
   return files;
+}
+
+/**
+ * 只读文件开头一段。元数据（frontmatter、SQL 校验标记）都在文件头部，
+ * 整读大文件会把数 GB 的知识库读进堆内存。
+ *
+ * @param {string} path
+ * @param {number} [bytes]
+ * @returns {Promise<string>}
+ */
+async function readHead(path, bytes = 64 * 1024) {
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
 }
