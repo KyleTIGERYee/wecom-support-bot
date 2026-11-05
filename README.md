@@ -166,6 +166,25 @@ npm run instance -- ask \
 
 `--source-type gitlab` 接受本地路径、`file://`、HTTP(S) 与 SSH 仓库，可用 `--ref` 选择分支；实现只执行 clone 到临时副本后校验和单向同步，不 push、不回写来源，也不保存或在错误日志中暴露 URL 凭证。HTTP/SSH 自动化验收通过 PATH 中的假 git 完成，真实 GitLab 联网尚未验收。zip 解包和团队打包使用本机已有的 `unzip` / `zip`，不会安装新依赖。
 
+## Windows / WSL2 安装与迁移
+
+Windows 采用 WSL2、Linux 原生文件系统和 systemd，不使用原生 Windows 服务或 Docker Desktop。先构建不含私人来源、真实凭证和平台产物的安装包，再在 Windows 运行一键安装器与本地控制台：
+
+```bash
+node scripts/windows-instance.js build-package --output /path/outside/repo/wecom-windows
+# 将输出目录复制到 Windows，运行 Install-WecomSupportBot.cmd，再运行 WecomSupportBot-Console.cmd
+```
+
+控制台复用上述 `instance init/status/sync/ask`，在 WSL 内完成四模型真实连接测试、知识/Skills/执行审批检查及企微测试机器人配置；控制台、启动前检查和 systemd 都显式使用 `/opt/wecom-support-bot/runtime/pi/bin/pi`。原机器的 `localhost/127.0.0.1` 不可直接沿用，需填写 WSL 可路由到的 Windows 主机地址或实际模型 URL。正式切换与回滚默认 dry-run，要求独立测试机器人全项结构化 JSON 证据、固定场景真实通过结果、文件哈希与人工复核批准，且 dry-run 和 execute 都会重验；固定六题同时绑定 ID 与正文 SHA-256。状态包只迁移 workspace、inbox/session-state 和明确的 pi 会话，不包含 models/凭证/provider 密钥，legacy 根会话保持原相对路径。切换仍要求显式确认、先停旧端再启新端；回滚合并 Windows 期间新增任务、inbox 和会话，不直接覆盖冲突文件。
+
+完整安装、测试机器人固定清单、切换/回滚命令与故障安全语义见：
+
+- `docs/windows-wsl2.md`
+- `docs/windows-acceptance.md`
+- `docs/windows-migration-questions.json`
+
+**当前验证边界**：本仓库只有 macOS，真实 Windows UAC/DISM/重启续装、WSL2/systemd、目标模型网络、测试机器人企微全链路以及正式切换/回滚均未实机验收。Mac 测试只覆盖公开 dry-run、安装包校验、假 systemctl/launchctl 边界、状态合并和临时结构化验收 fixture，不代表这些实机项目已经通过；本机无 `pwsh` 时 PowerShell 解析、标准包 PlanOnly 与控制台假 WSL 测试会明确 skipped。
+
 ## 已知限制
 
 - 纯文本对话。图片、文件、语音暂未处理（图片需解密下载，语音企微已转文字可直接用）。

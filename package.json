@@ -8,6 +8,7 @@
   "scripts": {
     "start": "node src/index.js",
     "instance": "node scripts/local-instance.js",
+    "windows": "node scripts/windows-instance.js",
     "test": "node scripts/check-roots-consistency.js && node --test \"test/**/*.test.js\"",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

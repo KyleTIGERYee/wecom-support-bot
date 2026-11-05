@@ -9,12 +9,12 @@ import { createLogger } from "./log.js";
 import { createSessionState } from "./session-state.js";
 import { createInbox } from "./inbox.js";
 import { createSessionQueue } from "./session-queue.js";
-import { createGuardClient } from "./model-client.js";
+import { createGuardClient, createQuickClient } from "./model-client.js";
 import { runAgentTurn, killAllChildren } from "./agent.js";
 import { reviewReply } from "./guard.js";
 import { classifyQuestion } from "./route.js";
 import { handleTurn } from "./orchestrate.js";
-import { createDefaultResourceCatalog } from "./resource-catalog.js";
+import { createDefaultResourceCatalog, createLocalResourceCatalog } from "./resource-catalog.js";
 import { runTurnLifecycle } from "./turn-lifecycle.js";
 import { deliverFinal } from "./deliver.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
@@ -38,11 +38,18 @@ const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
 async function main() {
   const config = await loadConfig(projectDir);
-  const resourceContext = createDefaultResourceCatalog(config.namedRoots, projectDir);
-  const log = createLogger({ logPath: join(projectDir, "logs/bot.log") });
+  const runtimeDir = config.localInstance?.instanceDir ?? projectDir;
+  const resourceContext = config.localInstance
+    ? await createLocalResourceCatalog(
+        config.localInstance.instanceDir,
+        config.localInstance.saved.contextSources,
+        config.localInstance.saved.resources?.syncedAt ?? config.localInstance.saved.initializedAt ?? null,
+      )
+    : createDefaultResourceCatalog(config.namedRoots, projectDir);
+  const log = createLogger({ logPath: join(runtimeDir, "logs/bot.log") });
 
   // 企微同一个机器人只能有一条长连接，两份进程会互相踢线，所以先拿锁
-  const lockPath = join(projectDir, `data/${config.wecom.botId.slice(0, 8)}.lock`);
+  const lockPath = join(runtimeDir, `data/${config.wecom.botId.slice(0, 8)}.lock`);
   const lock = await acquireLock({ lockPath });
   if (!lock.acquired) {
     process.stderr.write(`已有实例在运行（pid ${lock.holder}），拒绝启动。\n`);
@@ -50,16 +57,17 @@ async function main() {
   }
 
   const state = createSessionState({
-    storePath: join(projectDir, "data/session-state.json"),
+    storePath: join(runtimeDir, "data/session-state.json"),
     rotation: config.rotation,
   });
   await state.load();
 
-  const inbox = createInbox({ storePath: join(projectDir, "data/inbox.jsonl") });
+  const inbox = createInbox({ storePath: join(runtimeDir, "data/inbox.jsonl") });
   await inbox.load();
   await inbox.compact(Date.now(), config.inbox.retentionMs);
 
   const callModel = await createGuardClient({ config, agentDir: config.pi.agentDir });
+  const callQuickModel = config.localInstance ? await createQuickClient({ config, agentDir: config.pi.agentDir }) : callModel;
   const queue = createSessionQueue({ maxConcurrent: config.queue.maxConcurrent });
 
   /** @type {Set<Promise<void>>} 在途轮次，优雅退出时等它们答完 */
@@ -167,7 +175,7 @@ async function main() {
         const imagePaths = await downloadImages({
           client,
           images: message.images,
-          dir: join(projectDir, "data/images"),
+          dir: join(runtimeDir, "data/images"),
           msgid,
         });
         finalQuestion = withImageInstructions(question, imagePaths);
@@ -254,10 +262,13 @@ async function main() {
     let route = "deep";
     if (config.routing.enabled) {
       const t = Date.now();
-      route = await classifyQuestion({ question, callModel });
+      route = await classifyQuestion({ question, callModel: callQuickModel });
       lap("route", t);
     }
     const thinkingLevel = config.pi.thinkingLevels[route];
+    const turnConfig = route === "quick" && config.quick
+      ? { ...config, pi: { ...config.pi, provider: "local-instance-quick", model: config.quick.model } }
+      : config;
 
     const execute = async () => {
       const t = Date.now();
@@ -266,14 +277,14 @@ async function main() {
         sessionKey,
         deps: {
           state,
-          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills },
+          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills, workspaceDir: config.localInstance ? join(config.localInstance.instanceDir, "workspace") : undefined },
           runAgent: async ({ prompt, sessionId, currentSkill }) => {
             const agentStartedAt = Date.now();
             const agentTurn = await runAgentTurn({
               prompt,
               sessionId,
               currentSkill,
-              config,
+              config: turnConfig,
               projectDir,
               resourceCatalog: resourceContext.entries,
               idleTimeoutMs: config.pi.idleTimeoutMs,

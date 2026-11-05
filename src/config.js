@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { loadLocalInstanceConfig } from "./local-instance-config.js";
+
 /**
  * 加载配置：default.json 提供默认值，secrets.json 提供凭证。
  *
@@ -13,6 +15,7 @@ import { join } from "node:path";
  * @returns {Promise<any>}
  */
 export async function loadConfig(projectDir, { env = process.env } = {}) {
+  if (env.WECOM_BOT_INSTANCE_DIR) return loadLocalInstanceConfig(projectDir, env.WECOM_BOT_INSTANCE_DIR, { env });
   const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
   const secretsPath = env.WECOM_BOT_SECRETS || join(projectDir, "config/secrets.json");
   const resolvedPath = resolveFrom(projectDir, secretsPath);

@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -2182,4 +2182,124 @@ test("共享来源中的符号链接不会把目录外私人文件纳入团队�
   assert.match(result.checks.contextSources[0].reason, /符号链接/);
   assert.equal(existsSync(join(instanceDir, "context/001-shared/private-link.md")), false);
   assert.equal(await readFile(privateFile, "utf8"), "PRIVATE_OUTSIDE_SHARED_ROOT\n");
+});
+
+test("真实企微服务轮次复用实例 workspace，经 Skill 与执行审批生成任务产物", { timeout: 30000 }, async (t) => {
+  const root = await makeTempDir(t);
+  const instanceDir = join(root, "service-instance");
+  const workspace = join(instanceDir, "workspace");
+  const skillPath = join(instanceDir, "context/shared/skills/document-delivery/SKILL.md");
+  const artifact = join(workspace, "wecom-skill-report.md");
+  const piLog = join(root, "service-pi.jsonl");
+  const sdkLog = join(root, "service-sdk.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(instanceDir, "data"), { recursive: true });
+  await mkdir(join(instanceDir, "agent"), { recursive: true });
+  await mkdir(dirname(skillPath), { recursive: true });
+  await writeFile(join(instanceDir, "context/shared/handbook.md"), "退租审批需要两级审批。\n");
+  await writeFile(skillPath, "---\nname: document-delivery\ndescription: 创建业务文档与报告\ntriggers: 报告\n---\nSERVICE_SKILL_BODY\n");
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const modelConfig = { baseUrl: models.baseUrl, model: "main-model" };
+  await writeFile(join(instanceDir, "instance.json"), JSON.stringify({
+    version: 2,
+    ready: true,
+    instance: { id: "service-instance", template: "team" },
+    initializedAt: "2026-11-05T00:00:00.000Z",
+    models: { main: modelConfig, quick: modelConfig, guard: modelConfig, executionApproval: modelConfig },
+    contextSources: [{ name: "shared", type: "directory", scope: "shared", localPath: "context/shared", status: "ok", version: "resource-v1" }],
+    resources: { version: "resource-v1", catalogVersion: "resource-v1", syncedAt: "2026-11-05T00:00:00.000Z", files: ["context/shared/handbook.md", "context/shared/skills/document-delivery/SKILL.md"] },
+    checks: {},
+  }));
+  await writeFile(join(instanceDir, "secrets.json"), JSON.stringify({ mainApiKey: "service-test-key", quickApiKey: "service-test-key", guardApiKey: "service-test-key", executionApprovalApiKey: "service-test-key" }));
+  await writeFile(join(instanceDir, "wecom.json"), JSON.stringify({ active: "test", test: { botId: "service-test-bot", secret: "service-test-secret" } }));
+
+  const fakeSdk = join(root, "fake-wecom-sdk.mjs");
+  await writeFile(fakeSdk, `import { EventEmitter } from "node:events";
+import { appendFileSync } from "node:fs";
+const log = (entry) => appendFileSync(${JSON.stringify(sdkLog)}, JSON.stringify(entry) + "\\n");
+class WSClient extends EventEmitter {
+  constructor(options) { super(); this.options = options; }
+  connect() {
+    setTimeout(() => {
+      this.emit("authenticated");
+      this.emit("message", { headers: { req_id: "service-message" }, body: { msgid: "service-message", msgtype: "text", text: { content: "请生成退租报告" }, from: { userid: "service-user" }, chattype: "single" } });
+    }, 20);
+  }
+  replyStream(frame, streamId, text, finish) {
+    log({ type: "reply", text, finish });
+    if (finish) setTimeout(() => process.kill(process.pid, "SIGTERM"), 100);
+    return Promise.resolve({});
+  }
+  disconnect() {}
+}
+function generateReqId(prefix) { return prefix + "-fake"; }
+export default { WSClient, generateReqId };
+`);
+  const loader = join(root, "fake-wecom-loader.mjs");
+  await writeFile(loader, `export async function resolve(specifier, context, nextResolve) {
+  if (specifier === "@wecom/aibot-node-sdk") return { url: ${JSON.stringify(pathToFileURL(fakeSdk).href)}, shortCircuit: true };
+  return nextResolve(specifier, context);
+}
+`);
+  const fakePi = join(root, "service-pi.mjs");
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { processApprovedToolCall } from ${JSON.stringify(pathToFileURL(join(projectDir, "extensions/bash-whitelist.ts")).href)};
+import { createExecutionApprovalClient } from ${JSON.stringify(pathToFileURL(join(projectDir, "src/model-client.js")).href)};
+const args = process.argv.slice(2);
+const prompt = args.at(-1);
+const workspace = prompt.match(/^workspace: (.+)$/m)?.[1];
+const skillPath = prompt.match(/^skill_path: (.+)$/m)?.[1];
+const emit = (value) => console.log(JSON.stringify(value));
+if (skillPath) {
+  emit({ type: "tool_execution_start", toolName: "read", toolCallId: "service-read-skill", args: { path: skillPath } });
+  emit({ type: "tool_execution_end", toolName: "read", toolCallId: "service-read-skill", args: { path: skillPath }, result: readFileSync(skillPath, "utf8"), isError: false });
+}
+let finalText = "WORKSPACE_MISSING";
+let verdict = "NOT_RUN";
+if (workspace) {
+  const target = join(workspace, "wecom-skill-report.md");
+  const approval = JSON.parse(process.env.WECOM_BOT_EXECUTION_APPROVAL);
+  const callModel = await createExecutionApprovalClient({ config: { executionApproval: approval, pi: { provider: process.env.WECOM_BOT_PI_PROVIDER } }, agentDir: process.env.PI_CODING_AGENT_DIR });
+  const result = await processApprovedToolCall({
+    event: { type: "tool_call", toolCallId: "service-write-report", toolName: "write", input: { path: target, content: "SERVICE_WORKSPACE_ARTIFACT\\n" } },
+    task: { goal: "生成退租报告", currentSkill: process.env.WECOM_BOT_CURRENT_SKILL, necessaryChange: "创建本次企微 Skill 任务产物" },
+    writeRoots: JSON.parse(process.env.WECOM_BOT_WRITE_ROOTS),
+    protectedRoots: JSON.parse(process.env.WECOM_BOT_PROTECTED_ROOTS),
+    callModel,
+    logger: (entry) => process.stderr.write("[execution-approval] " + JSON.stringify(entry) + "\\n"),
+    execute: async () => { mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, "SERVICE_WORKSPACE_ARTIFACT\\n"); },
+  });
+  verdict = result.verdict;
+  finalText = verdict === "ALLOW" ? "企微报告已生成" : "企微报告未获批";
+}
+appendFileSync(${JSON.stringify(piLog)}, JSON.stringify({ prompt, workspace, skillPath, verdict, tools: args[args.indexOf("--tools") + 1], writeRoots: JSON.parse(process.env.WECOM_BOT_WRITE_ROOTS) }) + "\\n");
+emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText }] } });
+`, { mode: 0o755 });
+
+  const child = spawn(process.execPath, ["--experimental-loader", loader, join(projectDir, "src/index.js")], {
+    cwd: projectDir,
+    env: { ...process.env, WECOM_BOT_INSTANCE_DIR: instanceDir, WECOM_BOT_PI_BINARY: fakePi },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`企微假服务未及时退出：${stderr}`)); }, 20000);
+    child.on("error", reject);
+    child.on("exit", (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.equal(exit.code, 0, stderr);
+  assert.equal(await readFile(artifact, "utf8"), "SERVICE_WORKSPACE_ARTIFACT\n");
+  const piCall = JSON.parse((await readFile(piLog, "utf8")).trim());
+  assert.equal(piCall.workspace, workspace);
+  assert.equal(piCall.skillPath, skillPath);
+  assert.equal(piCall.verdict, "ALLOW");
+  assert.deepEqual(piCall.writeRoots, [join(instanceDir, "context"), workspace]);
+  const replies = (await readFile(sdkLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(replies.some((entry) => entry.finish && entry.text === "企微报告已生成"));
+  assert.ok(models.calls.some((call) => call.messages.some((message) => typeof message.content === "string" && message.content.includes("你是独立的执行审批模型"))));
 });

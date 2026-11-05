@@ -13,6 +13,7 @@ import { reviewReply } from "../src/guard.js";
 import { classifyQuestion } from "../src/route.js";
 import { createSessionState } from "../src/session-state.js";
 import { createLocalResourceCatalog } from "../src/resource-catalog.js";
+import { createLocalRuntimeConfig as createSharedLocalRuntimeConfig } from "../src/local-instance-config.js";
 
 const execFileAsync = promisify(execFile);
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1016,45 +1017,9 @@ async function executeLocalQuestion({
   };
 }
 
-async function createLocalRuntimeConfig({ saved, secrets, catalogRoot, workspaceDir, agentDir }) {
+async function createLocalRuntimeConfig(options) {
   const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
-  const approvalModel = saved.models.executionApproval ?? saved.models.main;
-  const quickModel = saved.models.quick ?? saved.models.main;
-  return {
-    ...defaults,
-    projectDir,
-    roots: [join(catalogRoot, "context"), workspaceDir],
-    writeRoots: [join(catalogRoot, "context"), workspaceDir],
-    protectedRoots: [projectDir],
-    pi: {
-      ...defaults.pi,
-      binary: process.env.WECOM_BOT_PI_BINARY || join(homedir(), ".pi-support/bin/pi"),
-      agentDir,
-      provider: "local-instance",
-      model: saved.models.main.model,
-      systemPromptPath: join(projectDir, "prompts/local-instance.md"),
-      localInstance: true,
-    },
-    guard: {
-      ...defaults.guard,
-      baseUrl: saved.models.guard.baseUrl,
-      model: saved.models.guard.model,
-      apiKey: secrets.guardApiKey,
-    },
-    quick: {
-      ...defaults.guard,
-      baseUrl: quickModel.baseUrl,
-      model: quickModel.model,
-      apiKey: secrets.quickApiKey ?? secrets.mainApiKey,
-    },
-    executionApproval: {
-      ...defaults.executionApproval,
-      enabled: true,
-      baseUrl: approvalModel.baseUrl,
-      model: approvalModel.model,
-      apiKey: secrets.executionApprovalApiKey ?? secrets.mainApiKey,
-    },
-  };
+  return createSharedLocalRuntimeConfig({ ...options, projectDir, defaults });
 }
 
 function parseExportArgs(args) {

@@ -18,8 +18,11 @@
 | S12 消息归一化 | `src/wecom.js` | `normalizeMessage(frame) → {text, userId, chatType, chatId, msgid, images} \| null` | 文本/语音/图文混排提取文字；纯图与混排取图；无文字且无图返回 null；会话指令识别与 @提及剥离 |
 | S13 执行审批 | `extensions/bash-whitelist.ts` | 真实 pi `tool_call` 钩子：write/edit/bash → 放行或 `{block, reason}`；`processApprovedToolCall({event, task, callModel, execute, ...}) → {verdict, source, reason, riskCategory, executionResult?}` | ALLOW 后执行；DENY 理由回主 Agent；硬规则不可被模型覆盖；异常、超时、无效输出 fail-closed；逐次审批不扩散；写目标限写根，cp 源限读根，mv 源与目标均限写根且避开保护根；默认企微只读 |
 | S14 本地实例公开工作流程 | `scripts/local-instance.js` | `npm run instance -- init|ask|sync|status|export [选项]` → JSON 结果 | 目录、文件、zip 与本地/file/HTTP(S)/SSH GitLab 来源的单向复制；团队/空白/导入模板；四模型连接测试与真实 pi 配置；知识、Skills、04 执行审批与示例任务逐项真实检查；事务式同步保留 workspace、会话和运行状态；团队包剔除凭证、私人来源与运行状态；status 公开资源版本、目录一致性、副本漂移、最近同步、加载失败和实际覆盖；运行时仅访问本地副本与独立 workspace；现有 Guard 重写保持可用 |
+| S15 Windows/WSL2 公开工作流程 | `scripts/windows-instance.js`、`windows/install.ps1`、`windows/console.ps1`、`windows/linux/*.sh` | `npm run windows -- install-plan|build-package|...|state-merge|cutover-*|rollback-* [选项]` → JSON；控制台与安装脚本退出码 | 标准包布局、白名单及哈希；安装参数、安全门与 WSL 命令计划；统一 runtime pi 环境；systemd 单元及假 systemctl/launchctl 启停顺序；本地实例企微配置；固定场景结构化 JSON 证据、独立测试 botId、人工复核与固定问题正文 SHA-256 硬门；dry-run 切换/回滚；无秘密的 inbox、根/嵌套会话和任务状态无损合并与失败安全停止 |
 
 S14 不新增内部函数测试缝：测试只驱动公开 CLI，以临时目录和本地假 OpenAI 兼容服务替代外部模型；GitLab HTTP/SSH 通过 PATH 中的假 git 验证 clone 参数、临时副本、失败清理与凭证脱敏，不访问真实远端。真实 pi 查数验收通过现有 binary 注入点使用默认只读模式，测试扩展副本仅把 04 既有默认 Wiki 脚本目录重定位到隔离 HOME 的只读假数据脚本，不设置环境变量脚本白名单、不访问真实 BI；真实 pi 文档验收仍逐次验证 write/edit 审批。本机存在隔离 pi 时，同时使用真实 pi binary 验证模型配置、文件白名单、文档产物与查数组合，不存在时仅跳过对应真实 pi 验收。S13 使用真实 TS 扩展公开 `tool_call` 行为，并以临时目录、本地假模型和假执行器覆盖执行结果，不访问真实企微、生产或主工作区。
+
+S15 不新增内部函数测试缝：测试只驱动上述公开 CLI/脚本，以临时目录、假 systemctl/launchctl、假 WSL/进程边界验证命令顺序和安全门。macOS 的 dry-run、静态检查与假边界结果不得写成真实 Windows、WSL2、systemd、模型网络、企微或正式切换已通过；这些实机项目固定列入 `docs/windows-wsl2.md` 的未验收清单。
 
 依赖注入约定：S2 的 `runner`、S3/S10 的 `callModel`、S4 的 `deps`、S7 的 `stream`/`push`/`wait`、S8 的 `execute`/`surface`、S11 的 `client` 都是注入点，测试用假实现替换真实的外部边界（子进程、HTTP、企微 SDK、时钟）。项目自身模块一律不 mock。
 

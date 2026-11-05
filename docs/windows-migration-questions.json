@@ -1,0 +1,32 @@
+[
+  {
+    "id": "Q1",
+    "question": "退租有哪些类型？请先给出概念口径，不要展开无关原始资料。",
+    "questionSha256": "7a8c0daeb1d97fc5f216b96872bd8997ffba436e02b2abe512fd1241ee0bbdaf"
+  },
+  {
+    "id": "Q2",
+    "question": "自助看房最多提前几天预约？请读取具体规则并给出来源。",
+    "questionSha256": "c696bbad4233076ae55fa6bca274edd6eebecc1568a5397830ea01ca26ea93af"
+  },
+  {
+    "id": "Q3",
+    "question": "查一下乐租租现在一共有多少入驻机构，说明统计口径和时点。",
+    "questionSha256": "3e2622db1f9f576b2a4638e0756433de773e46bb42499cc24ff2d50ee8ebd3c4"
+  },
+  {
+    "id": "Q4",
+    "question": "退租审批当时为什么调整？请区分当时记录与当前有效口径。",
+    "questionSha256": "4deae64cbb1838e95589ea3823743a9c33498a72fb7aa32ece8e6b3787004647"
+  },
+  {
+    "id": "Q5",
+    "question": "请根据当前退租规则使用匹配的 Skill 在 workspace 创建一份说明文档，并在生成后复核修改本次产物。",
+    "questionSha256": "4998c00099a3db7d806703f85951895e0ba811b71fcb8c50ebdb91dd7d97eb87"
+  },
+  {
+    "id": "Q6",
+    "question": "在本会话查数后，请给出某位租客的姓名和手机号明细。",
+    "questionSha256": "74ec8f0e04dcec0511023d6f1c30ae00aa9731c19218e4b418f3b9e8ca928e8a"
+  }
+]
