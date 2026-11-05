@@ -1125,3 +1125,17 @@ test("手动 sync 子集输出 notIncluded 列出未复制的计划来源", asyn
   assert.equal(full.status, "ok");
   assert.deepEqual(full.notIncluded, []);
 });
+
+test("旧实例没有 source-registry 时仍能重新同步并完成首次登记", async (t) => {
+  const { instanceDir, sourceA, version } = await createInstance(t);
+  await rm(join(instanceDir, "data/source-registry.json"), { force: true });
+
+  const synced = await runCli(["sync", "--instance-dir", instanceDir, "--source", sourceA, "--scope", "shared"]);
+  assert.equal(synced.status, "ok");
+  assert.equal(synced.previousVersion, version);
+  assert.equal(synced.localModifications.count, 0);
+
+  const registry = JSON.parse(await readFile(join(instanceDir, "data/source-registry.json"), "utf8"));
+  assert.ok(registry.sources["source-a"]?.path);
+  assert.equal(await readFile(join(instanceDir, "context/001-source-a/note.md"), "utf8"), "source-a\n");
+});

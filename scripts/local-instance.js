@@ -1559,7 +1559,9 @@ async function assertNoDuplicateSourceNames(sources, template, existing = []) {
   await assertUniqueSourceNames(named);
   const registered = new Map(
     (Array.isArray(existing) ? existing : [])
-      .filter((entry) => typeof entry?.name === "string" && entry.name)
+      // 旧实例（本改动之前创建）没有 registry，contextSources 里只有名字没有原始路径。
+      // 这类条目无法比较路径，按“首次登记”处理，否则老实例永远无法再同步。
+      .filter((entry) => typeof entry?.name === "string" && entry.name && typeof entry?.path === "string" && entry.path)
       .map((entry) => [entry.name, entry.path]),
   );
   for (const source of named) {
