@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 安装完全隔离的 pi 实例，供企微机器人专用。
-# 不读写 /Users/kyle/.pi，也不动 /Users/kyle/.local/node/bin/pi。
+# 不读写日常 coding 用的 pi 目录（~/.pi），也不动已有的 node 安装。
 set -euo pipefail
 
-PREFIX="${PI_SUPPORT_PREFIX:-/Users/kyle/.pi-support}"
+PREFIX="${PI_SUPPORT_PREFIX:-$HOME/.pi-support}"
 VERSION="0.84.1"
 AGENT_DIR="$PREFIX/agent"
 CODING_AGENT_DIR="$HOME/.pi/agent"

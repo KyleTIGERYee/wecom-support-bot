@@ -11,7 +11,7 @@
         ↓ 收到即落盘 data/inbox.jsonl（按 msgid 去重）→ 5 秒内回占位
    调度：同一同事的消息串行排队，全局最多 4 轮并行；分级 quick/deep
         ↓ spawn，每轮一次
-   执行：隔离的 pi 实例（/Users/kyle/.pi-support，与日常 coding 的 pi 完全隔离）
+   执行：隔离的 pi 实例（默认 `~/.pi-support`，与日常 coding 的 pi 完全隔离；可用 `WECOM_BOT_PI_BINARY` 覆盖）
         ├─ ajly-wiki / lzz-wiki          业务概念
         ├─ ajly-db-wiki / lzz-db-wiki    表结构与检索参考
         ├─ bi_query.py                   生产数据（只读，LIMIT 100）
@@ -59,9 +59,9 @@ chmod 600 config/secrets.json
 # 4. 前台试跑
 npm start
 
-# 5. 装成常驻服务
-cp launchd/com.kyle.wecom-support-bot.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.kyle.wecom-support-bot.plist
+# 5. 装成常驻服务（按实例生成 launchd 单元；先用 dry-run 看，再 --install --yes）
+npm run instance -- schedule --instance-dir ./instances/team
+npm run instance -- schedule --instance-dir ./instances/team --install --yes
 ```
 
 ## 运维
@@ -70,11 +70,11 @@ launchctl load ~/Library/LaunchAgents/com.kyle.wecom-support-bot.plist
 # 看日志
 tail -f logs/bot.log
 
-# 重启
-launchctl kickstart -k gui/$(id -u)/com.kyle.wecom-support-bot
+# 重启（单元名带实例 id 前 8 位，以下用 <id> 代替）
+launchctl kickstart -k gui/$(id -u)/com.wecom-support-bot.<id>
 
-# 停掉
-launchctl unload ~/Library/LaunchAgents/com.kyle.wecom-support-bot.plist
+# 停掉并移除单元
+npm run instance -- schedule --instance-dir ./instances/team --uninstall --yes
 
 # 跑测试
 npm test

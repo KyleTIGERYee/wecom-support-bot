@@ -1,4 +1,7 @@
-import { resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /** 允许被 python3 执行的检索脚本（按文件名匹配）。 */
 const ALLOWED_SCRIPT_NAMES = new Set([
@@ -26,10 +29,9 @@ const ALLOWED_COMMANDS = new Set([
 ]);
 
 /** 允许用 node 执行的只读脚本：经验检索与指标路由。 */
-const ALLOWED_NODE_SCRIPTS = new Set([
-  "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js",
-  "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js",
-]);
+const ALLOWED_NODE_SCRIPTS = new Set(
+  ["read-evolution.js", "search-bridge.js"].map((name) => join(projectDir, "scripts", name)),
+);
 
 /**
  * 能改变数据流向或串联命令的 shell 元字符。
