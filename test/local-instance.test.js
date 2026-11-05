@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { cp, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -2241,7 +2241,7 @@ writeFileSync(join(checkout, ".git/config"), "fake metadata\\n");
     FAKE_GIT_LOG: fakeGitLog,
     FAKE_GIT_FIXTURE: remoteFixture,
   };
-  const httpSource = "https://url-user:url-pass@gitlab.example.invalid/team/http-resources.git";
+  const httpSource = "https://gitlab.example.invalid/team/http-resources.git";
   const remoteInstance = join(root, "remote-instance");
   const remoteInitialized = await initInstance({
     instanceDir: remoteInstance,
@@ -2256,9 +2256,18 @@ writeFileSync(join(checkout, ".git/config"), "fake metadata\\n");
     "GITLAB_HTTP_V1\n",
   );
   assert.equal(existsSync(join(remoteInstance, "context/001-http-resources/.git")), false);
-  assert.equal(JSON.stringify(remoteInitialized).includes("url-pass"), false);
   const remoteConfig = JSON.parse(await readFile(join(remoteInstance, "instance.json"), "utf8"));
   assert.equal(JSON.stringify(remoteConfig).includes(httpSource), false);
+  // --ref 只保存在 registry，contextSources 不再复制该字段。
+  assert.equal("ref" in remoteConfig.contextSources[0], false);
+  const registryPath = join(remoteInstance, "data/source-registry.json");
+  assert.equal(existsSync(registryPath), true);
+  assert.equal((await stat(registryPath)).mode & 0o777, 0o600);
+  const registry = JSON.parse(await readFile(registryPath, "utf8"));
+  assert.equal(registry.sources["http-resources"].path, httpSource);
+  assert.equal(registry.sources["http-resources"].ref, "main");
+  const remoteStatus = await runCli(["status", "--instance-dir", remoteInstance]);
+  assert.equal(remoteStatus.coverage.sources[0].ref, "main");
 
   await writeFile(join(remoteFixture, "CONTEXT.md"), "GITLAB_SSH_V2\n");
   const sshSource = "git@gitlab.example.invalid:team/ssh-resources.git";
@@ -2282,21 +2291,14 @@ writeFileSync(join(checkout, ".git/config"), "fake metadata\\n");
     "GITLAB_SSH_V2\n",
   );
   assert.equal(await readFile(join(remoteFixture, "CONTEXT.md"), "utf8"), "GITLAB_SSH_V2\n");
-  const gitCalls = (await readFile(fakeGitLog, "utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(gitCalls.map((call) => call.args[0]), ["clone", "clone"]);
-  assert.equal(gitCalls[0].args.includes(httpSource), true);
-  assert.equal(gitCalls[1].args.includes(sshSource), true);
-  assert.equal(gitCalls[0].args.includes("main"), true);
-  assert.match(gitCalls[0].allowProtocol, /https/);
-  assert.match(gitCalls[1].allowProtocol, /ssh/);
-
+  const failedSource = "https://gitlab.example.invalid/team/failure.git";
   const failedRemote = await runCli(
     [
       "sync",
       "--instance-dir",
       remoteInstance,
       "--source",
-      "https://url-user:url-pass@gitlab.example.invalid/team/failure.git",
+      failedSource,
       "--scope",
       "shared",
       "--source-type",
@@ -2305,15 +2307,47 @@ writeFileSync(join(checkout, ".git/config"), "fake metadata\\n");
     { allowFailure: true, env: remoteEnv },
   );
   assert.equal(failedRemote.status, "error");
-  assert.equal(failedRemote.reason.includes("url-pass"), false);
-  assert.equal(failedRemote.reason.includes("url-user:url-pass"), false);
+  assert.match(failedRemote.reason, /clone failed/);
   assert.equal(
     await readFile(join(remoteInstance, "context/001-ssh-resources/CONTEXT.md"), "utf8"),
     "GITLAB_SSH_V2\n",
   );
   assert.equal((await readdir(remoteInstance)).some((name) => name.startsWith(".resources-")), false);
+
+  const password = "{{SECRET_vizlp4z7}}";
+  const credentialed = `https://url-user:${password}@gitlab.example.invalid/team/credential.git`;
+  const rejected = await runCli(
+    [
+      "sync",
+      "--instance-dir",
+      remoteInstance,
+      "--source",
+      credentialed,
+      "--scope",
+      "shared",
+      "--source-type",
+      "gitlab",
+    ],
+    { allowFailure: true, env: remoteEnv },
+  );
+  assert.equal(rejected.status, "error");
+  assert.match(rejected.reason, /内嵌凭证|无凭据/);
+  assert.equal(JSON.stringify(rejected).includes(password), false);
+  assert.equal(JSON.stringify(rejected).includes("url-user"), false);
   const savedFailure = await readFile(join(remoteInstance, "sync-status.json"), "utf8");
-  assert.equal(savedFailure.includes("url-pass"), false);
+  assert.equal(savedFailure.includes(password), false);
+  const registryAfterFailure = JSON.parse(await readFile(registryPath, "utf8"));
+  assert.equal(Object.keys(registryAfterFailure.sources).sort().join(","), "http-resources,ssh-resources");
+  assert.equal(JSON.stringify(registryAfterFailure).includes(password), false);
+
+  const gitCalls = (await readFile(fakeGitLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(gitCalls.map((call) => call.args[0]), ["clone", "clone", "clone"]);
+  assert.equal(gitCalls[0].args.includes(httpSource), true);
+  assert.equal(gitCalls[1].args.includes(sshSource), true);
+  assert.equal(gitCalls[2].args.includes(failedSource), true);
+  assert.equal(gitCalls[0].args.includes("main"), true);
+  assert.match(gitCalls[0].allowProtocol, /https/);
+  assert.match(gitCalls[1].allowProtocol, /ssh/);
 });
 
 test("sync-status 提交失败时整个同步事务回滚到 V1 并清理临时文件", async (t) => {

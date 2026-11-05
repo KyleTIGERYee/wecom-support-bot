@@ -1,12 +1,29 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { runAgentTurn } from "../src/agent.js";
+import {
+  createSourcePathFilter,
+  isSensitiveName,
+  scanInventory,
+} from "../src/instance-inventory.js";
+import { CADENCE_KINDS, buildSchedule, cadenceText, isDue, nextDueAt, normalizeCadence } from "../src/sync-plan.js";
+import {
+  assertUniqueSourceNames,
+  canonicalSourceKey,
+  findRegisteredSource,
+  normalizeSource,
+  parseGitlabSource,
+  pathsOverlap,
+  redactSourceCredentials,
+  resolveRealPath,
+} from "../src/source-spec.js";
+import { acquireLock, releaseLock } from "../src/lock.js";
 import { createGuardClient, createQuickClient } from "../src/model-client.js";
 import { handleTurn } from "../src/orchestrate.js";
 import { reviewReply } from "../src/guard.js";
@@ -44,7 +61,25 @@ async function main() {
     await exportInstance(args);
     return;
   }
-  throw new Error("用法：local-instance.js init|ask|sync|status|export|configure-bi [选项]");
+  if (command === "inventory") {
+    await inventory(args);
+    return;
+  }
+  if (command === "plan") {
+    await plan(args);
+    return;
+  }
+  if (command === "sync-due") {
+    await syncDue(args);
+    return;
+  }
+  if (command === "schedule") {
+    await schedule(args);
+    return;
+  }
+  throw new Error(
+    "用法：local-instance.js init|ask|sync|status|export|configure-bi|inventory|plan|sync-due|schedule [选项]",
+  );
 }
 
 async function configureBi(args) {
@@ -93,8 +128,496 @@ async function configureBi(args) {
     throw new Error("instance.json 的 trustedDataScripts 必须是按业务线登记的对象");
   }
   saved.trustedDataScripts = { ...saved.trustedDataScripts, [options.business]: realScript };
+  if (saved.syncPlan !== undefined) saved.syncPlan = normalizeSyncPlan(saved);
   await writeJson(join(instanceDir, "instance.json"), saved);
   process.stdout.write(`${JSON.stringify({ status: "ok", instanceDir, business: options.business, script: realScript })}\n`);
+}
+
+async function inventory(args) {
+  const options = parseInventoryArgs(args);
+  const result = await scanInventory({
+    roots: options.roots,
+    maxDepth: options.maxDepth,
+    exclude: options.exclude,
+    symlinks: options.symlinks,
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+async function plan(args) {
+  const options = parsePlanArgs(args);
+  const instanceDir = resolve(options.instanceDir);
+  await assertSafeInstanceDir(instanceDir);
+  const saved = await readInstanceConfig(instanceDir);
+  const registry = await readSourceRegistry(instanceDir);
+  await assertNoDuplicateSourceNames(
+    (saved.contextSources ?? []).map((source) => ({
+      name: source.name,
+      type: source.type,
+      path: registry[source.name]?.path,
+    })),
+  );
+  const rawPlanSources = Array.isArray(saved.syncPlan?.sources) ? saved.syncPlan.sources : [];
+  saved.syncPlan = ensurePlanEntries(saved, registry);
+  const hasUnknownPlanFields = rawPlanSources.some(
+    (entry) => entry && typeof entry === "object" && Object.keys(entry).some((key) => !PLAN_FIELDS.includes(key)),
+  );
+  let changed = hasUnknownPlanFields || saved.syncPlan.sources.length !== rawPlanSources.length;
+  if (options.source) {
+    const updated = await applyPlanUpdate(saved, options, instanceDir);
+    saved.syncPlan = { sources: updated.sources };
+    saved.contextSources = updated.contextSources;
+    changed = true;
+    await writeJson(join(instanceDir, "instance.json"), saved);
+    process.stdout.write(`${JSON.stringify({ instanceDir, updated: updated.name, ...buildPlanView(saved) })}\n`);
+    return;
+  }
+  if (changed) await writeJson(join(instanceDir, "instance.json"), saved);
+  process.stdout.write(`${JSON.stringify({ instanceDir, ...buildPlanView(saved) })}\n`);
+}
+
+/**
+ * 首次运行 plan 时为所有 contextSources 补齐计划条目：
+ * 默认 enabled、manual 频率。登记阶段写入 registry 的 exclude / symlinks 在此沿用，
+ * 之后以计划条目为准。未登记来源不会因为“未登记”在同步时被删掉。
+ *
+ * @param {any} saved
+ * @param {Record<string, {exclude?: string[], symlinks?: string}>} [registry]
+ */
+function ensurePlanEntries(saved, registry = {}) {
+  const plan = normalizeSyncPlan(saved);
+  const known = new Set(plan.sources.map((entry) => entry.name));
+  const additions = (Array.isArray(saved.contextSources) ? saved.contextSources : [])
+    .filter((source) => typeof source?.name === "string" && !known.has(source.name))
+    .map((source) => {
+      const registered = registry?.[source.name] ?? {};
+      return {
+        name: source.name,
+        scope: source.scope === "private" ? "private" : "shared",
+        exclude: Array.isArray(registered.exclude) ? registered.exclude : [],
+        symlinks: registered.symlinks ?? "follow",
+        cadence: { kind: "manual" },
+        enabled: true,
+        lastRunAt: null,
+        lastStatus: null,
+        lastVersion: null,
+      };
+    });
+  if (additions.length === 0) return plan;
+  return { sources: [...plan.sources, ...additions] };
+}
+
+async function syncDue(args) {
+  const options = parseSyncDueArgs(args);
+  const instanceDir = resolve(options.instanceDir);
+  await assertSafeInstanceDir(instanceDir);
+  const now = options.now ? new Date(options.now) : new Date();
+  if (Number.isNaN(now.getTime())) throw new Error(`--now 不是合法 ISO 8601 时间：${options.now}`);
+  let saved = await readInstanceConfig(instanceDir);
+  let registry = await readSourceRegistry(instanceDir);
+  let plan = ensurePlanEntries(saved, registry);
+  saved.syncPlan = plan;
+  let enabled = plan.sources.filter((entry) => entry.enabled !== false);
+  let due = enabled.filter((entry) => isDue(entry.cadence, entry.lastRunAt, now));
+  let sourceSet = buildSyncDueSourceSet(saved, plan, registry);
+  await assertNoDuplicateSourceNames(sourceSet.sources);
+  if (options.dryRun) {
+    const view = buildPlanView(saved, now);
+    process.stdout.write(
+      `${JSON.stringify({
+        dryRun: true,
+        ran: false,
+        checkedAt: now.toISOString(),
+        due: due.map((entry) => entry.name),
+        removed: sourceSet.removed,
+        sources: view.sources,
+      })}\n`,
+    );
+    return;
+  }
+  if (due.length === 0) {
+    process.stdout.write(`${JSON.stringify({ ran: false, checkedAt: now.toISOString(), due: [], removed: [] })}\n`);
+    return;
+  }
+
+  const lockPath = join(instanceDir, "data/sync.lock");
+  const lock = await acquireLock({ lockPath });
+  if (!lock.acquired) {
+    process.stdout.write(
+      `${JSON.stringify({
+        ran: false,
+        locked: true,
+        holder: lock.holder ?? null,
+        reason: lock.reason ?? "同步锁被占用",
+        due: due.map((entry) => entry.name),
+        removed: [],
+      })}\n`,
+    );
+    return;
+  }
+  try {
+    // 拿锁后重读：另一个进程可能刚完成计划更新或同步。
+    saved = await readInstanceConfig(instanceDir);
+    registry = await readSourceRegistry(instanceDir);
+    plan = ensurePlanEntries(saved, registry);
+    saved.syncPlan = plan;
+    enabled = plan.sources.filter((entry) => entry.enabled !== false);
+    due = enabled.filter((entry) => isDue(entry.cadence, entry.lastRunAt, now));
+    sourceSet = buildSyncDueSourceSet(saved, plan, registry);
+    await assertNoDuplicateSourceNames(sourceSet.sources);
+    if (due.length === 0) {
+      process.stdout.write(`${JSON.stringify({ ran: false, checkedAt: now.toISOString(), due: [], removed: [] })}\n`);
+      return;
+    }
+    const syncedNames = new Set(sourceSet.sources.map((source) => source.name));
+    const outcome = await runSyncOnce({
+      instanceDir,
+      sources: sourceSet.sources,
+      operation: "sync-due",
+      now,
+      saved,
+      plan,
+      due,
+      markPlanSources: syncedNames,
+      preserveDisabled: true,
+    });
+    let planUpdateError = null;
+    if (!outcome.ok) {
+      try {
+        await markPlanSourcesError(instanceDir, syncedNames);
+      } catch (error) {
+        planUpdateError = error?.message ?? String(error);
+      }
+    }
+    process.stdout.write(
+      `${JSON.stringify({
+        ...outcome.result,
+        removed: outcome.ok ? sourceSet.removed : [],
+        ...(planUpdateError ? { planUpdateError } : {}),
+      })}\n`,
+    );
+    if (!outcome.ok) process.exitCode = 1;
+  } finally {
+    await releaseLock({ lockPath });
+  }
+}
+
+/**
+ * 整包同步集合 = 全部 contextSources；只有显式 disabled 才移除副本。
+ * 未登记来源按 manual 处理，仍参与整包同步。
+ *
+ * 原始来源路径保存在实例内独立的 data/source-registry.json（不进入 instance.json，
+ * 也不进入团队包），未逐项登记计划的来源仍能按 manual 参与整包同步。
+ *
+ * @param {any} saved
+ * @param {{sources: any[]}} plan
+ * @param {Record<string, {path?: string, type?: string, ref?: string}>} registry
+ */
+function buildSyncDueSourceSet(saved, plan, registry = {}) {
+  const entries = new Map(plan.sources.map((entry) => [entry.name, entry]));
+  const contextSources = Array.isArray(saved.contextSources) ? saved.contextSources : [];
+  const sources = [];
+  const removed = [];
+  contextSources.forEach((source, index) => {
+    const entry = entries.get(source.name) ?? null;
+    if (entry?.enabled === false || (!entry && source.status === "disabled")) {
+      removed.push(source.name);
+      return;
+    }
+    const registryEntry = registry[source.name] ?? null;
+    sources.push({
+      slot: index + 1,
+      name: source.name,
+      path: registryEntry?.path ?? null,
+      type: registryEntry?.type ?? source.type ?? "auto",
+      scope: entry?.scope ?? source.scope,
+      exclude: entry?.exclude ?? source.exclude ?? [],
+      symlinks: entry?.symlinks ?? source.symlinks ?? "follow",
+      includeSecrets: source.includeSecrets === true,
+      ...(registryEntry?.ref ? { ref: registryEntry.ref } : {}),
+    });
+  });
+  return { sources, removed };
+}
+
+async function schedule(args) {
+  const options = parseScheduleArgs(args);
+  const instanceDir = resolve(options.instanceDir);
+  await assertSafeInstanceDir(instanceDir);
+  const saved = await readInstanceConfig(instanceDir);
+  const generated = buildSchedule({
+    platform: options.platform,
+    instanceDir,
+    instanceId: saved.instance?.id ?? "instance",
+    nodePath: process.execPath,
+    cliPath: join(projectDir, "scripts/local-instance.js"),
+    tickMinutes: options.tickMinutes,
+    home: resolve(options.home),
+  });
+
+  // `--dry-run` 与默认行为完全等价：不指定 --install/--uninstall 时本来就只生成、不落盘。
+  // 显式写出来只是让调用方无需记住默认值，两者走同一条预览路径。
+  const dryRun = options.dryRun || (!options.install && !options.uninstall);
+  if (dryRun) {
+    process.stdout.write(
+      `${JSON.stringify({
+        dryRun: true,
+        status: "ok",
+        platform: generated.platform,
+        label: generated.label,
+        tickMinutes: generated.tickMinutes,
+        logPath: generated.logPath,
+        units: generated.units,
+        commands: generated.installCommands,
+      })}\n`,
+    );
+    return;
+  }
+
+  if (!options.yes) {
+    process.stdout.write(
+      `${JSON.stringify({
+        dryRun: true,
+        status: "error",
+        action: options.install ? "install" : "uninstall",
+        requiresConfirmation: true,
+        reason: "需要用户明确同意后加 --yes；请先把将要写入的文件与将要执行的系统命令展示给用户，取得明确同意后再执行",
+        platform: generated.platform,
+        label: generated.label,
+        tickMinutes: generated.tickMinutes,
+        logPath: generated.logPath,
+        units: generated.units,
+        commands: options.install ? generated.installCommands : generated.uninstallCommands,
+      })}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  if (options.install) {
+    await mkdir(join(instanceDir, "logs"), { recursive: true });
+    for (const unit of generated.units) {
+      await mkdir(dirname(unit.path), { recursive: true });
+      await writeFile(unit.path, unit.content, { encoding: "utf8", mode: 0o644 });
+    }
+    const commands = await runScheduleCommands(generated.installCommands);
+    const failed = commands.some((command) => command.status === "error");
+    process.stdout.write(
+      `${JSON.stringify({
+        status: failed ? "error" : "ok",
+        platform: generated.platform,
+        installed: generated.units.map((unit) => unit.path),
+        logPath: generated.logPath,
+        commands,
+      })}\n`,
+    );
+    if (failed) process.exitCode = 1;
+    return;
+  }
+
+  const commands = await runScheduleCommands(generated.uninstallCommands);
+  const removed = [];
+  for (const unit of generated.units) {
+    if (await pathExists(unit.path)) {
+      await rm(unit.path, { force: true });
+      removed.push(unit.path);
+    }
+  }
+  process.stdout.write(
+    `${JSON.stringify({
+      status: commands.some((command) => command.status === "error") ? "error" : "ok",
+      platform: generated.platform,
+      removed,
+      commands,
+    })}\n`,
+  );
+  if (commands.some((command) => command.status === "error")) process.exitCode = 1;
+}
+
+async function runScheduleCommands(commands) {
+  const results = [];
+  for (const command of commands) {
+    try {
+      const { stdout } = await execFileAsync(command.command, command.args);
+      results.push({
+        command: command.command,
+        args: command.args,
+        status: "ok",
+        ...(stdout.trim() ? { stdout: stdout.trim() } : {}),
+      });
+    } catch (error) {
+      results.push({
+        command: command.command,
+        args: command.args,
+        status: command.ignoreFailure ? "ignored" : "error",
+        reason: error?.message ?? String(error),
+      });
+      if (!command.ignoreFailure) break;
+    }
+  }
+  return results;
+}
+
+async function readInstanceConfig(instanceDir) {
+  return JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+}
+
+const SOURCE_REGISTRY_PATH = "data/source-registry.json";
+
+/**
+ * 原始来源路径、类型、--ref 与复制选项（--exclude / --symlinks）只登记在实例内的
+ * data/source-registry.json，不写进 instance.json（实例可整体搬移）也不进入团队包。
+ * 它服务定时同步的重新复制，并在首次补齐同步计划时作为 exclude / symlinks 的默认值。
+ *
+ * @param {string} instanceDir
+ * @returns {Promise<Record<string, {path?: string, type?: string, ref?: string, exclude?: string[], symlinks?: string}>>}
+ */
+async function readSourceRegistry(instanceDir) {
+  try {
+    const value = JSON.parse(await readFile(join(instanceDir, SOURCE_REGISTRY_PATH), "utf8"));
+    return value && typeof value.sources === "object" && value.sources !== null && !Array.isArray(value.sources)
+      ? value.sources
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 把本次登记合并进暂存目录。registry 与 context / instance.json / sync-status
+ * 一起由 commitContext 原子替换，失败时全部回滚，不在事务外单独落盘。
+ *
+ * @param {string} instanceDir
+ * @param {string} stagingDir
+ * @param {{name: string, path?: string, type?: string, ref?: string, exclude?: string[], symlinks?: string}[]} entries
+ * @returns {Promise<boolean>}
+ */
+async function stageSourceRegistry(instanceDir, stagingDir, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return false;
+  const sources = await readSourceRegistry(instanceDir);
+  let changed = false;
+  for (const entry of entries) {
+    if (!entry?.name || typeof entry.path !== "string") continue;
+    sources[entry.name] = {
+      path: entry.path,
+      ...(entry.type ? { type: entry.type } : {}),
+      ...(entry.ref ? { ref: entry.ref } : {}),
+      exclude: Array.isArray(entry.exclude) ? entry.exclude : [],
+      symlinks: entry.symlinks ?? "follow",
+    };
+    changed = true;
+  }
+  if (!changed) return false;
+  const stagedPath = join(stagingDir, SOURCE_REGISTRY_PATH);
+  await mkdir(dirname(stagedPath), { recursive: true });
+  await writeJson(stagedPath, { version: 1, sources });
+  return true;
+}
+
+/** syncPlan 条目只允许这些字段；原始路径与类型只存在于 data/source-registry.json。 */
+const PLAN_FIELDS = ["name", "cadence", "exclude", "symlinks", "scope", "enabled", "lastRunAt", "lastStatus", "lastVersion"];
+
+function normalizeSyncPlan(saved) {
+  const plan = saved?.syncPlan;
+  const sources = Array.isArray(plan?.sources)
+    ? plan.sources
+        .filter((entry) => entry && typeof entry === "object" && typeof entry.name === "string")
+        .map((entry) => Object.fromEntries(PLAN_FIELDS.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]])))
+    : [];
+  return { sources };
+}
+
+async function applyPlanUpdate(saved, options, instanceDir) {
+  const registry = await readSourceRegistry(instanceDir);
+  const registered = await findRegisteredSource(registry, options.source, { instanceDir });
+  const contextSources = Array.isArray(saved.contextSources) ? saved.contextSources : [];
+  const contextSource = contextSources.find((source) => source.name === registered.name);
+  if (!contextSource) {
+    throw new Error(`来源已登记但没有对应的标准资源副本：${registered.name}；请先运行 init 或 sync`);
+  }
+  const plan = normalizeSyncPlan(saved);
+  const existing = plan.sources.find((entry) => entry.name === registered.name) ?? null;
+  const cadence = options.cadence ?? existing?.cadence;
+  if (!cadence) throw new Error("首次为来源配置同步计划需要 --cadence");
+  const scope = options.scope ?? existing?.scope ?? contextSource.scope;
+  if (!["shared", "private"].includes(scope)) throw new Error("--scope 必须是 shared 或 private");
+  if (saved.instance?.template === "team" && scope !== "shared") {
+    throw new Error("团队实例只能使用明确共享的来源");
+  }
+  const symlinks = options.symlinks ?? existing?.symlinks ?? "follow";
+  if (options.includeSecrets === true && scope !== "private") {
+    throw new Error("--include-secrets 只能用于 private 来源；shared 来源不得包含凭证文件");
+  }
+  // 切回 shared 时自动撤销该来源的凭证复制，shared 永远不携带敏感文件。
+  const includeSecrets = scope === "private" ? options.includeSecrets ?? (contextSource.includeSecrets === true) : false;
+  const exclude = options.clearExcludes ? [] : options.exclude.length > 0 ? options.exclude : existing?.exclude ?? [];
+  const enabled = options.disable ? false : options.enable ? true : existing?.enabled ?? true;
+  const entry = {
+    name: registered.name,
+    scope,
+    exclude,
+    symlinks,
+    cadence,
+    enabled,
+    lastRunAt: existing?.lastRunAt ?? null,
+    lastStatus: existing?.lastStatus ?? null,
+    lastVersion: existing?.lastVersion ?? null,
+  };
+  return {
+    name: entry.name,
+    sources: existing
+      ? plan.sources.map((candidate) => (candidate.name === entry.name ? entry : candidate))
+      : [...plan.sources, entry],
+    contextSources: contextSources.map((source) =>
+      source.name === entry.name ? { ...source, includeSecrets } : source,
+    ),
+  };
+}
+
+function buildPlanView(saved, now = new Date()) {
+  const plan = normalizeSyncPlan(saved);
+  const contextByName = new Map((saved.contextSources ?? []).map((source) => [source.name, source]));
+  const sources = plan.sources.map((entry) => {
+    const context = contextByName.get(entry.name);
+    try {
+      return {
+        ...entry,
+        ...(context?.secretsIncluded ? { secretsIncluded: true, secretFiles: context.secretFiles ?? [] } : {}),
+        cadenceText: cadenceText(entry.cadence),
+        due: entry.enabled !== false ? isDue(entry.cadence, entry.lastRunAt, now) : false,
+        nextDueAt: entry.enabled !== false ? nextDueAt(entry.cadence, entry.lastRunAt, now) : null,
+      };
+    } catch (error) {
+      return {
+        ...entry,
+        cadenceText: "无效",
+        due: false,
+        nextDueAt: null,
+        error: error?.message ?? String(error),
+      };
+    }
+  });
+  const nextSyncAt = sources.map((source) => source.nextDueAt).filter(Boolean).sort()[0] ?? null;
+  const planned = new Set(sources.map((source) => source.name));
+  return {
+    checkedAt: now.toISOString(),
+    sources,
+    nextSyncAt,
+    unplanned: (saved.contextSources ?? [])
+      .filter((source) => !planned.has(source.name))
+      .map((source) => source.name),
+  };
+}
+
+async function markPlanSourcesError(instanceDir, names) {
+  const saved = await readInstanceConfig(instanceDir);
+  const plan = normalizeSyncPlan(saved);
+  if (plan.sources.length === 0) return;
+  saved.syncPlan = {
+    ...plan,
+    sources: plan.sources.map((entry) => (names.has(entry.name) ? { ...entry, lastStatus: "error" } : entry)),
+  };
+  await writeJson(join(instanceDir, "instance.json"), saved);
 }
 
 async function init(args) {
@@ -107,6 +630,7 @@ async function init(args) {
   if (importing && !options.importPackage) throw new Error("既有实例导入需要 --package");
   let importedPackage = null;
   let contextSources;
+  let sourceRegistry = [];
   if (importing) {
     const packageDir = join(stagingDir, "package");
     await mkdir(packageDir, { recursive: true });
@@ -114,7 +638,9 @@ async function init(args) {
     importedPackage = await readImportedPackage(packageDir);
     contextSources = await copyImportedSources(stagingDir, packageDir, importedPackage.config.contextSources);
   } else {
-    contextSources = await copySources({ instanceDir, stagingDir, sources: options.sources, template: options.template });
+    const copied = await copySources({ instanceDir, stagingDir, sources: options.sources, template: options.template });
+    contextSources = copied.contextSources;
+    sourceRegistry = copied.registry;
   }
   applyModelDefaults(options, importedPackage?.config.models ?? {});
   const syncedAt = new Date().toISOString();
@@ -122,11 +648,13 @@ async function init(args) {
   for (const source of contextSources) {
     if (source.status === "ok") source.version = version;
   }
+  const manifest = await manifestHashes(stagingDir, contextSources);
   const resources = {
     version,
     catalogVersion: version,
     syncedAt,
-    files: await resourceManifest(stagingDir, contextSources),
+    files: manifest.files,
+    fileHashes: manifest.fileHashes,
     ...(importedPackage ? { importedFromVersion: importedPackage.config.resources?.version ?? null } : {}),
   };
 
@@ -203,16 +731,22 @@ async function init(args) {
   config.ready = ready;
   config.checks = checks;
 
-  await commitContext({ instanceDir, stagingDir, config });
+  const registryStaged = await stageSourceRegistry(instanceDir, stagingDir, sourceRegistry);
+  await commitContext({
+    instanceDir,
+    stagingDir,
+    config,
+    lastSync: {
+      status: sourcesReady ? "ok" : "error",
+      operation: importing ? "import" : "init",
+      finishedAt: syncedAt,
+      version,
+    },
+    registryStaged,
+  });
   await writeJson(join(instanceDir, "secrets.json"), secrets);
   await mkdir(join(instanceDir, "agent"), { recursive: true });
   await writeJson(join(instanceDir, "agent/models.json"), createPiModels(options));
-  await writeJson(join(instanceDir, "sync-status.json"), {
-    status: sourcesReady ? "ok" : "error",
-    operation: importing ? "import" : "init",
-    finishedAt: syncedAt,
-    version,
-  });
 
   process.stdout.write(
     `${JSON.stringify({ ready, instanceDir, resources, checks: { ...checks, contextSources } })}\n`,
@@ -407,57 +941,320 @@ async function sync(args) {
   const options = parseSyncArgs(args);
   const instanceDir = resolve(options.instanceDir);
   await assertSafeInstanceDir(instanceDir);
-  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
-  const startedAt = new Date().toISOString();
+  const saved = await readInstanceConfig(instanceDir);
+  const registry = await readSourceRegistry(instanceDir);
+  const existingSources = (Array.isArray(saved.contextSources) ? saved.contextSources : []).map((source) => ({
+    name: source.name,
+    path: registry[source.name]?.path,
+  }));
+  const outcome = await runSyncOnce({
+    instanceDir,
+    sources: options.sources,
+    operation: "sync",
+    now: new Date(),
+    saved,
+    existingSources,
+  });
+  // 手动 sync 只复制本次给定的来源；计划里应同步却没参与本次的来源必须显式列出，
+  // 否则 sync-due 会报它们 due 却永远没有副本可复制。
+  process.stdout.write(`${JSON.stringify({ ...outcome.result, notIncluded: notIncludedSources(saved, outcome.result) })}\n`);
+  if (!outcome.ok) process.exitCode = 1;
+}
+
+/**
+ * @param {any} saved 同步前的实例配置
+ * @param {any} result 本次 sync 的结果
+ * @returns {string[]}
+ */
+function notIncludedSources(saved, result) {
+  const attempted = new Set((result?.contextSources ?? []).map((source) => source.name));
+  const disabled = new Set(
+    (saved?.syncPlan?.sources ?? []).filter((entry) => entry.enabled === false).map((entry) => entry.name),
+  );
+  const planned = new Set([
+    ...(saved?.contextSources ?? []).map((source) => source.name),
+    ...(saved?.syncPlan?.sources ?? []).map((entry) => entry.name),
+  ]);
+  return [...planned].filter((name) => !attempted.has(name) && !disabled.has(name)).sort();
+}
+
+/**
+ * sync 与 sync-due 共用的完整同步管线：暂存复制 → 校验 → 生成资源清单 →
+ * 留存上一版快照并统计本地修改 → 事务提交。
+ *
+ * @param {{
+ *   instanceDir: string,
+ *   sources: any[],
+ *   operation: "sync" | "sync-due",
+ *   now: Date,
+ *   saved?: any,
+ *   plan?: {sources: any[]} | null,
+ *   due?: any[],
+ *   markPlanSources?: Set<string> | null,
+ *   preserveDisabled?: boolean,
+ *   existingSources?: {name?: string, path?: string}[]
+ * }} options
+ */
+async function runSyncOnce({
+  instanceDir,
+  sources,
+  operation,
+  now,
+  saved = null,
+  plan = null,
+  due = [],
+  markPlanSources = null,
+  preserveDisabled = false,
+  existingSources = [],
+}) {
+  saved ??= await readInstanceConfig(instanceDir);
+  const startedAt = now.toISOString();
   const stagingDir = await createStagingDir(instanceDir);
   let commitStarted = false;
+  /** @type {any[] | null} */
+  let copiedSources = null;
   try {
-    const contextSources = await copySources({
+    const copied = await copySources({
       instanceDir,
       stagingDir,
-      sources: options.sources,
-      template: saved.instance.template,
+      sources,
+      template: saved.instance?.template,
+      existingSources,
     });
-    if (contextSources.length === 0 || contextSources.some((source) => source.status !== "ok")) {
-      throw new Error(contextSources[0]?.reason ?? "同步至少需要一个可读取的标准资源来源");
+    const contextSources = copied.contextSources;
+    copiedSources = contextSources;
+    const failed = contextSources.find((source) => source.status !== "ok");
+    if (contextSources.length === 0 || failed) {
+      throw new Error(failed?.reason ?? "同步至少需要一个可读取的标准资源来源");
     }
-    const syncedAt = new Date().toISOString();
+    const syncedAt = now.toISOString();
     const version = await hashSources(stagingDir, contextSources);
     for (const source of contextSources) source.version = version;
     await createLocalResourceCatalog(stagingDir, contextSources, syncedAt);
+    const manifest = await manifestHashes(stagingDir, contextSources);
     const resources = {
       version,
       catalogVersion: version,
       syncedAt,
-      files: await resourceManifest(stagingDir, contextSources),
+      files: manifest.files,
+      fileHashes: manifest.fileHashes,
     };
+    const localModifications = await detectLocalModifications(instanceDir, saved);
+    const previousVersion = saved.resources?.version ?? null;
+    const snapshotStaged = await stagePreviousContext(instanceDir);
+    const snapshotPath = snapshotStaged ? join(instanceDir, "snapshots/previous") : null;
+    const mergedContextSources = preserveDisabled
+      ? mergePreservedSources(saved.contextSources, contextSources, plan)
+      : contextSources;
+    const updatedPlan =
+      markPlanSources && plan
+        ? {
+            ...plan,
+            sources: plan.sources.map((entry) =>
+              markPlanSources.has(entry.name)
+                ? { ...entry, lastRunAt: syncedAt, lastStatus: "ok", lastVersion: version }
+                : entry,
+            ),
+          }
+        : null;
+    const planForConfig = updatedPlan ?? (saved.syncPlan ? normalizeSyncPlan(saved) : null);
     const config = {
       ...saved,
-      contextSources,
+      ...(planForConfig ? { syncPlan: planForConfig } : {}),
+      contextSources: mergedContextSources,
       resources,
-      checks: {
-        ...saved.checks,
-        context: { status: "ok" },
+      checks: { ...saved.checks, context: { status: "ok" } },
+    };
+    const lastSync = {
+      status: "ok",
+      operation,
+      startedAt,
+      finishedAt: syncedAt,
+      version,
+      previousVersion,
+      snapshotPath,
+      localModifications,
+      ...(operation === "sync-due" ? { due: due.map((entry) => entry.name) } : {}),
+    };
+    const registryStaged = await stageSourceRegistry(instanceDir, stagingDir, copied.registry);
+    commitStarted = true;
+    await commitContext({ instanceDir, stagingDir, config, lastSync, registryStaged, snapshotStaged });
+    return {
+      ok: true,
+      result: {
+        ...(operation === "sync-due" ? { ran: true } : {}),
+        ...lastSync,
+        resources,
+        contextSources: mergedContextSources,
       },
     };
-    const lastSync = { status: "ok", operation: "sync", startedAt, finishedAt: syncedAt, version };
-    commitStarted = true;
-    await commitContext({ instanceDir, stagingDir, config, lastSync });
-    process.stdout.write(`${JSON.stringify({ ...lastSync, resources, contextSources })}\n`);
   } catch (error) {
     if (!commitStarted) await rm(stagingDir, { recursive: true, force: true });
+    // 提交失败：丢弃暂存快照，保留原来的 snapshots/previous。
+    await rm(join(instanceDir, "snapshots/previous.next"), { recursive: true, force: true }).catch(() => {});
+    const reason = redactSourceCredentials(error?.message ?? error);
     const lastSync = {
       status: "error",
-      operation: "sync",
+      operation,
       startedAt,
       finishedAt: new Date().toISOString(),
       version: saved.resources?.version ?? null,
-      reason: error?.message ?? String(error),
+      reason,
     };
     if (!commitStarted) await writeJson(join(instanceDir, "sync-status.json"), lastSync);
-    process.stdout.write(`${JSON.stringify(lastSync)}\n`);
-    process.exitCode = 1;
+    return {
+      ok: false,
+      result: {
+        ...(operation === "sync-due" ? { ran: true, due: due.map((entry) => entry.name) } : {}),
+        ...lastSync,
+        ...(copiedSources ? { contextSources: copiedSources } : {}),
+      },
+    };
   }
+}
+
+/**
+ * disabled 来源是唯一会移除副本的显式操作：保留计划与 contextSources 条目，
+ * 但不再复制其文件，并在调用方输出 removed。
+ *
+ * @param {any[] | undefined} previous
+ * @param {any[]} copied
+ * @param {{sources: any[]} | null} plan
+ */
+function mergePreservedSources(previous, copied, plan) {
+  if (!plan) return copied;
+  const disabled = new Set(plan.sources.filter((entry) => entry.enabled === false).map((entry) => entry.name));
+  const remaining = new Map(copied.map((source) => [source.name, source]));
+  const merged = [];
+  for (const source of Array.isArray(previous) ? previous : []) {
+    if (disabled.has(source.name)) {
+      merged.push({ ...source, status: "disabled" });
+      continue;
+    }
+    const next = remaining.get(source.name);
+    if (next) {
+      merged.push(next);
+      remaining.delete(source.name);
+    }
+  }
+  for (const extra of remaining.values()) merged.push(extra);
+  return merged;
+}
+
+function emptyLocalModifications() {
+  return { count: 0, added: 0, modified: 0, removed: 0, sample: [] };
+}
+
+/**
+ * 用上一次同步写入的 resources.files / fileHashes 与当前 context 实际内容比对。
+ * 只报告、不阻塞同步；单向同步仍以标准版本为准。
+ *
+ * @param {string} instanceDir
+ * @param {any} saved
+ */
+async function detectLocalModifications(instanceDir, saved) {
+  const contextDir = join(instanceDir, "context");
+  if (!(await pathExists(contextDir))) return emptyLocalModifications();
+  const current = await hashTreeFiles(contextDir, "context");
+  const baseline = saved.resources?.fileHashes;
+  const hasHashes =
+    baseline && typeof baseline === "object" && !Array.isArray(baseline) && Object.keys(baseline).length > 0;
+  const manifest = Array.isArray(saved.resources?.files) ? saved.resources.files : [];
+  const added = [];
+  const modified = [];
+  const removed = [];
+  if (hasHashes) {
+    for (const [path, hash] of current) {
+      if (!(path in baseline)) added.push(path);
+      else if (baseline[path] !== hash) modified.push(path);
+    }
+    for (const path of Object.keys(baseline)) {
+      if (!current.has(path)) removed.push(path);
+    }
+  } else {
+    const known = new Set(manifest);
+    for (const path of current.keys()) {
+      if (!known.has(path)) added.push(path);
+    }
+    for (const path of known) {
+      if (!current.has(path)) removed.push(path);
+    }
+  }
+  added.sort();
+  modified.sort();
+  removed.sort();
+  const sample = [
+    ...added.map((path) => `+ ${path}`),
+    ...modified.map((path) => `~ ${path}`),
+    ...removed.map((path) => `- ${path}`),
+  ].slice(0, 10);
+  return {
+    count: added.length + modified.length + removed.length,
+    added: added.length,
+    modified: modified.length,
+    removed: removed.length,
+    sample,
+  };
+}
+
+/**
+ * 把当前 context 暂存到 snapshots/previous.next。它只是本次事务的一部分：
+ * 只有提交成功才把它替换成 snapshots/previous（只保留最近一版）；
+ * 提交失败时删除 next，旧的上一版保持不动。
+ *
+ * @param {string} instanceDir
+ * @returns {Promise<boolean>}
+ */
+async function stagePreviousContext(instanceDir) {
+  const current = join(instanceDir, "context");
+  if (!(await pathExists(current))) return false;
+  const next = join(instanceDir, "snapshots/previous.next");
+  await mkdir(dirname(next), { recursive: true });
+  await rm(next, { recursive: true, force: true });
+  await cp(current, next, { recursive: true, dereference: false });
+  return true;
+}
+
+/** @param {string} rootDir @param {any[]} sources */
+async function manifestHashes(rootDir, sources) {
+  const files = await resourceManifest(rootDir, sources);
+  const fileHashes = {};
+  for (const file of files) {
+    fileHashes[file] = await hashFile(resolve(rootDir, file));
+  }
+  return { files, fileHashes };
+}
+
+/** @param {string} path */
+async function hashFile(path) {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+/**
+ * @param {string} directory
+ * @param {string} prefix
+ * @returns {Promise<Map<string, string>>}
+ */
+async function hashTreeFiles(directory, prefix) {
+  const result = new Map();
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const childPrefix = `${prefix}/${entry.name}`;
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) {
+      for (const [path, hash] of await hashTreeFiles(join(directory, entry.name), childPrefix)) {
+        result.set(path, hash);
+      }
+    } else if (entry.isFile()) {
+      result.set(childPrefix, await hashFile(join(directory, entry.name)));
+    }
+  }
+  return result;
 }
 
 async function status(args) {
@@ -472,10 +1269,29 @@ async function status(args) {
     loadFailures.push({ source: "catalog", reason: error?.message ?? String(error) });
   }
   const coverageSources = [];
+  const registry = await readSourceRegistry(instanceDir);
+  const planView = buildPlanView(saved);
+  const planSources = new Map(planView.sources.map((source) => [source.name, source]));
   for (const source of saved.contextSources ?? []) {
+    const planSource = planSources.get(source.name) ?? null;
+    const planFields = {
+      symlinks: source.symlinks ?? null,
+      excluded: source.excluded ?? null,
+      excludedSensitive: source.excludedSensitive ?? { files: [], total: 0 },
+      ...(source.secretsIncluded ? { secretsIncluded: true } : {}),
+      ...(Array.isArray(source.secretFiles) ? { secretFiles: source.secretFiles } : {}),
+      ref: registry[source.name]?.ref ?? null,
+      lastRunAt: planSource?.lastRunAt ?? null,
+      lastSyncStatus: planSource?.lastStatus ?? null,
+      nextDueAt: planSource?.nextDueAt ?? null,
+    };
+    if (source.status === "disabled") {
+      coverageSources.push({ name: source.name, scope: source.scope, status: "disabled", files: 0, skills: 0, ...planFields });
+      continue;
+    }
     if (source.status !== "ok" || !source.localPath) {
       loadFailures.push({ source: source.name, reason: source.reason ?? "来源未就绪" });
-      coverageSources.push({ name: source.name, scope: source.scope, status: source.status, files: 0, skills: 0 });
+      coverageSources.push({ name: source.name, scope: source.scope, status: source.status, files: 0, skills: 0, ...planFields });
       continue;
     }
     try {
@@ -486,10 +1302,11 @@ async function status(args) {
         status: "ok",
         files: files.length,
         skills: files.filter((file) => basename(file.name) === "SKILL.md").length,
+        ...planFields,
       });
     } catch (error) {
       loadFailures.push({ source: source.name, reason: error?.message ?? String(error) });
-      coverageSources.push({ name: source.name, scope: source.scope, status: "error", files: 0, skills: 0 });
+      coverageSources.push({ name: source.name, scope: source.scope, status: "error", files: 0, skills: 0, ...planFields });
     }
   }
   for (const path of saved.resources?.files ?? []) {
@@ -527,6 +1344,11 @@ async function status(args) {
         matchesSyncedVersion: Boolean(version && actualVersion === version),
       },
       lastSync,
+      previousVersion: lastSync?.previousVersion ?? null,
+      snapshotPath: lastSync?.snapshotPath ?? null,
+      localModifications: await detectLocalModifications(instanceDir, saved),
+      lastSyncLocalModifications: lastSync?.localModifications ?? null,
+      syncPlan: { sources: planView.sources, nextSyncAt: planView.nextSyncAt },
       loadFailures,
       coverage,
     })}\n`,
@@ -557,6 +1379,7 @@ async function exportInstance(args) {
       });
     }
     await assertNoSymlinks(join(stagingDir, "context"));
+    await assertNoSensitiveFiles(join(stagingDir, "context"));
     const version = await hashSources(stagingDir, sharedSources);
     for (const source of sharedSources) source.version = version;
     const models = Object.fromEntries(
@@ -614,6 +1437,12 @@ async function readImportedPackage(packageDir) {
 }
 
 async function copyImportedSources(stagingDir, packageDir, sources) {
+  await assertUniqueSourceNames(
+    sources.map((source) => ({
+      name: source?.name,
+      path: typeof source?.localPath === "string" ? source.localPath : "",
+    })),
+  );
   const contextSources = [];
   for (const source of sources) {
     if (source.scope !== "shared" || typeof source.localPath !== "string") {
@@ -653,6 +1482,52 @@ async function assertNoSymlinks(path) {
   }
 }
 
+/**
+ * 团队包不静默剔除任何东西：只要有凭证类文件留在待打包副本里，就直接拒绝导出，
+ * 并列出文件让用户处理。
+ *
+ * @param {string} path
+ */
+async function assertNoSensitiveFiles(path) {
+  const info = await stat(path);
+  if (!info.isDirectory()) {
+    if (isSensitiveName(basename(path))) throw new Error(`团队包包含敏感文件，拒绝导出：${basename(path)}`);
+    return;
+  }
+  const found = [];
+  const entries = await readdir(path, { withFileTypes: true });
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.isSymbolicLink()) continue;
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await collectSensitiveFiles(child, entry.name);
+      found.push(...nested);
+    } else if (entry.isFile() && isSensitiveName(entry.name)) {
+      found.push(entry.name);
+    }
+  }
+  if (found.length > 0) {
+    throw new Error(`团队包包含敏感文件，拒绝导出（不会静默剔除）：${found.slice(0, 10).join("、")}`);
+  }
+}
+
+/**
+ * @param {string} path
+ * @param {string} prefix
+ * @returns {Promise<string[]>}
+ */
+async function collectSensitiveFiles(path, prefix) {
+  const found = [];
+  const entries = await readdir(path, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const childPrefix = `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) found.push(...(await collectSensitiveFiles(join(path, entry.name), childPrefix)));
+    else if (entry.isFile() && isSensitiveName(entry.name)) found.push(childPrefix);
+  }
+  return found;
+}
+
 async function createStagingDir(instanceDir) {
   await mkdir(instanceDir, { recursive: true });
   const stagingDir = join(instanceDir, `.resources-${randomUUID()}`);
@@ -660,127 +1535,496 @@ async function createStagingDir(instanceDir) {
   return stagingDir;
 }
 
-async function copySources({ instanceDir, stagingDir, sources, template }) {
+/**
+ * 登记前检查来源名唯一性：registry 按 name 存储，同名不同路径会互相覆盖，
+ * 两份标准副本也会共用名称。既检查本批来源之间，也检查与实例内已登记来源的冲突
+ * （同名同真实路径允许，视为重新登记）。规范化失败的单来源错误仍由复制阶段报告。
+ *
+ * @param {{name?: string, type?: string, path?: string}[]} sources
+ * @param {string} [template]
+ * @param {{name?: string, path?: string}[]} [existing]
+ */
+async function assertNoDuplicateSourceNames(sources, template, existing = []) {
+  const named = [];
+  for (const source of Array.isArray(sources) ? sources : []) {
+    const rawPath = typeof source?.path === "string" ? source.path.trim() : "";
+    if (!rawPath) continue;
+    try {
+      const spec = await normalizeSource(source, { template });
+      named.push({ name: spec.name, path: spec.sourcePath });
+    } catch {
+      // 交给复制阶段按单个来源报错。
+    }
+  }
+  await assertUniqueSourceNames(named);
+  const registered = new Map(
+    (Array.isArray(existing) ? existing : [])
+      .filter((entry) => typeof entry?.name === "string" && entry.name)
+      .map((entry) => [entry.name, entry.path]),
+  );
+  for (const source of named) {
+    if (!registered.has(source.name)) continue;
+    const previous = registered.get(source.name);
+    if (typeof previous === "string" && previous !== "" && (await sameSourcePath(previous, source.path))) continue;
+    await assertUniqueSourceNames([
+      { name: source.name, path: typeof previous === "string" ? previous : "" },
+      { name: source.name, path: source.path },
+    ]);
+  }
+}
+
+/** @param {string} left @param {string} right */
+async function sameSourcePath(left, right) {
+  try {
+    return (await canonicalSourceKey(left)) === (await canonicalSourceKey(right));
+  } catch {
+    return left === right;
+  }
+}
+
+async function copySources({ instanceDir, stagingDir, sources, template, existingSources = [] }) {
+  await assertNoDuplicateSourceNames(sources, template, existingSources);
   const contextSources = [];
+  /** @type {{name: string, path: string, type?: string, ref?: string}[]} */
+  const registry = [];
   for (const [index, source] of sources.entries()) {
-    let sourcePath = resolve(source.path);
+    const rawPath = typeof source?.path === "string" ? source.path : "";
+    if (rawPath.trim() === "") {
+      contextSources.push({
+        name: source?.name ?? `source-${index + 1}`,
+        type: source?.type ?? "auto",
+        scope: source?.scope,
+        status: "error",
+        reason: "来源缺少原始路径，无法重新同步；请用 sync --source 指定原始来源",
+      });
+      continue;
+    }
+    /** @type {import("../src/source-spec.js").SourceSpec | null} */
+    let spec = null;
+    /** @type {ReturnType<typeof parseGitlabSource> | null} */
     let gitlabSource = null;
     let targetPath = null;
     try {
-      const requestedType = source.type ?? "auto";
-      if (!["auto", "directory", "file", "package", "gitlab"].includes(requestedType)) {
-        throw new Error(`不支持的来源类型：${requestedType}`);
-      }
-      if (requestedType === "gitlab") {
-        gitlabSource = parseGitlabSource(source.path);
-        sourcePath = gitlabSource.path;
-      }
-      const sourceName = requestedType === "gitlab"
-        ? gitlabSource.name
-        : requestedType === "package" || (requestedType === "auto" && extname(sourcePath).toLowerCase() === ".zip")
-          ? basename(sourcePath, extname(sourcePath))
-          : basename(sourcePath);
-      if (!["shared", "private"].includes(source.scope)) {
+      spec = await normalizeSource(source, { template });
+      if (spec.type === "missing") throw new Error(`来源不存在或不可访问：${spec.name}`);
+      if (spec.scope !== "shared" && spec.scope !== "private") {
         contextSources.push({
-          name: sourceName,
-          type: requestedType,
-          scope: source.scope,
+          name: spec.name,
+          type: spec.type,
+          scope: spec.scope,
           status: "error",
           reason: "每个本地来源都必须明确共享或个人私有范围",
         });
         continue;
       }
-      if (template === "team" && source.scope !== "shared") {
-        contextSources.push({
-          name: sourceName,
-          type: requestedType,
-          scope: source.scope,
-          status: "error",
-          reason: "团队实例只能使用明确共享的来源",
-        });
-        continue;
-      }
-      if (!gitlabSource || gitlabSource.local) await assertSourceTargetSeparated(sourcePath, instanceDir);
-      let readPath = sourcePath;
-      if (requestedType === "gitlab") {
+      if (spec.type === "gitlab") gitlabSource = parseGitlabSource(spec.sourcePath);
+      if (!gitlabSource || gitlabSource.local) await assertSourceTargetSeparated(spec.sourcePath, instanceDir);
+      let readPath = spec.sourcePath;
+      let detectedType = spec.type;
+      if (spec.type === "gitlab") {
         const checkout = join(stagingDir, `gitlab-checkout-${index + 1}`);
         const cloneArgs = ["clone", "--quiet", "--no-hardlinks", "--depth", "1"];
-        if (source.ref) {
-          if (source.ref.startsWith("-")) throw new Error("GitLab ref 不能是命令选项");
-          cloneArgs.push("--branch", source.ref);
-        }
-        cloneArgs.push("--", sourcePath, checkout);
+        if (spec.ref) cloneArgs.push("--branch", spec.ref);
+        cloneArgs.push("--", spec.sourcePath, checkout);
         await execFileAsync("git", cloneArgs, {
-          env: { ...process.env, GIT_ALLOW_PROTOCOL: gitlabSource.protocols, GIT_TERMINAL_PROMPT: "0" },
+          env: { ...process.env, GIT_ALLOW_PROTOCOL: gitlabSource?.protocols, GIT_TERMINAL_PROMPT: "0" },
         });
         await rm(join(checkout, ".git"), { recursive: true, force: true });
         readPath = checkout;
+        detectedType = "directory";
       }
-      const sourceStat = await stat(readPath);
-      const detectedType = sourceStat.isDirectory()
-        ? "directory"
-        : sourceStat.isFile() && (requestedType === "package" || extname(sourcePath).toLowerCase() === ".zip")
-          ? "package"
-          : "file";
-      const type = requestedType === "gitlab" ? "gitlab" : requestedType === "auto" ? detectedType : requestedType;
-      if (requestedType !== "auto" && requestedType !== "gitlab" && type !== detectedType) {
-        throw new Error(`来源实际类型与 --source-type ${requestedType} 不一致`);
-      }
-      const localPath = join("context", `${String(index + 1).padStart(3, "0")}-${sourceName}`);
+      const position = Number.isInteger(source.slot) && source.slot > 0 ? source.slot : index + 1;
+      const localPath = join("context", `${String(position).padStart(3, "0")}-${spec.name}`);
       targetPath = join(stagingDir, localPath);
+      let copyInfo;
       if (detectedType === "package") {
-        await mkdir(targetPath, { recursive: true });
-        await extractPackage(readPath, targetPath);
+        const extractDir = `${targetPath}__extract-${randomUUID()}`;
+        await mkdir(extractDir, { recursive: true });
+        try {
+          await extractPackage(readPath, extractDir);
+          copyInfo = await copyDirectorySource({
+            sourcePath: extractDir,
+            targetPath,
+            exclude: spec.exclude,
+            symlinks: spec.symlinks,
+            scope: /** @type {"shared" | "private"} */ (spec.scope),
+            includeSecrets: spec.includeSecrets,
+            packageMode: true,
+          });
+        } finally {
+          await rm(extractDir, { recursive: true, force: true });
+        }
+      } else if (detectedType === "directory") {
+        copyInfo = await copyDirectorySource({
+          sourcePath: readPath,
+          targetPath,
+          exclude: spec.exclude,
+          symlinks: spec.symlinks,
+          scope: /** @type {"shared" | "private"} */ (spec.scope),
+          includeSecrets: spec.includeSecrets,
+        });
       } else {
-        await cp(readPath, targetPath, { recursive: detectedType === "directory", dereference: false });
+        copyInfo = await copySingleFileSource({
+          sourcePath: readPath,
+          targetPath,
+          exclude: spec.exclude,
+          symlinks: spec.symlinks,
+          scope: /** @type {"shared" | "private"} */ (spec.scope),
+          includeSecrets: spec.includeSecrets,
+        });
       }
-      await assertNoSymlinks(targetPath);
       if (detectedType !== "file" && (await readLocalFiles(targetPath)).length === 0) {
         throw new Error("本地来源为空，没有可读取的文件");
       }
-      contextSources.push({ name: sourceName, type, scope: source.scope, localPath, status: "ok" });
+      contextSources.push({
+        name: spec.name,
+        type: spec.type,
+        scope: spec.scope,
+        localPath,
+        status: "ok",
+        exclude: spec.exclude,
+        ...copyInfo,
+        ...(spec.includeSecrets ? { includeSecrets: true } : {}),
+      });
+      // 原始路径、类型、--ref 与复制选项只进 data/source-registry.json；
+      // 含凭证的地址在规范化阶段已被拒绝。
+      registry.push({
+        name: spec.name,
+        path: spec.sourcePath,
+        type: spec.type,
+        ...(spec.ref ? { ref: spec.ref } : {}),
+        exclude: spec.exclude,
+        symlinks: spec.symlinks,
+      });
     } catch (error) {
       if (targetPath) await rm(targetPath, { recursive: true, force: true });
+      const copyInfo = /** @type {any} */ (error)?.copyInfo;
       contextSources.push({
-        name: gitlabSource?.name ?? basename(sourcePath),
-        scope: source.scope,
+        name: spec?.name ?? gitlabSource?.name ?? basename(rawPath) ?? `source-${index + 1}`,
+        scope: source?.scope,
         status: "error",
         reason: `本地来源不可读：${redactSourceCredentials(error?.message ?? error)}`,
+        ...(copyInfo ? copyInfo : {}),
       });
     }
   }
-  return contextSources;
+  return { contextSources, registry };
 }
 
-function parseGitlabSource(source) {
-  if (source.startsWith("file://")) {
-    const path = fileURLToPath(source);
-    return { path, local: true, protocols: "file", name: basename(path).replace(/\.git$/i, "") };
-  }
-  if (/^https?:\/\//i.test(source) || /^ssh:\/\//i.test(source)) {
-    const url = new URL(source);
-    const name = basename(url.pathname).replace(/\.git$/i, "");
-    if (!name) throw new Error("GitLab 来源必须包含仓库路径");
-    return {
-      path: source,
-      local: false,
-      protocols: url.protocol === "ssh:" ? "ssh" : "http:https",
-      name,
-    };
-  }
-  if (/^[^/\s@]+@[^/\s:]+:.+/.test(source)) {
-    const repositoryPath = source.slice(source.indexOf(":") + 1);
-    const name = basename(repositoryPath).replace(/\.git$/i, "");
-    if (!name) throw new Error("GitLab 来源必须包含仓库路径");
-    return { path: source, local: false, protocols: "ssh", name };
-  }
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source)) throw new Error("GitLab 只支持 file、HTTP(S) 或 SSH 来源");
-  const path = resolve(source);
-  return { path, local: true, protocols: "file", name: basename(path).replace(/\.git$/i, "") };
+/**
+ * `--include-secrets` 是来源级开关：即使本次没有命中任何凭证文件，
+ * 结果也必须标 `secretsIncluded: true`，避免把“没命中”误读成“没开启”。
+ *
+ * @param {ReturnType<typeof emptyCopyStats>} stats
+ * @param {boolean} includeSecrets
+ */
+function copyInfoFromStats(stats, includeSecrets = false) {
+  const excludedSensitiveFiles = [...new Set(stats.excludedSensitiveFiles)].sort();
+  const secretFiles = [...new Set(stats.secretFiles)].sort();
+  return {
+    symlinks: {
+      followed: stats.followed,
+      skipped: stats.skipped,
+      followedOutsideRoot: stats.followedOutsideRoot,
+      blockedOutsideRoot: stats.blockedOutsideRoot,
+      broken: stats.broken,
+    },
+    excluded: { files: stats.excludedFiles, dirs: stats.excludedDirs, sensitive: stats.excludedSensitive },
+    excludedSensitive: { files: excludedSensitiveFiles.slice(0, 20), total: excludedSensitiveFiles.length },
+    ...(includeSecrets ? { secretsIncluded: true, secretFiles } : {}),
+  };
 }
 
-function redactSourceCredentials(value) {
-  return String(value).replace(/((?:https?|ssh):\/\/)[^\s/@]+@/gi, "$1***@");
+function emptyCopyStats() {
+  return {
+    followed: 0,
+    skipped: 0,
+    followedOutsideRoot: 0,
+    blockedOutsideRoot: 0,
+    broken: 0,
+    excludedFiles: 0,
+    excludedDirs: 0,
+    excludedSensitive: 0,
+    /** @type {string[]} */
+    excludedSensitiveFiles: [],
+    /** @type {string[]} */
+    secretFiles: [],
+  };
+}
+
+/**
+ * @param {string} message
+ * @param {ReturnType<typeof emptyCopyStats>} stats
+ * @param {boolean} includeSecrets
+ */
+function copyInfoError(message, stats, includeSecrets = false) {
+  const error = new Error(message);
+  /** @type {any} */ (error).copyInfo = copyInfoFromStats(stats, includeSecrets);
+  return error;
+}
+
+/**
+ * 按排除规则与软链策略复制目录。默认跟随软链；shared 来源与资源包拒绝指向根外的软链，
+ * 避免把来源根之外的私人文件带进团队副本。过滤与敏感检测都作用在最终真实目标上。
+ * `includeSecrets` 只由 private 来源显式请求，命中项列名并继续复制。
+ */
+async function copyDirectorySource({
+  sourcePath,
+  targetPath,
+  exclude,
+  symlinks,
+  scope,
+  includeSecrets = false,
+  packageMode = false,
+}) {
+  const filter = createSourcePathFilter({ exclude, includeSecrets });
+  const stats = emptyCopyStats();
+  const realRoot = await realpath(sourcePath);
+  await mkdir(targetPath, { recursive: true });
+  await copyTreeEntries({
+    directory: sourcePath,
+    targetRoot: targetPath,
+    relPath: "",
+    realRel: "",
+    filter,
+    symlinks,
+    scope,
+    includeSecrets,
+    packageMode,
+    realRoot,
+    ancestors: new Set([realRoot]),
+    stats,
+  });
+  return copyInfoFromStats(stats, includeSecrets);
+}
+
+async function copyTreeEntries({
+  directory,
+  targetRoot,
+  relPath,
+  realRel,
+  filter,
+  symlinks,
+  scope,
+  includeSecrets,
+  packageMode,
+  realRoot,
+  ancestors,
+  stats,
+}) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const childRel = relPath ? join(relPath, entry.name) : entry.name;
+    const childRealRel = realRel ? join(realRel, entry.name) : entry.name;
+    const childPath = join(directory, entry.name);
+    const destination = join(targetRoot, childRel);
+    if (entry.isSymbolicLink()) {
+      await copySourceSymlink({
+        linkPath: childPath,
+        destination,
+        targetRoot,
+        relPath: childRel,
+        filter,
+        symlinks,
+        scope,
+        includeSecrets,
+        packageMode,
+        realRoot,
+        ancestors,
+        stats,
+      });
+      continue;
+    }
+    if (entry.isDirectory()) {
+      if (filter(childRealRel, true)) {
+        stats.excludedDirs += 1;
+        continue;
+      }
+      await mkdir(destination, { recursive: true });
+      let realChild;
+      try {
+        realChild = await realpath(childPath);
+      } catch {
+        stats.skipped += 1;
+        continue;
+      }
+      await copyTreeEntries({
+        directory: childPath,
+        targetRoot,
+        relPath: childRel,
+        realRel: childRealRel,
+        filter,
+        symlinks,
+        scope,
+        includeSecrets,
+        packageMode,
+        realRoot,
+        ancestors: new Set([...ancestors, realChild]),
+        stats,
+      });
+      continue;
+    }
+    if (entry.isFile()) {
+      const sensitive = isSensitiveName(entry.name);
+      if (sensitive && !includeSecrets) {
+        stats.excludedSensitive += 1;
+        stats.excludedSensitiveFiles.push(childRel.replaceAll(sep, "/"));
+        continue;
+      }
+      if (filter(childRealRel, false)) {
+        stats.excludedFiles += 1;
+        continue;
+      }
+      if (sensitive) stats.secretFiles.push(childRel.replaceAll(sep, "/"));
+      await copyFile(childPath, destination);
+      continue;
+    }
+    stats.skipped += 1;
+  }
+}
+
+async function copySourceSymlink({
+  linkPath,
+  destination,
+  targetRoot,
+  relPath,
+  filter,
+  symlinks,
+  scope,
+  includeSecrets,
+  packageMode,
+  realRoot,
+  ancestors,
+  stats,
+}) {
+  if (symlinks === "skip") {
+    stats.skipped += 1;
+    return;
+  }
+  if (symlinks === "reject") throw copyInfoError(`资源不允许符号链接：${relPath}`, stats, includeSecrets);
+  let target;
+  try {
+    target = await realpath(linkPath);
+  } catch {
+    stats.broken += 1;
+    return;
+  }
+  /** @type {import("node:fs").Stats} */
+  let info;
+  try {
+    info = await stat(target);
+  } catch {
+    stats.broken += 1;
+    return;
+  }
+  const isDirectory = info.isDirectory();
+  const outside = !(target === realRoot || target.startsWith(`${realRoot}${sep}`));
+  const targetRel = outside ? basename(target) : relative(realRoot, target);
+  const sensitive = isSensitiveName(basename(target)) || isSensitiveName(basename(relPath));
+  if (sensitive && !includeSecrets) {
+    stats.excludedSensitive += 1;
+    stats.excludedSensitiveFiles.push(relPath.replaceAll(sep, "/"));
+    return;
+  }
+  if (filter(targetRel, isDirectory)) {
+    if (isDirectory) stats.excludedDirs += 1;
+    else stats.excludedFiles += 1;
+    return;
+  }
+  if (outside) {
+    if (packageMode || scope === "shared") {
+      stats.blockedOutsideRoot += 1;
+      throw copyInfoError(`符号链接指向来源根之外，已拒绝：${relPath}`, stats, includeSecrets);
+    }
+    stats.followedOutsideRoot += 1;
+  }
+  if (isDirectory) {
+    if (ancestors.has(target)) {
+      stats.skipped += 1;
+      return;
+    }
+    await mkdir(destination, { recursive: true });
+    await copyTreeEntries({
+      directory: target,
+      targetRoot,
+      relPath,
+      realRel: targetRel,
+      filter,
+      symlinks,
+      scope,
+      includeSecrets,
+      packageMode,
+      realRoot,
+      ancestors: new Set([...ancestors, target]),
+      stats,
+    });
+  } else if (info.isFile()) {
+    if (sensitive) stats.secretFiles.push(relPath.replaceAll(sep, "/"));
+    await copyFile(target, destination);
+  } else {
+    stats.skipped += 1;
+    return;
+  }
+  stats.followed += 1;
+}
+
+/**
+ * 单文件来源同样走软链策略、根外拒绝与敏感目标检测，不能绕过。
+ *
+ * @param {{sourcePath: string, targetPath: string, exclude: string[], symlinks: string, scope: string, includeSecrets?: boolean}} options
+ */
+async function copySingleFileSource({ sourcePath, targetPath, exclude, symlinks, scope, includeSecrets = false }) {
+  const filter = createSourcePathFilter({ exclude, includeSecrets });
+  const stats = emptyCopyStats();
+  const linkInfo = await lstat(sourcePath);
+  let readPath = sourcePath;
+  if (linkInfo.isSymbolicLink()) {
+    if (symlinks === "skip") {
+      stats.skipped += 1;
+      throw copyInfoError(`来源文件是符号链接，已按 --symlinks skip 跳过：${basename(sourcePath)}`, stats, includeSecrets);
+    }
+    if (symlinks === "reject") throw copyInfoError(`资源不允许符号链接：${basename(sourcePath)}`, stats, includeSecrets);
+    let target;
+    try {
+      target = await realpath(sourcePath);
+    } catch {
+      stats.broken += 1;
+      throw copyInfoError(`符号链接目标不存在或无法解析：${basename(sourcePath)}`, stats, includeSecrets);
+    }
+    const targetInfo = await stat(target);
+    if (!targetInfo.isFile()) {
+      throw copyInfoError(`单文件来源的符号链接目标不是普通文件：${basename(sourcePath)}`, stats, includeSecrets);
+    }
+    const parentRoot = await realpath(dirname(sourcePath));
+    const outside = !(target === parentRoot || target.startsWith(`${parentRoot}${sep}`));
+    if (outside) {
+      if (scope === "shared") {
+        stats.blockedOutsideRoot += 1;
+        throw copyInfoError(`符号链接指向来源根之外，已拒绝：${basename(sourcePath)}`, stats, includeSecrets);
+      }
+      stats.followedOutsideRoot += 1;
+    }
+    stats.followed += 1;
+    readPath = target;
+  }
+  const targetName = basename(readPath);
+  const linkName = basename(sourcePath);
+  const sensitive = isSensitiveName(targetName) || isSensitiveName(linkName);
+  if (sensitive && !includeSecrets) {
+    stats.excludedSensitive += 1;
+    stats.excludedSensitiveFiles.push(targetName);
+    throw copyInfoError(`来源文件命中敏感文件规则，已排除：${targetName}`, stats, includeSecrets);
+  }
+  if (filter(targetName, false)) {
+    stats.excludedFiles += 1;
+    throw copyInfoError(`来源文件命中默认排除或自定义排除：${targetName}`, stats, includeSecrets);
+  }
+  const targetInfo = await stat(readPath);
+  if (!targetInfo.isFile()) throw copyInfoError(`来源不是普通文件：${targetName}`, stats, includeSecrets);
+  if (sensitive) stats.secretFiles.push(targetName);
+  await copyFile(readPath, targetPath);
+  return copyInfoFromStats(stats, includeSecrets);
 }
 
 async function assertSafeInstanceDir(instanceDir) {
@@ -818,33 +2062,6 @@ async function assertSourceTargetSeparated(sourcePath, instanceDir) {
   }
 }
 
-/** 已存在路径直接 realpath；不存在尾部从最近的已存在祖先解析，避免符号链接别名绕过。 */
-async function resolveRealPath(path) {
-  let current = resolve(path);
-  const missing = [];
-  while (true) {
-    try {
-      const resolved = await realpath(current);
-      return join(resolved, ...missing);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      try {
-        if ((await lstat(current)).isSymbolicLink()) throw new Error(`不能解析悬空符号链接：${current}`);
-      } catch (lstatError) {
-        if (lstatError?.code !== "ENOENT") throw lstatError;
-      }
-      const parent = dirname(current);
-      if (parent === current) throw error;
-      missing.unshift(basename(current));
-      current = parent;
-    }
-  }
-}
-
-function pathsOverlap(left, right) {
-  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
-}
-
 async function extractPackage(sourcePath, targetPath) {
   const { stdout: entries } = await execFileAsync("unzip", ["-Z1", sourcePath]);
   for (const entry of entries.split("\n").filter(Boolean)) {
@@ -855,7 +2072,11 @@ async function extractPackage(sourcePath, targetPath) {
   await execFileAsync("unzip", ["-q", sourcePath, "-d", targetPath]);
 }
 
-async function commitContext({ instanceDir, stagingDir, config, lastSync = null }) {
+/**
+ * 把 context、instance.json、source registry、sync-status 与暂存的上一版快照放在
+ * 同一个事务里替换：任一步失败都按逆序回滚，快照也不会在提交失败时被换成新副本。
+ */
+async function commitContext({ instanceDir, stagingDir, config, lastSync = null, registryStaged = false, snapshotStaged = false }) {
   const entries = [
     {
       name: "context",
@@ -874,12 +2095,32 @@ async function commitContext({ instanceDir, stagingDir, config, lastSync = null 
       newMoved: false,
     },
   ];
+  if (registryStaged) {
+    entries.push({
+      name: SOURCE_REGISTRY_PATH,
+      current: join(instanceDir, SOURCE_REGISTRY_PATH),
+      staged: join(stagingDir, SOURCE_REGISTRY_PATH),
+      backup: join(stagingDir, "previous-source-registry.json"),
+      oldMoved: false,
+      newMoved: false,
+    });
+  }
   if (lastSync) {
     entries.push({
       name: "sync-status.json",
       current: join(instanceDir, "sync-status.json"),
       staged: join(stagingDir, "sync-status.json"),
       backup: join(stagingDir, "previous-sync-status.json"),
+      oldMoved: false,
+      newMoved: false,
+    });
+  }
+  if (snapshotStaged) {
+    entries.push({
+      name: "snapshots/previous",
+      current: join(instanceDir, "snapshots/previous"),
+      staged: join(instanceDir, "snapshots/previous.next"),
+      backup: join(stagingDir, "previous-snapshot"),
       oldMoved: false,
       newMoved: false,
     });
@@ -895,12 +2136,15 @@ async function commitContext({ instanceDir, stagingDir, config, lastSync = null 
       if (entry.name === "sync-status.json" && process.env.WECOM_BOT_TEST_FAIL_SYNC_STATUS_COMMIT === "1") {
         throw new Error("注入的 sync-status 提交失败");
       }
+      await mkdir(dirname(entry.current), { recursive: true });
       await rename(entry.staged, entry.current);
       entry.newMoved = true;
     }
   } catch (error) {
     for (const entry of [...entries].reverse()) {
-      if (entry.newMoved) await rename(entry.current, join(stagingDir, `failed-${entry.name}`)).catch(() => {});
+      if (entry.newMoved) {
+        await rename(entry.current, join(stagingDir, `failed-${entry.name.replaceAll("/", "-")}`)).catch(() => {});
+      }
       if (entry.oldMoved) await rename(entry.backup, entry.current).catch(() => {});
     }
     await rm(stagingDir, { recursive: true, force: true });
@@ -1096,6 +2340,209 @@ function parseConfigureBiArgs(args) {
   return options;
 }
 
+function parseInventoryArgs(args) {
+  const options = { roots: [], exclude: [], symlinks: "follow", maxDepth: Number.POSITIVE_INFINITY };
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (!value) throw new Error(`${flag} 缺少值`);
+    index += 1;
+    if (flag === "--root") options.roots.push(value);
+    else if (flag === "--exclude") options.exclude.push(value);
+    else if (flag === "--symlinks") options.symlinks = value;
+    else if (flag === "--max-depth") {
+      const depth = Number(value);
+      if (!Number.isInteger(depth) || depth < 1) throw new Error(`--max-depth 必须是正整数：${value}`);
+      options.maxDepth = depth;
+    } else throw new Error(`inventory 未知选项：${flag}`);
+  }
+  if (options.roots.length === 0) throw new Error("inventory 至少需要一个 --root");
+  if (!["follow", "skip", "reject"].includes(options.symlinks)) {
+    throw new Error(`--symlinks 只支持 follow、skip 或 reject：${options.symlinks}`);
+  }
+  return options;
+}
+
+function parsePlanArgs(args) {
+  const options = { exclude: [], weekdays: [], clearExcludes: false, includeSecrets: false };
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    if (flag === "--enable") {
+      options.enable = true;
+      continue;
+    }
+    if (flag === "--disable") {
+      options.disable = true;
+      continue;
+    }
+    if (flag === "--clear-excludes") {
+      options.clearExcludes = true;
+      continue;
+    }
+    if (flag === "--include-secrets") {
+      options.includeSecrets = true;
+      continue;
+    }
+    const value = args[index + 1];
+    if (!value) throw new Error(`${flag} 缺少值`);
+    index += 1;
+    if (flag === "--instance-dir") options.instanceDir = value;
+    else if (flag === "--source") options.source = value;
+    else if (flag === "--scope") options.scope = value;
+    else if (flag === "--cadence") options.cadenceKind = value;
+    else if (flag === "--every-minutes") {
+      const everyMinutes = Number(value);
+      if (!Number.isInteger(everyMinutes)) throw new Error(`--every-minutes 必须是整数：${value}`);
+      options.everyMinutes = everyMinutes;
+    } else if (flag === "--at") options.at = value;
+    else if (flag === "--weekday") options.weekdays.push(Number(value));
+    else if (flag === "--weekdays") options.weekdays.push(...parseWeekdaysValue(value));
+    else if (flag === "--exclude") options.exclude.push(value);
+    else if (flag === "--symlinks") options.symlinks = value;
+    else throw new Error(`plan 未知选项：${flag}`);
+  }
+  if (!options.instanceDir) throw new Error("plan 需要 --instance-dir");
+  if (options.enable && options.disable) throw new Error("--enable 与 --disable 不能同时使用");
+  if (options.clearExcludes && options.exclude.length > 0) {
+    throw new Error("--clear-excludes 与 --exclude 不能同时使用");
+  }
+  const cadenceParams =
+    options.everyMinutes !== undefined || options.at !== undefined || options.weekdays.length > 0;
+  if (!options.cadenceKind && cadenceParams) {
+    throw new Error("--at、--weekday、--weekdays、--every-minutes 需要与 --cadence 一起使用，不能单独更新");
+  }
+  const updateRequested =
+    options.source !== undefined ||
+    options.scope !== undefined ||
+    options.cadenceKind !== undefined ||
+    cadenceParams ||
+    options.exclude.length > 0 ||
+    options.clearExcludes ||
+    options.symlinks !== undefined ||
+    options.includeSecrets ||
+    options.enable ||
+    options.disable;
+  if (!options.source && updateRequested) throw new Error("更新同步计划需要 --source <原始来源路径>");
+  if (options.symlinks !== undefined && !["follow", "skip", "reject"].includes(options.symlinks)) {
+    throw new Error(`--symlinks 只支持 follow、skip 或 reject：${options.symlinks}`);
+  }
+  options.cadence = options.cadenceKind ? cadenceFromArgs(options) : null;
+  return options;
+}
+
+function parseSyncDueArgs(args) {
+  const options = { dryRun: false };
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    if (flag === "--dry-run") {
+      options.dryRun = true;
+      continue;
+    }
+    const value = args[index + 1];
+    if (!value) throw new Error(`${flag} 缺少值`);
+    index += 1;
+    if (flag === "--instance-dir") options.instanceDir = value;
+    else if (flag === "--now") options.now = value;
+    else throw new Error(`sync-due 未知选项：${flag}`);
+  }
+  if (!options.instanceDir) throw new Error("sync-due 需要 --instance-dir");
+  return options;
+}
+
+function parseScheduleArgs(args) {
+  const options = {
+    tickMinutes: 15,
+    home: homedir(),
+    platform: process.platform,
+    install: false,
+    uninstall: false,
+    yes: false,
+    dryRun: false,
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    if (flag === "--dry-run") {
+      options.dryRun = true;
+      continue;
+    }
+    if (flag === "--yes") {
+      options.yes = true;
+      continue;
+    }
+    if (flag === "--install") {
+      options.install = true;
+      continue;
+    }
+    if (flag === "--uninstall") {
+      options.uninstall = true;
+      continue;
+    }
+    const value = args[index + 1];
+    if (!value) throw new Error(`${flag} 缺少值`);
+    index += 1;
+    if (flag === "--instance-dir") options.instanceDir = value;
+    else if (flag === "--tick-minutes") {
+      const tickMinutes = Number(value);
+      if (!Number.isInteger(tickMinutes) || tickMinutes < 1) throw new Error(`--tick-minutes 必须是正整数：${value}`);
+      options.tickMinutes = tickMinutes;
+    } else if (flag === "--home") options.home = value;
+    else if (flag === "--platform") options.platform = value;
+    else throw new Error(`schedule 未知选项：${flag}`);
+  }
+  if (!options.instanceDir) throw new Error("schedule 需要 --instance-dir");
+  if (options.install && options.uninstall) throw new Error("--install 与 --uninstall 不能同时使用");
+  if (options.dryRun && (options.install || options.uninstall)) {
+    throw new Error("--dry-run 不能与 --install 或 --uninstall 同时使用");
+  }
+  if (options.platform !== "darwin" && options.platform !== "linux") {
+    throw new Error(`--platform 只支持 darwin 或 linux（Windows 请在 WSL2 内运行）：${options.platform}`);
+  }
+  return options;
+}
+
+/**
+ * CLI 只负责拒绝与频率种类冲突的参数；kind 分派与补全统一交给 normalizeCadence，
+ * 避免命令行与频率模型各维护一份分派。
+ */
+function cadenceFromArgs(options) {
+  const kind = options.cadenceKind;
+  if (!CADENCE_KINDS.includes(kind)) {
+    throw new Error(`不支持的频率：${kind}；可用 ${CADENCE_KINDS.join("、")}`);
+  }
+  if (kind === "manual" && (options.everyMinutes !== undefined || options.at !== undefined || options.weekdays.length > 0)) {
+    throw new Error("manual 频率不接受 --every-minutes、--at 或 --weekday");
+  }
+  if ((kind === "every" || kind === "hourly") && options.at !== undefined) {
+    throw new Error(`${kind} 频率不接受 --at`);
+  }
+  if (kind === "hourly" && options.everyMinutes !== undefined) {
+    throw new Error("hourly 固定每 60 分钟，不接受 --every-minutes");
+  }
+  if ((kind === "daily" || kind === "weekly") && options.everyMinutes !== undefined) {
+    throw new Error(`${kind} 频率不接受 --every-minutes`);
+  }
+  return normalizeCadence({
+    kind,
+    everyMinutes: options.everyMinutes,
+    at: options.at,
+    weekdays: options.weekdays.length > 0 ? options.weekdays : undefined,
+  });
+}
+
+function parseWeekdaysValue(value) {
+  const days = [];
+  for (const part of value.split(",")) {
+    const trimmed = part.trim();
+    const range = /^([1-7])-([1-7])$/.exec(trimmed);
+    if (range) {
+      for (let day = Number(range[1]); day <= Number(range[2]); day += 1) days.push(day);
+    } else {
+      days.push(Number(trimmed));
+    }
+  }
+  return days;
+}
+
 function parseExportArgs(args) {
   const options = {};
   for (let index = 0; index < args.length; index += 1) {
@@ -1111,10 +2558,50 @@ function parseExportArgs(args) {
   return options;
 }
 
+/**
+ * init / sync 的逐来源复制选项，与 plan 同义：`--exclude` 追加自定义规则，
+ * `--clear-excludes` 清空（与 `--exclude` 互斥），`--symlinks` 选择软链策略。
+ * 三者都必须跟在对应的 `--source` 之后，并由 registry 持久化。
+ *
+ * @param {{sources: {exclude?: string[], clearExcludes?: boolean, symlinks?: string}[]}} options
+ * @param {string} flag
+ * @param {string} [value]
+ * @returns {boolean} 是否已处理该选项
+ */
+function applySourceCopyOption(options, flag, value) {
+  if (flag !== "--clear-excludes" && flag !== "--exclude" && flag !== "--symlinks") return false;
+  if (options.sources.length === 0) throw new Error(`${flag} 必须跟在 --source 后面`);
+  const source = options.sources.at(-1);
+  if (flag === "--clear-excludes") {
+    if (source.exclude && source.exclude.length > 0) throw new Error("--clear-excludes 与 --exclude 不能同时使用");
+    source.clearExcludes = true;
+    return true;
+  }
+  if (flag === "--exclude") {
+    if (source.clearExcludes) throw new Error("--clear-excludes 与 --exclude 不能同时使用");
+    source.exclude = [...(source.exclude ?? []), value];
+    return true;
+  }
+  if (!["follow", "skip", "reject"].includes(String(value))) {
+    throw new Error(`--symlinks 只支持 follow、skip 或 reject：${value}`);
+  }
+  source.symlinks = value;
+  return true;
+}
+
 function parseSyncArgs(args) {
   const options = { sources: [] };
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
+    if (flag === "--include-secrets") {
+      if (options.sources.length === 0) throw new Error("--include-secrets 必须跟在 --source 后面");
+      options.sources.at(-1).includeSecrets = true;
+      continue;
+    }
+    if (flag === "--clear-excludes") {
+      applySourceCopyOption(options, flag);
+      continue;
+    }
     const value = args[index + 1];
     if (!value) throw new Error(`${flag} 缺少值`);
     index += 1;
@@ -1129,7 +2616,7 @@ function parseSyncArgs(args) {
     } else if (flag === "--scope") {
       if (options.sources.length === 0) throw new Error("--scope 必须跟在 --source 后面");
       options.sources.at(-1).scope = value;
-    } else throw new Error(`未知选项：${flag}`);
+    } else if (!applySourceCopyOption(options, flag, value)) throw new Error(`未知选项：${flag}`);
   }
   if (!options.instanceDir) throw new Error("sync 需要 --instance-dir");
   return options;
@@ -1187,6 +2674,15 @@ function parseInitArgs(args) {
   const options = { sources: [], template: "blank" };
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
+    if (flag === "--include-secrets") {
+      if (options.sources.length === 0) throw new Error("--include-secrets 必须跟在 --source 后面");
+      options.sources.at(-1).includeSecrets = true;
+      continue;
+    }
+    if (flag === "--clear-excludes") {
+      applySourceCopyOption(options, flag);
+      continue;
+    }
     const value = args[index + 1];
     if (!value) throw new Error(`${flag} 缺少值`);
     index += 1;
@@ -1215,7 +2711,7 @@ function parseInitArgs(args) {
     else if (flag === "--approval-base-url") options.approvalBaseUrl = value;
     else if (flag === "--approval-api-key") options.approvalApiKey = value;
     else if (flag === "--approval-model") options.approvalModel = value;
-    else throw new Error(`未知选项：${flag}`);
+    else if (!applySourceCopyOption(options, flag, value)) throw new Error(`未知选项：${flag}`);
   }
   for (const key of ["instanceDir", "apiKey"]) {
     if (!options[key]) throw new Error(`缺少必需选项：${key}`);

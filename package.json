@@ -7,6 +7,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "setup": "node scripts/setup.js",
     "instance": "node scripts/local-instance.js",
     "windows": "node scripts/windows-instance.js",
     "test": "node scripts/check-roots-consistency.js && node --test \"test/**/*.test.js\"",

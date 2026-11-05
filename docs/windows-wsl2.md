@@ -96,7 +96,7 @@ wecom-windows-package/
 
 **模型地址**：`localhost`、`127.0.0.1`、`::1`、`0.0.0.0` 在 Windows 控制台中被拒绝，因为原机器回环地址在 WSL 中不是原模型服务。填写 Windows 主机可被 WSL 路由到的地址或实际 URL。`validate-model-url` 只报告地址检查，从不报告连接成功；真正的四模型连接、知识/Skills、执行审批和示例任务检查仍由 WSL 内的 `instance init` 完成。
 
-06 `sync` 继续只提交 `context/`、资源 manifest 与同步状态，保留 `workspace/`、`data/`、pi sessions 和企微配置。运行时只读初始化选择的本地副本，不回读原始 Windows 来源。企微进程在启动时构建资源目录；同步完成后，在没有在途任务时使用控制台“重启服务”加载新版本，控制台不会在同步中静默重启正式服务。
+06 `sync` 在同一事务里提交 `context/`、资源 manifest（`instance.json` 的 `resources`）、`instance.json`、`data/source-registry.json` 与 `sync-status.json`，并把上一版 `context/` 原子替换到 `snapshots/previous/`；`workspace/`、`data/` 下的会话与收件箱状态、pi sessions 和企微配置保持不动。运行时只读初始化选择的本地副本，不回读原始 Windows 来源。企微进程在启动时构建资源目录；同步完成后，在没有在途任务时使用控制台“重启服务”加载新版本，控制台不会在同步中静默重启正式服务。
 
 ## 5. 独立测试机器人验收
 

@@ -46,11 +46,11 @@ agent 的原始输出在通过校验前**绝不外发**，同事只会看到「�
 ## 部署
 
 ```bash
-# 1. 安装隔离的 pi（首次）
-bash scripts/install-pi.sh
+# 1. 安装前检查：只报告 Node / 依赖 / pi / python3 / zip / unzip，不安装
+npm run setup -- --check
 
-# 2. 装依赖
-npm install
+# 2. 用户明确同意后，安装依赖与隔离的 pi；缺 python3/zip/unzip 只报告，不装系统包
+npm run setup -- --allow-install
 
 # 3. 配置凭证
 #    config/secrets.json 需要 botId 与 secret，权限必须是 600
@@ -119,7 +119,9 @@ WECOM_BOT_SECRETS=config/secrets.dev.json npm start
 
 ## 本地实例初始化与同步
 
-不用手改实例配置。通过公开初始化命令选择目录、单文件或 zip 资源包，并逐项指定 `shared` / `private` 范围。团队模板（`--template team`）只接受 `shared` 来源，空白模板可省略 `--template`；既有实例用 `--template import --package <分发包>` 导入。
+安装与初始化由用户自己的编码 Agent 执行：把仓库交给 ZCode、Codex 或 Claude Code，它会按根 `AGENTS.md` 的入口与硬性规则、`docs/agents/initialization.md` 的可执行协议盘点上下文、逐项确认来源 / 共享范围 / 同步频率，再执行初始化、定时同步与验收。本节命令是协议执行时使用的底层 CLI。
+
+不用手改实例配置。通过公开初始化命令选择目录、单文件或 zip 资源包，并逐项指定 `shared` / `private` 范围。团队模板（`--template team`）只接受 `shared` 来源，空白模板可省略 `--template`；既有实例用 `--template import --package <分发包>` 导入。同一实例内来源名必须唯一：`init` / `sync` / `plan` 遇到同名不同路径会直接报错并列出冲突的真实路径；`--exclude` / `--clear-excludes` / `--symlinks` 是逐来源选项（跟在对应 `--source` 之后），与 `plan` 同义并写入 `data/source-registry.json`，首次补齐同步计划时沿用。
 
 主模型、快速模型、执行审批模型与 Guard 模型默认共用 `--base-url` / `--api-key` / `--model`。需要独立配置时分别使用 `--quick-*`、`--approval-*`、`--guard-*` 三组选项。初始化会逐项检查四个模型，并通过真实 pi 读取本地知识与 Skill 正文、走完执行审批链和与 `ask` 相同的示例任务编排；临时检查产物会清理。未安装 pi、模型失败或未执行的检查会明确显示 `error` / `skipped`，不会冒充通过。
 
@@ -144,13 +146,27 @@ npm run instance -- configure-bi \
   --business lzz \
   --script /absolute/path/to/知识库/数据库/lzz-db-wiki/scripts/bi_query.py
 
-# 以本次明确选择的来源完整更新标准资源副本；workspace、data 和会话不动
+# 只复制本次列出的来源（逐个列出全部来源即为全量）；workspace 和会话不动
+# 提交成功后上一版才原子替换到 <instance>/snapshots/previous，并报告 localModifications
+# 结果里的 notIncluded 列出计划中应同步但本次未复制的来源
 npm run instance -- sync \
   --instance-dir ./instances/team \
   --source /path/to/shared-docs --scope shared
 
-# 查看资源版本、目录/副本一致性、本地修改漂移、最近同步和加载失败
+# 查看资源版本、目录/副本一致性、本地修改漂移、上一版快照、最近同步和加载失败
 npm run instance -- status --instance-dir ./instances/team
+
+# 只读盘点候选来源；输出内容、体积、Skills、资源类型、敏感文件、软链与建议
+npm run instance -- inventory --root /path/to/source --root /path/to/other
+
+# 逐来源配置共享范围与同步频率；不带 --source 时只查看计划与下次到期时间
+# 工作日每两小时：--cadence every --every-minutes 120 --weekdays 1-5
+# 首次 plan 会为所有来源补齐 manual 条目，未登记来源不会在同步时被删掉
+npm run instance -- plan --instance-dir ./instances/team \
+  --source /path/to/source --scope shared --cadence daily --at 09:00
+
+# 定时同步；默认 dry-run，展示 launchd plist / systemd unit 后取得同意再加 --install --yes
+npm run instance -- schedule --instance-dir ./instances/team --tick-minutes 15
 
 # 生成仅含共享资源的团队包；不含凭证、私人来源、workspace、会话或运行状态
 npm run instance -- export \
@@ -172,9 +188,11 @@ npm run instance -- ask \
 
 本地实例只执行 `instance.json` 的 `trustedDataScripts` 显式登记的 BI 入口；未配置时不会从 `config/default.json` 自动补全，真实查数会明确提示缺少配置。`configure-bi` 会校验业务线、绝对路径、realpath 和文件类型，只接受上述默认业务目录中的真实 `bi_query.py`，拒绝悬空路径、目录、任意副本、环境变量注入以及 context/workspace/project 保护根别名；它不改变 `ready`、资源版本、workspace 或会话状态。
 
-初始化与同步只写实例的 `context/` 标准副本，问答只读取该副本和独立 `workspace/`；原始目录、GitLab 和主工作区不是运行时来源。同步先构建并校验暂存副本，再把 context、资源 manifest、实例配置与 sync-status 作为一个事务提交；任一步失败都会恢复旧副本和旧状态。目录在每次问答/status 时从实际副本重建，源中删除的文件不会残留为目录项。
+初始化与同步写实例的 `context/` 标准副本与 `data/source-registry.json`（原始来源路径、类型、`--ref` 与登记期复制选项，mode 0600）；问答只读取该副本和独立 `workspace/`；原始目录、GitLab 和主工作区不是运行时来源。同步先构建并校验暂存副本，把当前 `context/` 暂存为 `snapshots/previous.next` 并统计 `localModifications`，再把 context、资源 manifest、实例配置、source registry 与 sync-status 作为一个事务提交，提交成功才把 `previous.next` 原子替换成 `snapshots/previous`；任一步失败都会恢复旧副本和旧状态并丢弃未提交的快照。目录在每次问答/status 时从实际副本重建，源中删除的文件不会残留为目录项。`plan --source` 只接受 registry 中 realpath 精确匹配的原始路径，同名不同路径会报错；同名来源在 `init` / `sync` / `plan` 与 `sync-due` 全部 fail-closed。
 
-`--source-type gitlab` 接受本地路径、`file://`、HTTP(S) 与 SSH 仓库，可用 `--ref` 选择分支；实现只执行 clone 到临时副本后校验和单向同步，不 push、不回写来源，也不保存或在错误日志中暴露 URL 凭证。HTTP/SSH 自动化验收通过 PATH 中的假 git 完成，真实 GitLab 联网尚未验收。zip 解包和团队打包使用本机已有的 `unzip` / `zip`，不会安装新依赖。
+`--source-type gitlab` 接受本地路径、`file://`、HTTP(S) 与 SSH 仓库，可用 `--ref` 选择分支；`--ref` 写入实例内 `data/source-registry.json`，`sync-due` 按该分支克隆，`status` 会展示。含内嵌 userinfo 的 URL（HTTP(S) 用户名/密码或任何带密码的地址）会被拒绝，不会落盘或回显，请改用无凭据地址或 SSH agent。实现只执行 clone 到临时副本后校验和单向同步，不 push、不回写来源，也不在错误日志中暴露 URL 凭证。HTTP/SSH 自动化验收通过 PATH 中的假 git 完成，真实 GitLab 联网尚未验收。zip 解包和团队打包使用本机已有的 `unzip` / `zip`，不会安装新依赖。
+
+凭证文件（`.env`、`.env.*`、`*.pem`、`*.key`、`id_rsa*`、`*credential*`、`secrets.json`、`models.json`、`wecom.json`、`.npmrc`、`.netrc`）默认排除。只有用户明确要求把凭证随**私有**副本一起放时，才对 `private` 来源加 `--include-secrets`；`shared` 来源会直接报错。只要来源用了该选项就标 `secretsIncluded: true`，被包含的文件列入 `secretFiles`（没有命中时为空数组）。导出团队包时只要发现敏感文件就报错拒绝，不会静默剔除。BI 不需要复制 `.env`：可信 `bi_query.py` 按原路径就地执行，读取它旁边的凭证。
 
 ## Windows / WSL2 安装与迁移
 
