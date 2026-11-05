@@ -10,6 +10,7 @@
  *   node scripts/regression-run.js --out docs/x.json   # 指定输出
  */
 import { readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -45,13 +46,19 @@ const outIndex = args.indexOf("--out");
 const outPath = outIndex >= 0 ? args[outIndex + 1] : join(projectDir, "docs/regression-baseline.json");
 
 const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
+// 仓库不写死机器路径：默认模式由 WECOM_BOT_ROOTS 提供根目录（数组或带名字的对象）。
+const envRoots = process.env.WECOM_BOT_ROOTS ? JSON.parse(process.env.WECOM_BOT_ROOTS) : null;
+const namedRoots = envRoots && !Array.isArray(envRoots) ? { ...(defaults.roots ?? {}), ...envRoots } : (defaults.roots ?? {});
 const config = {
   ...defaults,
   projectDir,
-  roots: Object.values(defaults.roots),
-  pi: { ...defaults.pi, binary: process.env.WECOM_BOT_PI_BINARY || defaults.pi.binary },
+  roots: Array.isArray(envRoots) ? envRoots : Object.values(namedRoots),
+  pi: {
+    ...defaults.pi,
+    binary: process.env.WECOM_BOT_PI_BINARY || defaults.pi?.binary || join(homedir(), ".pi-support/bin/pi"),
+  },
 };
-const resourceContext = createDefaultResourceCatalog(defaults.roots, projectDir);
+const resourceContext = createDefaultResourceCatalog(namedRoots, projectDir);
 
 const picked = QUESTIONS.filter((item) => !only || only.has(item.id));
 const results = [];

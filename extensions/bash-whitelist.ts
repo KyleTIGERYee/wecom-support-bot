@@ -21,21 +21,31 @@ import { pathToFileURL } from "node:url";
  * 默认企微模式允许 read 读取的项目内文件：不在 ROOTS 里，但 agent 必须先读它才能正确查数。
  * 本地实例不使用这份例外清单，只能读取自己的副本根。
  */
-const DEFAULT_ALLOWED_READ_FILES = ["/Users/kyle/Desktop/VIBECODING/wecom-support-bot/prompts/data-playbook.md"];
+const PROJECT_DIR = process.env.WECOM_BOT_PROJECT_DIR ?? "";
+const DEFAULT_ALLOWED_READ_FILES: string[] = [];
+const PROJECT_PLAYBOOK = PROJECT_DIR ? `${PROJECT_DIR}/prompts/data-playbook.md` : null;
 const IS_LOCAL_INSTANCE = process.env.WECOM_BOT_LOCAL_INSTANCE === "1";
-const ALLOWED_READ_FILES: string[] = IS_LOCAL_INSTANCE ? [] : DEFAULT_ALLOWED_READ_FILES;
+const ALLOWED_READ_FILES: string[] = IS_LOCAL_INSTANCE
+	? []
+	: PROJECT_PLAYBOOK
+		? [...DEFAULT_ALLOWED_READ_FILES, PROJECT_PLAYBOOK]
+		: DEFAULT_ALLOWED_READ_FILES;
 
 /** 允许被 python3 执行的检索脚本。 */
 const ALLOWED_SCRIPTS = new Set(["search_db.py", "search_queries.py", "search_wiki.py", "bi_query.py"]);
 
 /** 受信任的默认企微检索脚本来源；本地实例副本可写，不能作为代码来源。 */
-const DEFAULT_TRUSTED_PYTHON_SCRIPT_DIRS = [
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库/业务/ajly-wiki/scripts",
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库/业务/lzz-wiki/scripts",
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki/scripts",
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki/scripts",
-];
-const TRUSTED_PYTHON_SCRIPT_DIRS = IS_LOCAL_INSTANCE ? [] : DEFAULT_TRUSTED_PYTHON_SCRIPT_DIRS;
+/** 默认模式的受信任检索脚本目录从注入的知识库根推导，不写死机器路径。 */
+function trustedScriptDirsFrom(roots: string[]): string[] {
+	const base = roots.find((root) => root.replace(/\/$/, "").endsWith("知识库")) ?? roots[0];
+	if (!base) return [];
+	return [
+		"业务/ajly-wiki/scripts",
+		"业务/lzz-wiki/scripts",
+		"数据库/ajly-db-wiki/scripts",
+		"数据库/lzz-db-wiki/scripts",
+	].map((relative) => `${base.replace(/\/$/, "")}/${relative}`);
+}
 
 /** 允许直接执行的只读命令。 */
 const ALLOWED_COMMANDS = new Set([
@@ -58,11 +68,14 @@ const ALLOWED_COMMANDS = new Set([
  * 默认企微模式允许用 node 执行的只读脚本：经验检索与指标路由。
  * 本地实例不执行主工作区脚本。
  */
-const DEFAULT_ALLOWED_NODE_SCRIPTS = [
-	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js",
-	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js",
-];
-const ALLOWED_NODE_SCRIPTS = new Set<string>(IS_LOCAL_INSTANCE ? [] : DEFAULT_ALLOWED_NODE_SCRIPTS);
+const DEFAULT_ALLOWED_NODE_SCRIPTS: string[] = [];
+/** 仓库自带的只读检索脚本按项目目录推导，不写死机器路径。 */
+const PROJECT_NODE_SCRIPTS = PROJECT_DIR
+	? ["read-evolution.js", "search-bridge.js"].map((name) => `${PROJECT_DIR}/scripts/${name}`)
+	: [];
+const ALLOWED_NODE_SCRIPTS = new Set<string>(
+	IS_LOCAL_INSTANCE ? [] : [...DEFAULT_ALLOWED_NODE_SCRIPTS, ...PROJECT_NODE_SCRIPTS],
+);
 
 /** 改变数据流向或串联命令的元字符；`$` 单独列出以拦住 $HOME 之类的变量展开。 */
 const FORBIDDEN_METACHARS = [">", "<", "|", ";", "&", "`", "$", "\n"];
@@ -150,13 +163,9 @@ function tokenizeShellCommand(command: string): ShellTokenization {
 }
 
 /** 默认允许访问的文件系统根。与 config/default.json 的 roots 保持一致。 */
-const DEFAULT_ROOTS = [
-	"/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
-	"/Users/kyle/Desktop/VIBECODING/ajly",
-	"/Users/kyle/Desktop/VIBECODING/lezuzu",
-	// 同事发来的截图：机器人自己下载存到这里，agent 必须用 read 看图
-	"/Users/kyle/Desktop/VIBECODING/wecom-support-bot/data/images",
-];
+// 发行版不写死任何机器的绝对路径：默认模式由 WECOM_BOT_ROOTS 注入，
+// 实例模式由父进程按实例配置注入副本根。
+const DEFAULT_ROOTS: string[] = [];
 
 /** 本地实例只使用注入的副本根；默认企微模式保留原有根目录。 */
 const ROOTS: string[] = process.env.WECOM_BOT_ROOTS
@@ -164,6 +173,8 @@ const ROOTS: string[] = process.env.WECOM_BOT_ROOTS
 	: IS_LOCAL_INSTANCE
 		? []
 		: DEFAULT_ROOTS;
+/** 本地实例只用 saved 里登记的精确脚本路径，不使用默认目录推导。 */
+const TRUSTED_PYTHON_SCRIPT_DIRS = IS_LOCAL_INSTANCE ? [] : trustedScriptDirsFrom(ROOTS);
 
 const EXECUTION_APPROVAL: any = readEnvJson("WECOM_BOT_EXECUTION_APPROVAL", { enabled: false });
 const WRITE_ROOTS = readEnvJson<string[]>("WECOM_BOT_WRITE_ROOTS", []);

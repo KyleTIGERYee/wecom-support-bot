@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { loadLocalInstanceConfig } from "./local-instance-config.js";
@@ -25,12 +26,25 @@ export async function loadConfig(projectDir, { env = process.env } = {}) {
     throw new Error(`凭证文件缺少 botId 或 secret: ${secretsPath}`);
   }
 
+  // 默认模式的可执行路径不写进仓库：发行版里没有某台机器的绝对路径，
+  // 由环境变量或用户主目录推导；实例模式另有自己的配置来源。
+  const roots = Object.fromEntries(
+    Object.entries(defaults.roots ?? {}).filter(([, value]) => typeof value === "string" && value),
+  );
+  // WECOM_BOT_ROOTS 既可以是数组（扩展的白名单），也可以是带名字的对象（默认模式的根目录清单）。
+  const envRoots = env.WECOM_BOT_ROOTS ? JSON.parse(env.WECOM_BOT_ROOTS) : null;
+  const namedRoots = envRoots && !Array.isArray(envRoots) ? { ...roots, ...envRoots } : roots;
   return {
     ...defaults,
     projectDir,
     wecom: { botId: secrets.botId, secret: secrets.secret },
-    roots: Object.values(defaults.roots),
-    namedRoots: defaults.roots,
+    pi: {
+      ...defaults.pi,
+      binary: env.WECOM_BOT_PI_BINARY || defaults.pi?.binary || join(homedir(), ".pi-support/bin/pi"),
+      agentDir: defaults.pi?.agentDir || join(homedir(), ".pi-support/agent"),
+    },
+    roots: Array.isArray(envRoots) ? envRoots : Object.values(namedRoots),
+    namedRoots,
   };
 }
 

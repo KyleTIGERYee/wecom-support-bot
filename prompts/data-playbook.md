@@ -1,3 +1,5 @@
+> 本文里的 `<知识库>`、`<db-wiki目录>`、`scripts/` 一律按资源目录里该来源的 root 拼接；不要使用任何写死的本机路径。
+
 # 二、查数据库 wiki（表结构、字段、SQL）
 
 ## 2.1 先分清三种检索
@@ -16,13 +18,13 @@ python3 <dbwiki目录>/scripts/search_queries.py "关键词"   # 搜 235 个历�
 每个 db-wiki 都有一个 `.<名字>-db-wiki-evolution/` 目录，里面是之前踩过的坑。**查任何数据之前先跑这个**：
 
 ```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js <db-wiki目录绝对路径> "业务词1 业务词2"
+node scripts/read-evolution.js <db-wiki目录绝对路径> "业务词1 业务词2"
 ```
 
 比如：
 
 ```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki "机构 机构数"
+node scripts/read-evolution.js <知识库>/数据库/lzz-db-wiki "机构 机构数"
 ```
 
 它会返回「判断标准」和「与问题相关的历史经验」。**这些是用真实事故换来的教训，看到就必须照做。**
@@ -40,13 +42,13 @@ node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js 
 **先跑指标路由，它会告诉你该读哪个指标卡、有哪些同义说法、以及现成的 SQL：**
 
 ```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js <db-wiki目录绝对路径> "业务词"
+node scripts/search-bridge.js <db-wiki目录绝对路径> "业务词"
 ```
 
 比如：
 
 ```
-node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/search-bridge.js /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/lzz-db-wiki "机构数量"
+node scripts/search-bridge.js <知识库>/数据库/lzz-db-wiki "机构数量"
 ```
 
 它会输出指标名、同义说法、`metrics/xxx.md` 路径、以及相关的 `queries/xxx.sql`。**匹配到就直接读那个指标卡。**
@@ -194,7 +196,7 @@ python3 <dbwiki目录>/scripts/bi_query.py "SELECT ..."
 
 不要直接说"查不到"。代码能回答"这个字段怎么算的""这个状态怎么流转""校验在哪一层"。
 
-**安居乐寓 `/Users/kyle/Desktop/VIBECODING/ajly`：**
+**安居乐寓代码仓库（路径见资源目录里的代码来源根）：**
 
 - `ajly-consumer-api`、`ajly-consumer-wechat`：C 端接口
 - `ajly-provider-lease`、`ajly-provider-lease-service`：租赁业务
@@ -203,7 +205,7 @@ python3 <dbwiki目录>/scripts/bi_query.py "SELECT ..."
 - `ajly-job-executor`：定时任务（特价应用、批量同步）
 - `ajly-pipeline`：部署
 
-**乐租租 `/Users/kyle/Desktop/VIBECODING/lezuzu`：**
+**乐租租代码仓库（路径见资源目录里的代码来源根）：**
 
 - `ajly-flow-server`：后端（含 MCP 与小乐相关接口）
 - `ajly-flow-platform`：管理后台前端

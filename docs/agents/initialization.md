@@ -220,10 +220,11 @@ npm run instance -- sync --instance-dir <dir> \
 npm run instance -- configure-bi \
   --instance-dir /absolute/path/to/instance \
   --business lzz \
+  --knowledge-base /absolute/path/to/知识库 \
   --script /absolute/path/to/知识库/数据库/lzz-db-wiki/scripts/bi_query.py
 ```
 
-`--business` 只支持 `ajly` / `lzz`；脚本必须是该业务线默认目录中的真实 `bi_query.py`。未配置时真实查数会明确提示缺少配置。
+`--business` 只支持 `ajly` / `lzz`；脚本必须是该业务线默认目录中的真实 `bi_query.py`。仓库不写死任何机器的知识库路径，所以要用 `--knowledge-base` 指定知识库根目录（若 `config/default.json` 里配了 `roots.knowledgeBase` 可省略）。未配置时真实查数会明确提示缺少配置。
 
 ### 为什么 BI 不需要复制 `.env`
 
@@ -379,7 +380,7 @@ npm run instance -- sync-due --instance-dir <dir> [--now ISO8601] [--dry-run]
 npm run instance -- schedule --instance-dir <dir> [--tick-minutes N] [--platform darwin|linux] [--home <dir>] [--dry-run] [--install --yes|--uninstall --yes]
 npm run instance -- sync --instance-dir <dir> --source <路径> --scope <shared|private> [--exclude <glob>]... [--clear-excludes] [--symlinks follow|skip|reject] [--include-secrets]
 npm run instance -- status --instance-dir <dir>
-npm run instance -- configure-bi --instance-dir <dir> --business ajly|lzz --script <绝对路径>
+npm run instance -- configure-bi --instance-dir <dir> --business ajly|lzz --knowledge-base <知识库根> --script <绝对路径>
 npm run instance -- ask --instance-dir <dir> --question <问题> --session-key <标识>
 npm run instance -- export --instance-dir <dir> --output <zip>
 ```

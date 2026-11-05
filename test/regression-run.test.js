@@ -17,6 +17,25 @@ async function makeTempDir(t) {
   return dir;
 }
 
+
+/** 默认模式的根目录不再写死在仓库里；测试用临时知识库与代码仓目录。 */
+async function makeDefaultRoots(t) {
+  const root = await makeTempDir(t);
+  const knowledgeBase = join(root, "知识库");
+  const ajlyCode = join(root, "ajly");
+  const lzzCode = join(root, "lezuzu");
+  const { mkdir } = await import("node:fs/promises");
+  await Promise.all([
+    mkdir(join(knowledgeBase, "数据库/ajly-db-wiki/scripts"), { recursive: true }),
+    mkdir(join(knowledgeBase, "数据库/lzz-db-wiki/scripts"), { recursive: true }),
+    mkdir(join(knowledgeBase, "业务/ajly-wiki/scripts"), { recursive: true }),
+    mkdir(join(knowledgeBase, "业务/lzz-wiki/scripts"), { recursive: true }),
+    mkdir(ajlyCode, { recursive: true }),
+    mkdir(lzzCode, { recursive: true }),
+  ]);
+  return { root, knowledgeBase, ajlyCode, lzzCode, env: { WECOM_BOT_ROOTS: JSON.stringify({ knowledgeBase, ajlyCode, lzzCode }) } };
+}
+
 test("默认回归目录公开来源时间、有效状态和业务 Wiki 的 raw_base", async (t) => {
   const root = await makeTempDir(t);
   const fakePi = join(root, "fake-pi.js");
@@ -33,9 +52,10 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
     { mode: 0o755 },
   );
 
+  const roots = await makeDefaultRoots(t);
   await execFileAsync(process.execPath, [regressionCli, "--only", "Q2", "--out", out], {
     cwd: projectDir,
-    env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog },
+    env: { ...process.env, ...roots.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog },
   });
 
   const [record] = JSON.parse(await readFile(out, "utf8"));
@@ -57,8 +77,8 @@ test("回归加载记录区分查数手册、指标卡、表文档与 SQL", asyn
   const root = await makeTempDir(t);
   const fakePi = join(root, "fake-pi.js");
   const out = join(root, "result.json");
-  const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
-  const dbRoot = join(defaults.roots.knowledgeBase, "数据库/lzz-db-wiki");
+  const roots = await makeDefaultRoots(t);
+  const dbRoot = join(roots.knowledgeBase, "数据库/lzz-db-wiki");
   const paths = [
     join(projectDir, "prompts/data-playbook.md"),
     join(dbRoot, ".lzz-db-wiki-evolution/common/机构经验.md"),
@@ -83,7 +103,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 
   await execFileAsync(process.execPath, [regressionCli, "--only", "Q8", "--out", out], {
     cwd: projectDir,
-    env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi },
+    env: { ...process.env, ...roots.env, WECOM_BOT_PI_BINARY: fakePi },
   });
 
   const [record] = JSON.parse(await readFile(out, "utf8"));
@@ -100,8 +120,8 @@ test("具体规则回归经过同一会话的概念不足与 raw 深化链", asy
   const fakePi = join(root, "fake-pi.js");
   const piLog = join(root, "pi-log.jsonl");
   const out = join(root, "result.json");
-  const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
-  const wikiRoot = join(defaults.roots.knowledgeBase, "业务/ajly-wiki");
+  const roots = await makeDefaultRoots(t);
+  const wikiRoot = join(roots.knowledgeBase, "业务/ajly-wiki");
   const conceptPath = join(wikiRoot, "wiki/概念/自助看房.md");
   const rawPath = join(wikiRoot, "raw/自助看房/预约规则.md");
   await writeFile(
@@ -122,7 +142,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 
   await execFileAsync(process.execPath, [regressionCli, "--only", "Q4", "--out", out], {
     cwd: projectDir,
-    env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog },
+    env: { ...process.env, ...roots.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog },
   });
 
   const [record] = JSON.parse(await readFile(out, "utf8"));

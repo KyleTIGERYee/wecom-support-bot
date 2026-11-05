@@ -90,9 +90,12 @@ async function configureBi(args) {
     readFile(join(projectDir, "config/default.json"), "utf8").then(JSON.parse),
     readFile(join(instanceDir, "instance.json"), "utf8").then(JSON.parse),
   ]);
-  const knowledgeBase = defaults.roots?.knowledgeBase;
+  // 仓库不再写死某台机器的知识库路径：默认值缺失时用 --knowledge-base 显式指定。
+  const knowledgeBase = options.knowledgeBase ?? defaults.roots?.knowledgeBase;
   if (typeof knowledgeBase !== "string" || !isAbsolute(knowledgeBase)) {
-    throw new Error("config/default.json 缺少绝对路径 roots.knowledgeBase，无法确定默认可信 BI 目录");
+    throw new Error(
+      "需要知识库绝对路径：请传 --knowledge-base <知识库目录>，或在 config/default.json 的 roots.knowledgeBase 里配置",
+    );
   }
   if (!isAbsolute(options.script)) throw new Error("configure-bi 的 --script 必须是绝对路径");
 
@@ -2502,6 +2505,7 @@ function parseConfigureBiArgs(args) {
     if (flag === "--instance-dir") options.instanceDir = value;
     else if (flag === "--business") options.business = value;
     else if (flag === "--script") options.script = value;
+    else if (flag === "--knowledge-base") options.knowledgeBase = value;
     else throw new Error(`configure-bi 未知选项：${flag}`);
   }
   if (!options.instanceDir || !options.business || !options.script) {

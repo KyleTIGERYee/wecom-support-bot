@@ -1,7 +1,5 @@
 {
   "pi": {
-    "binary": "/Users/kyle/.pi-support/bin/pi",
-    "agentDir": "/Users/kyle/.pi-support/agent",
     "provider": "magpie",
     "model": "group/auto-deepseek-v4.1-flash",
     "timeoutMs": 600000,
@@ -13,12 +11,7 @@
       "deep": "max"
     }
   },
-  "roots": {
-    "knowledgeBase": "/Users/kyle/Desktop/PM/信息技术部资产库/知识库",
-    "ajlyCode": "/Users/kyle/Desktop/VIBECODING/ajly",
-    "lzzCode": "/Users/kyle/Desktop/VIBECODING/lezuzu",
-    "images": "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/data/images"
-  },
+  "roots": {},
   "guard": {
     "baseUrl": "http://127.0.0.1:3425/v1",
     "model": "group/auto-deepseek-v4.1-flash",

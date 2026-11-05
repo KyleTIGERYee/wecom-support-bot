@@ -17,7 +17,7 @@ const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const config = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
 const extensionSource = await readFile(join(projectDir, "extensions/bash-whitelist.ts"), "utf8");
 
-const match = extensionSource.match(/const DEFAULT_ROOTS = \[([\s\S]*?)\];/);
+const match = extensionSource.match(/const DEFAULT_ROOTS(?:\s*:\s*string\[\])?\s*=\s*\[([\s\S]*?)\];/);
 if (!match) {
   console.error("未能在扩展里找到 DEFAULT_ROOTS 默认根目录定义");
   process.exit(1);
@@ -36,7 +36,7 @@ if (missingInExtension.length || missingInConfig.length) {
   process.exit(1);
 }
 
-const filesMatch = extensionSource.match(/const DEFAULT_ALLOWED_READ_FILES = \[([\s\S]*?)\];/);
+const filesMatch = extensionSource.match(/const DEFAULT_ALLOWED_READ_FILES(?:\s*:\s*string\[\])?\s*=\s*\[([\s\S]*?)\];/);
 const allowedFiles = filesMatch ? [...filesMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
 const resourceCatalog = createDefaultResourceCatalog(config.roots, projectDir);
 

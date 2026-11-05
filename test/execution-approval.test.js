@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import filesystemWhitelist, { processApprovedToolCall } from "../extensions/bash-whitelist.ts";
 
+const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
+
 async function makeCopyRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "wsb-execution-approval-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -77,6 +79,24 @@ async function loadEnabledApprovalHook(t, { readRoots, writeRoots, protectedRoot
   const extensionUrl = new URL("../extensions/bash-whitelist.ts", import.meta.url);
   extensionLoadSequence += 1;
   extensionUrl.searchParams.set("s13", String(extensionLoadSequence));
+  const { default: loadExtension } = await import(extensionUrl.href);
+  let handler;
+  loadExtension({ on: (eventName, callback) => {
+    if (eventName === "tool_call") handler = callback;
+  } });
+  assert.equal(typeof handler, "function");
+  return handler;
+}
+
+
+/** 默认模式：根目录与项目目录都由环境注入，扩展在导入时读取。 */
+async function loadDefaultModeHook(t, { project = projectDir, roots }) {
+  setEnv(t, "WECOM_BOT_LOCAL_INSTANCE", "0");
+  setEnv(t, "WECOM_BOT_PROJECT_DIR", project);
+  setEnv(t, "WECOM_BOT_ROOTS", JSON.stringify(roots));
+  const extensionUrl = new URL("../extensions/bash-whitelist.ts", import.meta.url);
+  extensionLoadSequence += 1;
+  extensionUrl.searchParams.set("s13-default", String(extensionLoadSequence));
   const { default: loadExtension } = await import(extensionUrl.href);
   let handler;
   loadExtension({ on: (eventName, callback) => {
@@ -579,12 +599,13 @@ test("S13 保护根符号链接别名与悬空 BI 入口 fail-closed，模型 AL
   assert.equal(model.calls.length, 0, "真实路径硬拒绝不能进入模型审批，更不能被 ALLOW 覆盖");
 });
 
-test("S13 Python 选项不能借受信任脚本路径绕过脚本入口硬规则", async () => {
-  let handler;
-  filesystemWhitelist({ on: (eventName, callback) => {
-    if (eventName === "tool_call") handler = callback;
-  } });
-  const trustedScript = "/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki/scripts/bi_query.py";
+test("S13 Python 选项不能借受信任脚本路径绕过脚本入口硬规则", async (t) => {
+  const knowledgeBase = join(await makeCopyRoot(t).then(({ root }) => root), "知识库");
+  const trustedDir = join(knowledgeBase, "数据库/ajly-db-wiki/scripts");
+  await mkdir(trustedDir, { recursive: true });
+  const trustedScript = join(trustedDir, "bi_query.py");
+  await writeFile(trustedScript, "print('ok')\n");
+  const handler = await loadDefaultModeHook(t, { roots: [knowledgeBase] });
 
   const direct = await handler({
     type: "tool_call",
@@ -606,13 +627,11 @@ test("S13 Python 选项不能借受信任脚本路径绕过脚本入口硬规则
   }
 });
 
-test("S13 Node 只接受首个参数直接为受信任脚本路径", async () => {
-  let handler;
-  filesystemWhitelist({ on: (eventName, callback) => {
-    if (eventName === "tool_call") handler = callback;
-  } });
-  const trustedScript = "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js";
-  const untrustedScript = "/Users/kyle/Desktop/VIBECODING/ajly/untrusted.js";
+test("S13 Node 只接受首个参数直接为受信任脚本路径", async (t) => {
+  const { root } = await makeCopyRoot(t);
+  const handler = await loadDefaultModeHook(t, { roots: [root] });
+  const trustedScript = join(projectDir, "scripts/read-evolution.js");
+  const untrustedScript = join(root, "untrusted.js");
 
   const direct = await handler({
     type: "tool_call",
