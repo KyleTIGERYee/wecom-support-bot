@@ -147,7 +147,7 @@ npm run instance -- configure-bi \
   --script /absolute/path/to/知识库/数据库/lzz-db-wiki/scripts/bi_query.py
 
 # 只复制本次列出的来源（逐个列出全部来源即为全量）；workspace 和会话不动
-# 提交成功后上一版才原子替换到 <instance>/snapshots/previous，并报告 localModifications
+# 只在有本地改动时才把上一版留到 <instance>/snapshots/previous，并报告 localModifications
 # 结果里的 notIncluded 列出计划中应同步但本次未复制的来源
 npm run instance -- sync \
   --instance-dir ./instances/team \
@@ -188,7 +188,7 @@ npm run instance -- ask \
 
 本地实例只执行 `instance.json` 的 `trustedDataScripts` 显式登记的 BI 入口；未配置时不会从 `config/default.json` 自动补全，真实查数会明确提示缺少配置。`configure-bi` 会校验业务线、绝对路径、realpath 和文件类型，只接受上述默认业务目录中的真实 `bi_query.py`，拒绝悬空路径、目录、任意副本、环境变量注入以及 context/workspace/project 保护根别名；它不改变 `ready`、资源版本、workspace 或会话状态。
 
-初始化与同步写实例的 `context/` 标准副本与 `data/source-registry.json`（原始来源路径、类型、`--ref` 与登记期复制选项，mode 0600）；问答只读取该副本和独立 `workspace/`；原始目录、GitLab 和主工作区不是运行时来源。同步先构建并校验暂存副本，把当前 `context/` 暂存为 `snapshots/previous.next` 并统计 `localModifications`，再把 context、资源 manifest、实例配置、source registry 与 sync-status 作为一个事务提交，提交成功才把 `previous.next` 原子替换成 `snapshots/previous`；任一步失败都会恢复旧副本和旧状态并丢弃未提交的快照。目录在每次问答/status 时从实际副本重建，源中删除的文件不会残留为目录项。`plan --source` 只接受 registry 中 realpath 精确匹配的原始路径，同名不同路径会报错；同名来源在 `init` / `sync` / `plan` 与 `sync-due` 全部 fail-closed。
+初始化与同步写实例的 `context/` 标准副本与 `data/source-registry.json`（原始来源路径、类型、`--ref` 与登记期复制选项，mode 0600）；问答只读取该副本和独立 `workspace/`；原始目录、GitLab 和主工作区不是运行时来源。同步先构建并校验暂存副本并统计 `localModifications`；有本地改动时把当前 `context/` 暂存为 `snapshots/previous.next`，再把 context、资源 manifest、实例配置、source registry 与 sync-status 作为一个事务提交，提交成功且本次有改动时才把 `previous.next` 原子替换成 `snapshots/previous`（无本地改动不生成快照，已有 `previous` 保持不动）；任一步失败都会恢复旧副本和旧状态并丢弃未提交的快照。`sync-due` 只从原始来源复制作到期来源，未到期且已有副本的来源用硬链接沿用、不读原始来源也不推进 `lastRunAt`；未到期但没有副本时回退为从原始来源复制。手动 `sync` 不沿用，始终全部重新复制。目录在每次问答/status 时从实际副本重建，源中删除的文件不会残留为目录项。`plan --source` 只接受 registry 中 realpath 精确匹配的原始路径，同名不同路径会报错；同名来源在 `init` / `sync` / `plan` 与 `sync-due` 全部 fail-closed。
 
 `--source-type gitlab` 接受本地路径、`file://`、HTTP(S) 与 SSH 仓库，可用 `--ref` 选择分支；`--ref` 写入实例内 `data/source-registry.json`，`sync-due` 按该分支克隆，`status` 会展示。含内嵌 userinfo 的 URL（HTTP(S) 用户名/密码或任何带密码的地址）会被拒绝，不会落盘或回显，请改用无凭据地址或 SSH agent。实现只执行 clone 到临时副本后校验和单向同步，不 push、不回写来源，也不在错误日志中暴露 URL 凭证。HTTP/SSH 自动化验收通过 PATH 中的假 git 完成，真实 GitLab 联网尚未验收。zip 解包和团队打包使用本机已有的 `unzip` / `zip`，不会安装新依赖。
 

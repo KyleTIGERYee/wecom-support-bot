@@ -204,9 +204,9 @@ npm run instance -- sync --instance-dir <dir> \
 
 `weekdays` 对 `every`、`daily`、`weekly` 都生效，非允许日不会到期；`every` + `weekdays` 仍按“上次成功同步 + 间隔”判断，只是周末不触发。`daily` / `weekly` 省略 `--at` 时默认 `09:00`，`weekly` 省略 `--weekdays` 时默认周一；**向用户确认时间，不要默认**。`--at`、`--weekday`、`--weekdays`、`--every-minutes` 不能脱离 `--cadence` 单独使用。
 
-**频率只决定“何时触发一次完整同步”，不是增量同步。** 每次触发都会重建全部 `contextSources` 的整份标准资源副本（未登记来源按 manual 处理，仍会同步）；只有显式 `--disable` 的来源会在下一次同步时移除副本，`removed` 会列出被移除的来源。`manual` 来源不会自己触发，但其他来源触发整包同步时它仍会被同步。
+**频率只决定“何时触发一次同步”，不是增量同步。** 每次 `sync-due` 都按到期集合重建：到期来源从原始路径重新复制；未到期但已有 `context/<slot>-<name>` 副本的来源沿用该副本（硬链接，不读原始来源，结果里 `carried: true`，`lastRunAt` / `lastStatus` 保持原值）；未到期却没有现成副本的来源回退为从原始来源复制，不会丢内容。未登记来源按 manual 处理、永不到期，因此一般走沿用；手动 `sync` 不沿用，始终按给定来源全部重新复制。只有显式 `--disable` 的来源会在下一次同步时移除副本，`removed` 会列出被移除的来源。
 
-每次提交前，当前 `context/` 会先暂存到 `<instance>/snapshots/previous.next/`；只有 `context/`、`instance.json`、`data/source-registry.json` 与 `sync-status.json` 全部提交成功，才把它原子替换成 `snapshots/previous/`（只保留最近一版）。提交失败时删除 `previous.next`，原来的 `previous` 保持不动。同步同时用上次的 `resources.files` / `fileHashes` 与当前副本比对，输出 `previousVersion`、`snapshotPath` 与 `localModifications {added, modified, removed, sample}`（计数与前 10 条样例）。本地修改只报告、不阻塞标准版本覆盖；快照暂存失败会中止本次同步，不会默默丢掉上一版。
+每次提交前，只有本次检测到本地改动（`localModifications.count > 0`）时，当前 `context/` 才会暂存到 `<instance>/snapshots/previous.next/`；只有 `context/`、`instance.json`、`data/source-registry.json` 与 `sync-status.json` 全部提交成功，才把它原子替换成 `snapshots/previous/`（只保留最近一版）。没有本地改动时 `snapshotPath` 为 `null`，不生成快照，已有的 `snapshots/previous` 也保持不动——快照的唯一用途是“覆盖前留住本地改动”。因此无改动时 `snapshotPath` 为 null，但磁盘上可能还留着更早一次生成的 `snapshots/previous`，它不代表本次同步生成了快照。提交失败时删除 `previous.next`，原来的 `previous` 保持不动。同步同时用上次的 `resources.files` / `fileHashes` 与当前副本比对，输出 `previousVersion`、`snapshotPath` 与 `localModifications {added, modified, removed, sample}`（计数与前 10 条样例）；沿用来源在无本地改动时复用上次的文件哈希（不再重读该来源），检测到本地改动时整体重算，两种情况下都参与全局 `version`。硬链接不被文件系统支持时（例如跨设备）回退为逐文件复制，行为一致，只是多一次写入。本地修改只报告、不阻塞标准版本覆盖；快照暂存失败会中止本次同步，不会默默丢掉上一版。
 
 **完成判据**：每个来源都有 `cadence`、`nextDueAt` 和 `lastStatus`。用户已逐项确认频率。
 
@@ -260,7 +260,7 @@ npm run instance -- schedule \
 
 - macOS：生成 `~/Library/LaunchAgents/com.wecom-support-bot.sync.<instanceId前8>.plist`，`StartInterval = tick × 60` 秒，`RunAtLoad = false`，日志写 `<instance>/logs/sync.log`。
 - Linux：生成 `~/.config/systemd/user/com.wecom-support-bot.sync.<instanceId前8>.service` 与 `.timer`，`OnBootSec=1min`、`OnActiveSec=1min`、`OnUnitActiveSec=<tick>min`、`Persistent=true`，全新安装后即生效。
-- 调度器每隔 `tick` 分钟运行一次 `sync-due`；`sync-due` 再按每个来源的 `cadence` 判断是否到期。到期时对全部未禁用来源做一次完整事务同步。
+- 调度器每隔 `tick` 分钟运行一次 `sync-due`；`sync-due` 再按每个来源的 `cadence` 判断是否到期。到期时做一次事务同步：到期来源重新复制，未到期且有副本的来源硬链接沿用，未到期且缺副本的来源回退复制。
 - 有锁 `data/sync.lock` 防止重叠执行；拿不到锁的进程直接返回 `locked: true`，不排队。
 
 **不可跳过的同意步骤**：`schedule` 默认就是 dry-run。必须先把 dry-run 输出的单元路径与系统命令完整展示给用户，取得明确同意后才能安装或卸载；`--install` 与 `--uninstall` 都必须显式加 `--yes`，缺少 `--yes` 时命令会打印将要写入的文件与将要执行的系统命令，并以非零状态退出，明确提示“需要用户明确同意后加 --yes”。
@@ -285,11 +285,11 @@ npm run instance -- schedule --instance-dir /absolute/path/to/instance --uninsta
 逐项真实执行，不许只看配置文件：
 
 1. **初始化检查**：重看 `init` 输出的 `checks`。`error` / `skipped` 逐项列出原因。
-2. **实例状态**：`npm run instance -- status --instance-dir <dir>`。检查 `ready`、`resources.consistent`、`loadFailures` 为空、`syncPlan.nextSyncAt`，以及每个来源的 `lastRunAt` / `lastSyncStatus`；同时核对每个来源的 `excludedSensitive`（文件名与总数）与 `ref`，以及顶层的 `previousVersion`、`snapshotPath`。本地改动分两个字段看：`localModifications` 是当前副本相对已同步基线的实时漂移，`lastSyncLocalModifications` 是上一次同步当时的报告（与 `sync-status.json` 一致）；同步完成后实时的 `localModifications` 归零、`lastSyncLocalModifications` 保留被覆盖前的计数，验收时要分别核对，不能把二者当成同一个数。
+2. **实例状态**：`npm run instance -- status --instance-dir <dir>`。检查 `ready`、`resources.consistent`、`loadFailures` 为空、`syncPlan.nextSyncAt`，以及每个来源的 `lastRunAt` / `lastSyncStatus`；同时核对每个来源的 `excludedSensitive`（文件名与总数）与 `ref`，以及顶层的 `previousVersion`、`snapshotPath`。本地改动分两个字段看：`localModifications` 是当前副本相对已同步基线的实时漂移，`lastSyncLocalModifications` 是上一次同步当时的报告（与 `sync-status.json` 一致）；同步完成后实时 `localModifications` 归零（沿用来源若被本地改过，其内容会被带入新基线并整体重算哈希，因此同样归零），`lastSyncLocalModifications` 保留被覆盖前的计数。验收时要分别核对，不能把二者当成同一个数。
 3. **概念问答**：用 `instance ask` 问一个该来源能回答的业务概念题，记录真实回答；回答不出或资料不足也要如实记录。
 4. **查数问答**：配置了 BI 才执行；未配置写 `skipped`。
 5. **workspace 产物与审批拒绝**：以 `init` 的 `executionApproval` 检查为证据（获批的 workspace 写入 + 越界写入被硬规则拒绝）。该项失败或未执行时，验收写 `failed` / `skipped`。
-6. **定时同步**：dry-run 内容与 `syncPlan` 对照；已安装则跑一次 `sync-due` 或等待 tick，确认 `lastStatus`、`nextDueAt` 更新，并检查本次同步的 `snapshotPath` 下确有上一版内容。
+6. **定时同步**：dry-run 内容与 `syncPlan` 对照；已安装则跑一次 `sync-due` 或等待 tick，确认 `lastStatus`、`nextDueAt` 更新。有本地改动时检查本次同步的 `snapshotPath` 下确有上一版内容；没有本地改动时 `snapshotPath` 为 `null`、`snapshots/previous` 保持原样。未到期来源应显示 `carried: true`，且原始来源被移动或删除也不影响同步。
 
 ```bash
 npm run instance -- ask \
@@ -315,7 +315,7 @@ npm run instance -- ask \
 | 模型检查 | `ok` / `failed` / `skipped` | `init` 的 `checks` | |
 | BI | `ok` / `skipped` | 步骤 7 输出 | |
 | 定时任务 | 已安装 / `skipped` | 单元路径与命令输出 | |
-| 上一版快照与本地修改 | `snapshotPath`、`lastSyncLocalModifications` 计数、实时 `localModifications` | `sync-status.json` / `status` | |
+| 上一版快照与本地修改 | `snapshotPath`（无本地改动时为 `null`）、`lastSyncLocalModifications` 计数、实时 `localModifications` | `sync-status.json` / `status` | |
 | 验收问答 | 真实回答摘要 | `ask` 输出 | |
 | 敏感文件与软链 | 数量、文件名、根外软链 | `inventory` / `status` | |
 
@@ -386,4 +386,4 @@ npm run instance -- export --instance-dir <dir> --output <zip>
 
 `init` / `sync`（逐来源，跟在对应 `--source` 之后）与 `plan` 使用同一组 `--exclude` / `--clear-excludes` / `--symlinks` 语义，所以盘点得到的 `files` / `bytes` 就是实际将复制的量。`inventory` 接受同一套 `--exclude` / `--symlinks`，但它只是只读盘点、没有持久化状态，因此不提供 `--clear-excludes`。`schedule` 的 `--dry-run` 与默认行为完全等价（不指定 `--install` / `--uninstall` 时本来就只生成、不落盘），保留它是为了让显式意图可读。
 
-`sync` 是手动同步：只复制本次 `--source` 指定的来源（逐个列出全部来源即为全量）；`sync-due` 是定时计划入口，按全部未禁用来源整包重建。两者共用同一条暂存、校验、快照与事务提交管线，只在同一事务里更新 `context/` 标准副本、`instance.json`、`data/source-registry.json`、`sync-status.json` 与 `snapshots/previous/`，不碰 `workspace/`、会话状态或收件箱。手动 `sync` 不更新计划里的 `lastRunAt`，下一次 tick 仍按原计划判断是否到期。`sync` 结果里的 `notIncluded` 列出计划中应同步、但本次没有复制的来源：要么改用全量（把所有来源都列进 `sync`），要么同步调整计划（例如对不再需要的来源执行 `plan --disable`），否则 `sync-due` 会报这些来源 due 却永远不会复制它们。
+`sync` 是手动同步：只复制本次 `--source` 指定的来源（逐个列出全部来源即为全量），并且始终从原始来源重新复制、不沿用副本；`sync-due` 是定时计划入口，只从原始来源复制作到期来源，未到期且已有副本的来源沿用实例内副本。两者共用同一条暂存、校验、快照与事务提交管线，只在同一事务里更新 `context/` 标准副本、`instance.json`、`data/source-registry.json`、`sync-status.json` 与 `snapshots/previous/`（有本地改动才生成快照），不碰 `workspace/`、会话状态或收件箱。手动 `sync` 不更新计划里的 `lastRunAt`，下一次 tick 仍按原计划判断是否到期；`sync-due` 也不推进沿用来源的 `lastRunAt` / `lastStatus`，只推进真正到期或回退复制的来源。`sync` 结果里的 `notIncluded` 列出计划中应同步、但本次没有复制的来源：要么改用全量（把所有来源都列进 `sync`），要么同步调整计划（例如对不再需要的来源执行 `plan --disable`），否则 `sync-due` 会报这些来源 due 却永远不会复制它们。

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { execFile } from "node:child_process";
-import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, cp, link, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -221,6 +221,8 @@ async function syncDue(args) {
   let enabled = plan.sources.filter((entry) => entry.enabled !== false);
   let due = enabled.filter((entry) => isDue(entry.cadence, entry.lastRunAt, now));
   let sourceSet = buildSyncDueSourceSet(saved, plan, registry);
+  await markCarriedSources(instanceDir, saved, sourceSet.sources, due);
+  assertUniqueSourceNameList(sourceSet.sources);
   await assertNoDuplicateSourceNames(sourceSet.sources);
   if (options.dryRun) {
     const view = buildPlanView(saved, now);
@@ -265,12 +267,14 @@ async function syncDue(args) {
     enabled = plan.sources.filter((entry) => entry.enabled !== false);
     due = enabled.filter((entry) => isDue(entry.cadence, entry.lastRunAt, now));
     sourceSet = buildSyncDueSourceSet(saved, plan, registry);
+    await markCarriedSources(instanceDir, saved, sourceSet.sources, due);
+    assertUniqueSourceNameList(sourceSet.sources);
     await assertNoDuplicateSourceNames(sourceSet.sources);
     if (due.length === 0) {
       process.stdout.write(`${JSON.stringify({ ran: false, checkedAt: now.toISOString(), due: [], removed: [] })}\n`);
       return;
     }
-    const syncedNames = new Set(sourceSet.sources.map((source) => source.name));
+    const syncedNames = new Set(sourcesToRead(sourceSet.sources).map((source) => source.name));
     const outcome = await runSyncOnce({
       instanceDir,
       sources: sourceSet.sources,
@@ -339,6 +343,102 @@ function buildSyncDueSourceSet(saved, plan, registry = {}) {
     });
   });
   return { sources, removed };
+}
+
+/**
+ * 未到期来源沿用实例内已有副本：只检查 context/<slot>-<name>，绝不读原始来源。
+ * 标记为 carried 的来源在复制阶段硬链接，不重新从原始路径复制。
+ * 没有现成副本（或副本为空）的来源保持原样，仍按到期处理从原始来源复制。
+ *
+ * @param {string} instanceDir
+ * @param {any} saved
+ * @param {any[]} sources
+ * @param {any[]} due
+ */
+async function markCarriedSources(instanceDir, saved, sources, due) {
+  const dueNames = new Set((Array.isArray(due) ? due : []).map((entry) => entry.name));
+  const known = new Map(
+    (Array.isArray(saved.contextSources) ? saved.contextSources : [])
+      .filter((source) => typeof source?.name === "string" && source.status === "ok" && typeof source.localPath === "string")
+      .map((source) => [source.name, source.localPath]),
+  );
+  for (const source of sources) {
+    if (dueNames.has(source.name)) continue;
+    const localPath = known.get(source.name) ?? join("context", `${String(source.slot).padStart(3, "0")}-${source.name}`);
+    if (await hasUsableContextCopy(instanceDir, localPath)) source.carried = localPath;
+  }
+}
+
+/** @param {string} instanceDir @param {string} localPath */
+async function hasUsableContextCopy(instanceDir, localPath) {
+  const target = join(instanceDir, localPath);
+  try {
+    const info = await stat(target);
+    if (info.isFile()) return true;
+    if (!info.isDirectory()) return false;
+    return (await listLocalFiles(target)).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** 沿用来源不读原始路径，因此不参与基于真实路径的来源查重。 @param {any[]} sources */
+function sourcesToRead(sources) {
+  return sources.filter((source) => typeof source?.carried !== "string");
+}
+
+/**
+ * 名称唯一性对全部来源生效：沿用来源不读原始路径，但仍不能借“沿用”绕过重复名检查。
+ * @param {any[]} sources
+ */
+function assertUniqueSourceNameList(sources) {
+  const seen = new Set();
+  for (const source of Array.isArray(sources) ? sources : []) {
+    const name = typeof source?.name === "string" ? source.name : "";
+    if (!name) continue;
+    if (seen.has(name)) throw new Error(`来源名称重复，同一实例内来源名必须唯一：${name}`);
+    seen.add(name);
+  }
+}
+
+/**
+ * 把实例内已有副本硬链接进暂存目录。硬链接与复制内容一致，但提交后删除旧 context
+ * 只减少一个链接，新副本仍然有效；跨设备或链接失败时回退为复制文件。
+ *
+ * @param {{instanceDir: string, stagingDir: string, localPath: string}} options
+ */
+async function carryExistingSource({ instanceDir, stagingDir, localPath }) {
+  const sourcePath = join(instanceDir, localPath);
+  const targetPath = join(stagingDir, localPath);
+  const info = await stat(sourcePath);
+  if (info.isFile()) {
+    await mkdir(dirname(targetPath), { recursive: true });
+    await linkOrCopyFile(sourcePath, targetPath);
+    return;
+  }
+  await linkOrCopyTree(sourcePath, targetPath);
+}
+
+/** @param {string} sourcePath @param {string} targetPath */
+async function linkOrCopyTree(sourcePath, targetPath) {
+  await mkdir(targetPath, { recursive: true });
+  const entries = await readdir(sourcePath, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const from = join(sourcePath, entry.name);
+    const to = join(targetPath, entry.name);
+    if (entry.isDirectory()) await linkOrCopyTree(from, to);
+    else if (entry.isFile()) await linkOrCopyFile(from, to);
+  }
+}
+
+/** @param {string} sourcePath @param {string} targetPath */
+async function linkOrCopyFile(sourcePath, targetPath) {
+  try {
+    await link(sourcePath, targetPath);
+  } catch {
+    await copyFile(sourcePath, targetPath);
+  }
 }
 
 async function schedule(args) {
@@ -984,8 +1084,8 @@ function notIncludedSources(saved, result) {
 }
 
 /**
- * sync 与 sync-due 共用的完整同步管线：暂存复制 → 校验 → 生成资源清单 →
- * 留存上一版快照并统计本地修改 → 事务提交。
+ * sync 与 sync-due 共用的完整同步管线：暂存复制 → 校验 → 统计本地修改 →
+ * 生成资源清单与版本（无本地改动时复用旧哈希）→ 有改动才留存快照 → 事务提交。
  *
  * @param {{
  *   instanceDir: string,
@@ -1025,6 +1125,7 @@ async function runSyncOnce({
       sources,
       template: saved.instance?.template,
       existingSources,
+      previousSources: Array.isArray(saved.contextSources) ? saved.contextSources : [],
     });
     const contextSources = copied.contextSources;
     copiedSources = contextSources;
@@ -1033,10 +1134,17 @@ async function runSyncOnce({
       throw new Error(failed?.reason ?? "同步至少需要一个可读取的标准资源来源");
     }
     const syncedAt = now.toISOString();
-    const version = await hashSources(stagingDir, contextSources);
+    const localModifications = await detectLocalModifications(instanceDir, saved);
+    // 副本被本地改过时不能复用旧哈希，否则基线僵化：之后每次都误报“有改动”并反复写快照。
+    const manifest = await manifestHashes(
+      stagingDir,
+      contextSources,
+      saved.resources?.fileHashes,
+      localModifications.count === 0,
+    );
+    const version = await hashSources(stagingDir, contextSources, manifest.fileHashes);
     for (const source of contextSources) source.version = version;
     await createLocalResourceCatalog(stagingDir, contextSources, syncedAt);
-    const manifest = await manifestHashes(stagingDir, contextSources);
     const resources = {
       version,
       catalogVersion: version,
@@ -1044,9 +1152,9 @@ async function runSyncOnce({
       files: manifest.files,
       fileHashes: manifest.fileHashes,
     };
-    const localModifications = await detectLocalModifications(instanceDir, saved);
     const previousVersion = saved.resources?.version ?? null;
-    const snapshotStaged = await stagePreviousContext(instanceDir);
+    // 快照只为“覆盖前留住本地改动”：没有本地改动就不生成，已有 previous 保持不动。
+    const snapshotStaged = localModifications.count > 0 ? await stagePreviousContext(instanceDir) : false;
     const snapshotPath = snapshotStaged ? join(instanceDir, "snapshots/previous") : null;
     const mergedContextSources = preserveDisabled
       ? mergePreservedSources(saved.contextSources, contextSources, plan)
@@ -1220,11 +1328,27 @@ async function stagePreviousContext(instanceDir) {
   return true;
 }
 
-/** @param {string} rootDir @param {any[]} sources */
-async function manifestHashes(rootDir, sources) {
+/**
+ * 资源清单与其逐文件 sha256。副本没有任何本地改动时，沿用来源直接复用旧哈希，省掉重读；
+ * 一旦检测到本地改动就整体重算，避免基线僵化——否则之后每次同步都会误报“有改动”并反复写快照。
+ *
+ * @param {string} rootDir
+ * @param {any[]} sources
+ * @param {Record<string, string> | null | undefined} [previousHashes]
+ * @param {boolean} [reuseCarried]
+ */
+async function manifestHashes(rootDir, sources, previousHashes = null, reuseCarried = false) {
   const files = await resourceManifest(rootDir, sources);
+  const carriedPaths = (Array.isArray(sources) ? sources : [])
+    .filter((source) => source?.status === "ok" && source.carried === true && typeof source.localPath === "string")
+    .map((source) => source.localPath);
   const fileHashes = {};
   for (const file of files) {
+    const carried = reuseCarried && carriedPaths.some((localPath) => file === localPath || file.startsWith(`${localPath}/`));
+    if (carried && typeof previousHashes?.[file] === "string") {
+      fileHashes[file] = previousHashes[file];
+      continue;
+    }
     fileHashes[file] = await hashFile(resolve(rootDir, file));
   }
   return { files, fileHashes };
@@ -1591,12 +1715,40 @@ async function sameSourcePath(left, right) {
   }
 }
 
-async function copySources({ instanceDir, stagingDir, sources, template, existingSources = [] }) {
-  await assertNoDuplicateSourceNames(sources, template, existingSources);
+/**
+ * @param {{instanceDir: string, stagingDir: string, sources: any[], template?: string, existingSources?: {name?: string, path?: string}[], previousSources?: any[]}} options
+ */
+async function copySources({ instanceDir, stagingDir, sources, template, existingSources = [], previousSources = [] }) {
+  await assertNoDuplicateSourceNames(sourcesToRead(sources), template, existingSources);
   const contextSources = [];
   /** @type {{name: string, path: string, type?: string, ref?: string}[]} */
   const registry = [];
   for (const [index, source] of sources.entries()) {
+    // 沿用来源只用实例内副本，不解析也不读取原始路径。
+    if (typeof source?.carried === "string") {
+      const previousEntry = previousSources.find((entry) => entry?.name === source.name) ?? null;
+      const previous = previousEntry?.status === "ok" ? previousEntry : {};
+      try {
+        await carryExistingSource({ instanceDir, stagingDir, localPath: source.carried });
+        contextSources.push({
+          ...previous,
+          name: source.name,
+          type: source.type ?? previous.type ?? "auto",
+          scope: source.scope ?? previous.scope,
+          localPath: source.carried,
+          status: "ok",
+          carried: true,
+        });
+      } catch (error) {
+        contextSources.push({
+          name: source.name,
+          scope: source.scope,
+          status: "error",
+          reason: `沿用已有副本失败：${redactSourceCredentials(error?.message ?? error)}`,
+        });
+      }
+      continue;
+    }
     const rawPath = typeof source?.path === "string" ? source.path : "";
     if (rawPath.trim() === "") {
       contextSources.push({
@@ -2162,29 +2314,39 @@ async function commitContext({ instanceDir, stagingDir, config, lastSync = null,
   await rm(stagingDir, { recursive: true, force: true });
 }
 
-async function hashSources(rootDir, sources) {
+/**
+ * 全局版本：对每个文件取 sha256 再按路径汇总。分离出逐文件哈希后，同步时可以把
+ * 已经算好的清单哈希直接喂进来，避免为了算版本再把几 GB 文件重读一遍。
+ *
+ * @param {string} rootDir
+ * @param {any[]} sources
+ * @param {Record<string, string> | null} [knownHashes] 形如 `context/001-xxx/a.md` → sha256
+ */
+async function hashSources(rootDir, sources, knownHashes = null) {
   const okSources = sources.filter((source) => source.status === "ok" && source.localPath);
   if (okSources.length === 0) return null;
   const hash = createHash("sha256");
   for (const source of okSources) {
     hash.update(`${source.name}\0${source.scope}\0${source.localPath}\0`);
-    await hashPath(resolve(rootDir, source.localPath), "", hash);
+    await hashPath(resolve(rootDir, source.localPath), "", hash, knownHashes, source.localPath);
   }
   return hash.digest("hex");
 }
 
-async function hashPath(path, prefix, hash) {
+async function hashPath(path, prefix, hash, knownHashes = null, keyPrefix = "") {
   const info = await stat(path);
   if (info.isFile()) {
-    hash.update(`${prefix || basename(path)}\0`);
-    hash.update(await readFile(path));
+    const relative = prefix || basename(path);
+    hash.update(`${relative}\0`);
+    const known = knownHashes?.[keyPrefix ? `${keyPrefix}/${relative}` : relative];
+    hash.update(known ?? (await hashFile(path)));
     hash.update("\0");
     return;
   }
   const entries = await readdir(path, { withFileTypes: true });
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
     if (entry.isSymbolicLink()) continue;
-    await hashPath(join(path, entry.name), prefix ? join(prefix, entry.name) : entry.name, hash);
+    await hashPath(join(path, entry.name), prefix ? join(prefix, entry.name) : entry.name, hash, knownHashes, keyPrefix);
   }
 }
 

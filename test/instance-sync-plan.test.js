@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
@@ -195,18 +196,22 @@ test("sync-due dry-run 不写盘，到期时整包同步且不丢未登记来源
   assert.equal(saved.contextSources.length, 3);
   assert.equal(saved.syncPlan.sources[0].lastRunAt, dryRunAt);
   assert.equal(saved.syncPlan.sources[0].lastStatus, "ok");
-  assert.equal(saved.syncPlan.sources[1].lastRunAt, dryRunAt);
+  // manual 来源未到期：沿用已有副本，计划时间与状态保持原值。
+  assert.equal(saved.syncPlan.sources[1].lastRunAt, null);
+  assert.equal(saved.syncPlan.sources[1].lastStatus, null);
   assert.equal(saved.syncPlan.sources[1].cadence.kind, "manual");
   // 未登记来源的原始路径只进 data/source-registry.json，不落进 instance.json。
   assert.equal("path" in saved.syncPlan.sources[1], false);
   assert.equal("type" in saved.syncPlan.sources[1], false);
   assert.equal(JSON.stringify(saved).includes(sourceB), false);
 
+  // B 未到期：沿用已有副本，即使原始来源内容变了也不读取。
   await writeFile(join(sourceB, "note.md"), "B2\n");
   const second = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 2)]);
   assert.equal(second.ran, true);
   assert.deepEqual(second.due, ["source-a"]);
-  assert.equal(await readFile(join(instanceDir, "context/002-source-b/note.md"), "utf8"), "B2\n");
+  assert.equal(await readFile(join(instanceDir, "context/002-source-b/note.md"), "utf8"), "source-b\n");
+  assert.equal(second.contextSources.find((source) => source.name === "source-b").carried, true);
 
   const sameTime = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 2)]);
   assert.equal(sameTime.ran, false);
@@ -258,9 +263,10 @@ test("同步前留存上一版快照并报告本地修改，随后仍以标准�
   const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
   assert.equal(first.status, "ok");
   assert.equal(first.previousVersion, version);
-  assert.match(first.snapshotPath, /snapshots\/previous$/);
+  // 没有本地改动时不留“上一版”：这份副本与当前内容相同，没有可回滚的东西。
+  assert.equal(first.snapshotPath, null);
   assert.deepEqual(first.localModifications, { count: 0, added: 0, modified: 0, removed: 0, sample: [] });
-  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "source-a\n");
+  assert.equal(existsSync(join(instanceDir, "snapshots/previous")), false);
 
   await writeFile(join(instanceDir, "context/001-source-a/note.md"), "LOCAL EDIT\n");
   await writeFile(join(instanceDir, "context/001-source-a/extra.md"), "LOCAL NEW\n");
@@ -300,12 +306,13 @@ test("同步前留存上一版快照并报告本地修改，随后仍以标准�
   assert.equal(status.snapshotPath, second.snapshotPath);
   assert.equal(status.previousVersion, first.version);
 
-  // 第三次同步只保留最近一版 previous：快照应等于第二次提交后的标准副本。
+  // 第三次同步没有本地改动：不生成新快照，已有 previous 保持不动。
   const third = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 4)]);
   assert.equal(third.status, "ok");
   assert.deepEqual(third.localModifications, { count: 0, added: 0, modified: 0, removed: 0, sample: [] });
-  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "source-a\n");
-  assert.equal(await readFile(join(instanceDir, "snapshots/previous/002-source-b/note.md"), "utf8"), "source-b\n");
+  assert.equal(third.snapshotPath, null);
+  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "LOCAL EDIT\n");
+  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/extra.md"), "utf8"), "LOCAL NEW\n");
 });
 
 test("快照失败会阻止同步且不覆盖当前副本", async (t) => {
@@ -334,7 +341,9 @@ test("快照失败会阻止同步且不覆盖当前副本", async (t) => {
 test("失败原因取第一个非 ok 来源，而不是列表第一项", async (t) => {
   const { instanceDir, sources } = await createInstanceWithSources(t, ["source-a", "source-b", "source-c"]);
   await runCli(planArgs(instanceDir, sources["source-a"], ["--cadence", "daily", "--at", "09:00"]));
+  // 原始来源与副本都不存在：未到期的 source-b 没有可沿用的副本，只能回退读取原始来源并失败。
   await rm(sources["source-b"], { recursive: true, force: true });
+  await rm(join(instanceDir, "context/002-source-b"), { recursive: true, force: true });
 
   const failed = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)], {
     allowFailure: true,
@@ -958,10 +967,16 @@ test("提交失败时保留旧的上一版快照并清掉未提交的 previous.n
   await runCli(planArgs(instanceDir, sourceA, ["--cadence", "every", "--every-minutes", "1"]));
   const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
   assert.equal(first.status, "ok");
-  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "source-a\n");
+  assert.equal(first.snapshotPath, null);
+
+  // 先制造一次本地改动并成功同步，才会产生上一版快照。
+  await writeFile(join(instanceDir, "context/001-source-a/note.md"), "LOCAL EDIT\n");
+  const second = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 1)]);
+  assert.equal(second.status, "ok");
+  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "LOCAL EDIT\n");
 
   await writeFile(join(sourceA, "note.md"), "A2\n");
-  await writeFile(join(instanceDir, "context/001-source-a/note.md"), "LOCAL EDIT\n");
+  await writeFile(join(instanceDir, "context/001-source-a/note.md"), "LOCAL EDIT 2\n");
   const failed = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 2)], {
     allowFailure: true,
     env: { ...process.env, WECOM_BOT_TEST_FAIL_SYNC_STATUS_COMMIT: "1" },
@@ -969,9 +984,9 @@ test("提交失败时保留旧的上一版快照并清掉未提交的 previous.n
   assert.equal(failed.ran, true);
   assert.equal(failed.status, "error");
   // 上一版快照没有被新副本覆盖，也没有留下未提交的半成品。
-  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "source-a\n");
+  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "LOCAL EDIT\n");
   assert.equal(existsSync(join(instanceDir, "snapshots/previous.next")), false);
-  assert.equal(await readFile(join(instanceDir, "context/001-source-a/note.md"), "utf8"), "LOCAL EDIT\n");
+  assert.equal(await readFile(join(instanceDir, "context/001-source-a/note.md"), "utf8"), "LOCAL EDIT 2\n");
   const syncStatus = JSON.parse(await readFile(join(instanceDir, "sync-status.json"), "utf8"));
   assert.equal(syncStatus.status, "ok");
 });
@@ -1138,4 +1153,174 @@ test("旧实例没有 source-registry 时仍能重新同步并完成首次登记
   const registry = JSON.parse(await readFile(join(instanceDir, "data/source-registry.json"), "utf8"));
   assert.ok(registry.sources["source-a"]?.path);
   assert.equal(await readFile(join(instanceDir, "context/001-source-a/note.md"), "utf8"), "source-a\n");
+});
+
+test("sync-due 未到期来源沿用已有副本，原始来源不可读也不失败", async (t) => {
+  const { instanceDir, sources } = await createInstanceWithSources(t, ["source-a", "source-b"]);
+  const sourceA = sources["source-a"];
+  const sourceB = sources["source-b"];
+  await runCli(planArgs(instanceDir, sourceA, ["--cadence", "daily", "--at", "09:00"]));
+  await runCli(planArgs(instanceDir, sourceB, ["--cadence", "weekly", "--weekdays", "1", "--at", "09:00"]));
+
+  const firstRunAt = localIso(2026, 11, 5, 10, 0);
+  const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", firstRunAt]);
+  assert.equal(first.status, "ok");
+  assert.deepEqual(first.due, ["source-a"]);
+  assert.equal(first.contextSources.find((source) => source.name === "source-b").carried, true);
+  assert.equal(first.contextSources.find((source) => source.name === "source-a").carried, undefined);
+
+  // 原始来源整个删除：未到期的 B 不应被读取，也不能让同步失败。
+  await rm(sourceB, { recursive: true, force: true });
+  await writeFile(join(sourceA, "note.md"), "A2\n");
+  const carriedBefore = await stat(join(instanceDir, "context/002-source-b/note.md"));
+  const secondRunAt = localIso(2026, 11, 6, 10, 0);
+  const second = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", secondRunAt]);
+  assert.equal(second.status, "ok");
+  assert.deepEqual(second.due, ["source-a"]);
+  assert.equal(await readFile(join(instanceDir, "context/001-source-a/note.md"), "utf8"), "A2\n");
+  assert.equal(await readFile(join(instanceDir, "context/002-source-b/note.md"), "utf8"), "source-b\n");
+  // 沿用走硬链接：inode 不变说明没有发生复制；提交删除旧 context 后仍可读。
+  assert.equal((await stat(join(instanceDir, "context/002-source-b/note.md"))).ino, carriedBefore.ino);
+  assert.equal(second.contextSources.find((source) => source.name === "source-b").carried, true);
+
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  const planB = saved.syncPlan.sources.find((entry) => entry.name === "source-b");
+  assert.equal(planB.lastRunAt, null);
+  assert.equal(planB.lastStatus, null);
+  assert.equal(saved.syncPlan.sources.find((entry) => entry.name === "source-a").lastRunAt, secondRunAt);
+
+  const status = await runCli(["status", "--instance-dir", instanceDir]);
+  assert.equal(status.loadFailures.length, 0);
+});
+
+test("未到期来源缺少上下文副本时回退为从原始来源复制", async (t) => {
+  const { instanceDir, sources } = await createInstanceWithSources(t, ["source-a", "source-b"]);
+  const sourceA = sources["source-a"];
+  const sourceB = sources["source-b"];
+  await runCli(planArgs(instanceDir, sourceA, ["--cadence", "daily", "--at", "09:00"]));
+  await runCli(planArgs(instanceDir, sourceB, ["--cadence", "weekly", "--weekdays", "1", "--at", "09:00"]));
+
+  const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
+  assert.equal(first.contextSources.find((source) => source.name === "source-b").carried, true);
+
+  await rm(join(instanceDir, "context/002-source-b"), { recursive: true, force: true });
+  await writeFile(join(sourceB, "note.md"), "B2\n");
+  const secondRunAt = localIso(2026, 11, 6, 10, 0);
+  const second = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", secondRunAt]);
+  assert.equal(second.status, "ok");
+  assert.equal(await readFile(join(instanceDir, "context/002-source-b/note.md"), "utf8"), "B2\n");
+  const secondB = second.contextSources.find((source) => source.name === "source-b");
+  assert.equal(secondB.carried, undefined);
+
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.equal(saved.syncPlan.sources.find((entry) => entry.name === "source-b").lastRunAt, secondRunAt);
+});
+
+test("没有本地改动时不生成快照，也不覆盖已有上一版", async (t) => {
+  const { instanceDir, sourceA, version } = await createInstance(t);
+  await runCli(planArgs(instanceDir, sourceA, ["--cadence", "daily", "--at", "09:00"]));
+
+  const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
+  assert.equal(first.status, "ok");
+  assert.equal(first.previousVersion, version);
+  assert.equal(first.snapshotPath, null);
+  assert.equal(existsSync(join(instanceDir, "snapshots/previous")), false);
+
+  await writeFile(join(instanceDir, "context/001-source-a/note.md"), "LOCAL EDIT\n");
+  const second = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 6, 10, 0)]);
+  assert.equal(second.status, "ok");
+  assert.equal(second.snapshotPath, join(instanceDir, "snapshots/previous"));
+  assert.equal(second.localModifications.count, 1);
+  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "LOCAL EDIT\n");
+
+  const third = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 7, 10, 0)]);
+  assert.equal(third.status, "ok");
+  assert.deepEqual(third.localModifications, { count: 0, added: 0, modified: 0, removed: 0, sample: [] });
+  assert.equal(third.snapshotPath, null);
+  assert.equal(third.previousVersion, second.version);
+  // 没有本地改动时保留已有上一版不动，而不是用一份相同的副本覆盖它。
+  assert.equal(await readFile(join(instanceDir, "snapshots/previous/001-source-a/note.md"), "utf8"), "LOCAL EDIT\n");
+  const syncStatus = JSON.parse(await readFile(join(instanceDir, "sync-status.json"), "utf8"));
+  assert.equal(syncStatus.snapshotPath, null);
+  assert.equal(syncStatus.previousVersion, second.version);
+});
+
+test("沿用来源复用上次文件哈希：原始来源改了也不影响未到期副本和版本", async (t) => {
+  const { instanceDir, sources } = await createInstanceWithSources(t, ["source-a", "source-b"]);
+  const sourceA = sources["source-a"];
+  const sourceB = sources["source-b"];
+  await runCli(planArgs(instanceDir, sourceA, ["--cadence", "daily", "--at", "09:00"]));
+  await runCli(planArgs(instanceDir, sourceB, ["--cadence", "weekly", "--weekdays", "1", "--at", "09:00"]));
+
+  const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
+  assert.equal(first.contextSources.find((source) => source.name === "source-b").carried, true);
+  const firstSaved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+
+  // 只改 B 的原始来源，不动它的副本；B 未到期，因此既不该被读取，也不该影响版本。
+  await writeFile(join(sourceB, "note.md"), "B-SOURCE-CHANGED\n");
+  const second = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 6, 10, 0)]);
+  assert.equal(second.status, "ok");
+  assert.equal(second.version, first.version);
+  assert.equal(
+    second.contextSources.find((source) => source.name === "source-b").carried,
+    true,
+  );
+  assert.equal(await readFile(join(instanceDir, "context/002-source-b/note.md"), "utf8"), "source-b\n");
+  const secondSaved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.equal(
+    secondSaved.resources.fileHashes["context/002-source-b/note.md"],
+    firstSaved.resources.fileHashes["context/002-source-b/note.md"],
+  );
+});
+
+test("副本有本地改动时不复用旧哈希，基线随实际内容更新", async (t) => {
+  const { instanceDir, sources } = await createInstanceWithSources(t, ["source-a", "source-b"]);
+  const sourceA = sources["source-a"];
+  const sourceB = sources["source-b"];
+  await runCli(planArgs(instanceDir, sourceA, ["--cadence", "daily", "--at", "09:00"]));
+  await runCli(planArgs(instanceDir, sourceB, ["--cadence", "weekly", "--weekdays", "1", "--at", "09:00"]));
+  await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
+
+  await writeFile(join(instanceDir, "context/002-source-b/note.md"), "LOCAL EDIT\n");
+  const synced = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 6, 10, 0)]);
+  assert.equal(synced.status, "ok");
+  assert.ok(synced.localModifications.count >= 1);
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  const expected = createHash("sha256").update("LOCAL EDIT\n").digest("hex");
+  assert.equal(saved.resources.fileHashes["context/002-source-b/note.md"], expected);
+
+  // 基线已与实际内容一致，下一次同步不应再报本地改动，也不该写快照。
+  const next = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 7, 10, 0)]);
+  assert.equal(next.localModifications.count, 0);
+  assert.equal(next.snapshotPath, null);
+});
+
+test("手动 sync 不沿用副本：未到期来源仍从原始来源重新复制", async (t) => {
+  const { instanceDir, sources } = await createInstanceWithSources(t, ["source-a", "source-b"]);
+  const sourceA = sources["source-a"];
+  const sourceB = sources["source-b"];
+  await runCli(planArgs(instanceDir, sourceA, ["--cadence", "daily", "--at", "09:00"]));
+  await runCli(planArgs(instanceDir, sourceB, ["--cadence", "weekly", "--weekdays", "1", "--at", "09:00"]));
+  const first = await runCli(["sync-due", "--instance-dir", instanceDir, "--now", localIso(2026, 11, 5, 10, 0)]);
+  assert.equal(first.contextSources.find((source) => source.name === "source-b").carried, true);
+
+  await writeFile(join(sourceB, "note.md"), "B2\n");
+  const manual = await runCli([
+    "sync",
+    "--instance-dir",
+    instanceDir,
+    "--source",
+    sourceA,
+    "--scope",
+    "shared",
+    "--source",
+    sourceB,
+    "--scope",
+    "shared",
+  ]);
+  assert.equal(manual.status, "ok");
+  assert.equal(await readFile(join(instanceDir, "context/002-source-b/note.md"), "utf8"), "B2\n");
+  assert.equal(manual.contextSources.find((source) => source.name === "source-b").carried, undefined);
+  const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
+  assert.equal(saved.syncPlan.sources.find((entry) => entry.name === "source-b").lastRunAt, null);
 });
