@@ -4,3 +4,6 @@ config/secrets.json
 data/
 *.log
 config/secrets.dev.json
+
+# 本地流程资料：规格、票据草稿、个人约定，不随仓库分发
+.scratch/
