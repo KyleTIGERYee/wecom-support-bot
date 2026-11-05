@@ -168,6 +168,10 @@ const ROOTS: string[] = process.env.WECOM_BOT_ROOTS
 const EXECUTION_APPROVAL: any = readEnvJson("WECOM_BOT_EXECUTION_APPROVAL", { enabled: false });
 const WRITE_ROOTS = readEnvJson<string[]>("WECOM_BOT_WRITE_ROOTS", []);
 const PROTECTED_ROOTS = readEnvJson<string[]>("WECOM_BOT_PROTECTED_ROOTS", []);
+const LOCAL_TRUSTED_DATA_SCRIPTS: string[] = IS_LOCAL_INSTANCE
+	? Object.values(readEnvJson<Record<string, unknown>>("WECOM_BOT_TRUSTED_DATA_SCRIPTS", {}))
+		.filter((path): path is string => typeof path === "string" && path.startsWith("/") && basename(path) === "bi_query.py")
+	: [];
 const CURRENT_SKILL = process.env.WECOM_BOT_CURRENT_SKILL?.trim() || "unknown";
 let approvalClientPromise: Promise<(messages: Array<{ role: string; content: string }>) => Promise<string>> | null = null;
 
@@ -266,10 +270,21 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 		if (!ALLOWED_SCRIPTS.has(scriptName)) {
 			return { allowed: false, reason: `脚本 ${scriptName} 不在白名单内` };
 		}
-		if (!absoluteScript || !TRUSTED_PYTHON_SCRIPT_DIRS.includes(dirname(absoluteScript))) {
+		if (!absoluteScript) {
 			return { allowed: false, reason: `脚本来源不受信任：${script}` };
 		}
-		if (!isInsideRoots(absoluteScript)) {
+		const trustedDataScript = IS_LOCAL_INSTANCE && scriptName === "bi_query.py" &&
+			LOCAL_TRUSTED_DATA_SCRIPTS.some((candidate) => toAbsolute(candidate) === absoluteScript);
+		const trustedDefaultScript = !IS_LOCAL_INSTANCE && TRUSTED_PYTHON_SCRIPT_DIRS.includes(dirname(absoluteScript));
+		if (!trustedDataScript && !trustedDefaultScript) {
+			return { allowed: false, reason: `脚本来源不受信任：${script}` };
+		}
+		if (trustedDataScript) {
+			// 本地副本、workspace 与保护根都不能因为被配置点名而成为代码来源。
+			if (isInsideRoots(absoluteScript) || isInsideAnyRoot(absoluteScript, WRITE_ROOTS) || isInsideAnyRoot(absoluteScript, PROTECTED_ROOTS)) {
+				return { allowed: false, reason: `可写副本或保护根不能作为可信 BI 入口：${script}` };
+			}
+		} else if (!isInsideRoots(absoluteScript)) {
 			return { allowed: false, reason: `路径越界：${script}` };
 		}
 		return { allowed: true };
@@ -299,6 +314,27 @@ export function checkCommand(command: string): { allowed: boolean; reason?: stri
 	}
 
 	return { allowed: true };
+}
+
+/** 本地可信 BI 每次执行前都以 realpath 核对候选、写根和保护根；任何解析失败都硬拒绝。 */
+async function trustedDataScriptRealPathAllowed(command: string): Promise<boolean> {
+	if (!IS_LOCAL_INSTANCE) return true;
+	const parsed = tokenizeShellCommand(command);
+	if (!parsed.ok || parsed.tokens[0] !== "python3") return true;
+	const script = toAbsolute(parsed.tokens[1] ?? "");
+	if (!script || !LOCAL_TRUSTED_DATA_SCRIPTS.some((candidate) => toAbsolute(candidate) === script)) return false;
+	try {
+		const [realScript, realTrustedScripts, realWriteRoots, realProtectedRoots] = await Promise.all([
+			realpath(script),
+			Promise.all(LOCAL_TRUSTED_DATA_SCRIPTS.map((path) => realpath(path))),
+			Promise.all(WRITE_ROOTS.map((path) => realpath(path))),
+			Promise.all(PROTECTED_ROOTS.map((path) => realpath(path))),
+		]);
+		return (await stat(realScript)).isFile() && realTrustedScripts.includes(realScript) &&
+			!isInsideAnyRoot(realScript, realWriteRoots) && !isInsideAnyRoot(realScript, realProtectedRoots);
+	} catch {
+		return false;
+	}
 }
 
 /** 判断 read 工具的目标路径是否允许。 */
@@ -627,7 +663,13 @@ export default function filesystemWhitelist(pi: any) {
 			const command = event.input?.command;
 			if (typeof command !== "string") return { block: true, reason: "未提供可解析的命令" };
 			const verdict = checkCommand(command);
-			if (verdict.allowed) return;
+			if (verdict.allowed) {
+				if (await trustedDataScriptRealPathAllowed(command)) return;
+				return {
+					block: true,
+					reason: "执行审批 DENY（hard-rule，风险类别：unknown）：可信 BI 入口的真实路径不存在、发生变化或落入可写副本、保护根。",
+				};
+			}
 		} else if (event.toolName !== "write" && event.toolName !== "edit") {
 			return;
 		}

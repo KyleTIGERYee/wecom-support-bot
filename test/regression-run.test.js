@@ -74,7 +74,8 @@ for (const [index, path] of paths.entries()) {
   console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "read-" + index, toolName: "read", args: { path } }));
   console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "read-" + index, toolName: "read", result: path.endsWith(".sql") ? { content: "-- ✅ 已验证" } : {}, isError: false }));
 }
-console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "regression-bi", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "regression-bi", toolName: "bash", result: { content: [{ type: "text", text: "56" }] }, isError: false }));
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "56 家" }] } }));
 `,
     { mode: 0o755 },

@@ -121,27 +121,31 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
       const skillRoot = [...skillMetadata.keys()]
         .filter((candidate) => path === candidate || path.startsWith(`${candidate}/`))
         .sort((a, b) => b.length - a.length)[0];
-      const metadata = skillRoot ? skillMetadata.get(skillRoot) : await readMetadata(path);
-      const sourceTime = metadata.sourceTime ?? null;
+      const metadata = await readMetadata(path);
+      const owningSkill = skillRoot ? skillMetadata.get(skillRoot) : undefined;
+      const sourceTime = metadata.sourceTime ?? owningSkill?.sourceTime ?? null;
       const common = {
         source: source.name,
         scope: source.scope,
         path,
         sourceTime,
         copiedAt,
-        validity: metadata.validity ?? inferValidity(path),
+        validity: metadata.validity ?? owningSkill?.validity ?? inferValidity(path),
       };
       if (skillRoot) {
-        const skillName = skillMetadata.get(skillRoot).name;
+        const skillName = owningSkill.name;
         const isBody = path === join(skillRoot, "SKILL.md");
-        const resourceType = isBody ? "skill" : classifySkillResource(skillRoot, path);
+        const skillResourceType = isBody ? "skill" : classifySkillResource(skillRoot, path);
+        const resourceType = isBody ? "skill" : classifyResourceType(path);
         entries.push({
           ...common,
           relativePath: relative(root, path) || basename(path),
-          depth: resourceType,
+          depth: skillResourceType,
           resourceType,
+          skillResourceType,
           skillName,
-          summary: metadata.summary,
+          summary: metadata.summary || owningSkill.summary,
+          verification: metadata.verification,
         });
         if (isBody) {
           skills.push({
@@ -419,6 +423,7 @@ export function findCatalogResource(path, catalog, readContent = undefined) {
     ...(entry.validity ? { validity: entry.validity } : {}),
     ...(entry.scope ? { scope: entry.scope } : {}),
     ...(entry.skillName ? { skillName: entry.skillName } : {}),
+    ...(entry.skillResourceType ? { skillResourceType: entry.skillResourceType } : {}),
     ...(verification ? { verification } : {}),
   };
 }

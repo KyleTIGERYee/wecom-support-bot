@@ -277,7 +277,7 @@ async function main() {
         sessionKey,
         deps: {
           state,
-          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills, workspaceDir: config.localInstance ? join(config.localInstance.instanceDir, "workspace") : undefined },
+          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills, workspaceDir: config.localInstance ? join(config.localInstance.instanceDir, "workspace") : undefined, trustedDataScripts: config.trustedDataScripts },
           runAgent: async ({ prompt, sessionId, currentSkill }) => {
             const agentStartedAt = Date.now();
             const agentTurn = await runAgentTurn({

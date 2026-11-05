@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -170,6 +170,64 @@ async function makeTempDir(t) {
   return dir;
 }
 
+/** 在临时项目中运行同一公开 CLI，避免测试读写本机默认知识库。 */
+async function makeIsolatedCliFixture(t) {
+  const root = await makeTempDir(t);
+  const fixtureProjectDir = join(root, "project");
+  const fixtureCliPath = join(fixtureProjectDir, "scripts/local-instance.js");
+  const defaultsPath = join(fixtureProjectDir, "config/default.json");
+  const knowledgeBase = join(root, "knowledge-base");
+  await mkdir(dirname(fixtureCliPath), { recursive: true });
+  await mkdir(dirname(defaultsPath), { recursive: true });
+  await cp(join(projectDir, "src"), join(fixtureProjectDir, "src"), { recursive: true });
+  await cp(cliPath, fixtureCliPath);
+  const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
+  defaults.roots.knowledgeBase = knowledgeBase;
+  await writeFile(defaultsPath, JSON.stringify(defaults));
+
+  const instanceDir = join(root, "instance");
+  const savedPath = join(instanceDir, "instance.json");
+  const localPath = "context/001-shared";
+  await mkdir(join(instanceDir, localPath), { recursive: true });
+  await mkdir(join(instanceDir, "workspace"), { recursive: true });
+  await mkdir(join(instanceDir, "agent"), { recursive: true });
+  await mkdir(join(instanceDir, "data"), { recursive: true });
+  await writeFile(join(instanceDir, localPath, "handbook.md"), "机构统计口径资料。\n");
+  const saved = {
+    version: 2,
+    ready: true,
+    instance: { id: "isolated-fixture", template: "blank" },
+    initializedAt: "2026-11-05T00:00:00.000Z",
+    models: {
+      main: { baseUrl: "http://127.0.0.1:1/v1", model: "main-model" },
+      quick: { baseUrl: "http://127.0.0.1:1/v1", model: "quick-model" },
+      guard: { baseUrl: "http://127.0.0.1:1/v1", model: "guard-model" },
+      executionApproval: { baseUrl: "http://127.0.0.1:1/v1", model: "approval-model" },
+    },
+    contextSources: [{ name: "shared", type: "directory", scope: "shared", localPath, status: "ok" }],
+    resources: {
+      version: "resource-version-keep",
+      catalogVersion: "resource-version-keep",
+      syncedAt: "2026-11-05T00:00:00.000Z",
+      files: [`${localPath}/handbook.md`],
+    },
+    checks: { sentinel: "keep" },
+  };
+  await writeFile(savedPath, JSON.stringify(saved));
+  return { root, projectDir: fixtureProjectDir, cliPath: fixtureCliPath, defaultsPath, knowledgeBase, instanceDir, savedPath, saved };
+}
+
+async function runIsolatedCli(fixture, args, options = {}) {
+  return execFileAsync(process.execPath, [fixture.cliPath, ...args], {
+    cwd: fixture.projectDir,
+    ...options,
+  });
+}
+
+function defaultBiScript(knowledgeBase, business) {
+  return join(knowledgeBase, `数据库/${business}-db-wiki/scripts/bi_query.py`);
+}
+
 function initInstance({
   instanceDir,
   sources = [],
@@ -304,6 +362,227 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   assert.deepEqual(call.writeRoots, [join(instanceDir, "context"), join(instanceDir, "workspace")]);
   assert.deepEqual(call.protectedRoots, [projectDir]);
   assert.equal(call.modelClientPath, join(projectDir, "src/model-client.js"));
+});
+
+test("S14 saved 未显式登记 BI 时不得回退 defaults，真实查数 prompt 如实报缺配置", async (t) => {
+  const fixture = await makeIsolatedCliFixture(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  for (const business of ["ajly", "lzz"]) {
+    const script = defaultBiScript(fixture.knowledgeBase, business);
+    await mkdir(dirname(script), { recursive: true });
+    await writeFile(script, "print('MUST_NOT_BE_IMPLICITLY_TRUSTED')\n", { mode: 0o555 });
+  }
+  for (const model of Object.values(fixture.saved.models)) model.baseUrl = models.baseUrl;
+  await writeFile(fixture.savedPath, JSON.stringify(fixture.saved));
+  await writeFile(
+    join(fixture.instanceDir, "secrets.json"),
+    JSON.stringify({ mainApiKey: "test", quickApiKey: "test", guardApiKey: "test", executionApprovalApiKey: "test" }),
+  );
+  const fakePi = join(fixture.root, "fake-pi.js");
+  const piLog = join(fixture.root, "pi-log.jsonl");
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
+  prompt: process.argv.at(-1),
+  trustedDataScripts: JSON.parse(process.env.WECOM_BOT_TRUSTED_DATA_SCRIPTS || "{}"),
+}) + "\\n");
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "无法确认现查数字" }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  await runIsolatedCli(
+    fixture,
+    ["ask", "--instance-dir", fixture.instanceDir, "--question", "查一下机构总数", "--session-key", "no-implicit-bi"],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog } },
+  );
+
+  const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(calls.length > 0);
+  for (const call of calls) assert.deepEqual(call.trustedDataScripts, {});
+  assert.match(calls[0].prompt, /未配置可用的可信只读 BI 入口/);
+  assert.equal(calls[0].prompt.includes(fixture.knowledgeBase), false);
+});
+
+test("S14 configure-bi 显式登记默认业务 BI 的真实路径且不改变其他实例状态", async (t) => {
+  const fixture = await makeIsolatedCliFixture(t);
+  const trustedScript = defaultBiScript(fixture.knowledgeBase, "lzz");
+  const aliasScript = join(fixture.root, "trusted-alias/bi_query.py");
+  const externalScript = join(fixture.root, "external/bi_query.py");
+  await mkdir(dirname(trustedScript), { recursive: true });
+  await mkdir(dirname(aliasScript), { recursive: true });
+  await writeFile(trustedScript, "print('TRUSTED_BI_ONLY')\n", { mode: 0o555 });
+  await symlink(trustedScript, aliasScript);
+  fixture.saved.trustedDataScripts = { ajly: "/explicit/missing/bi_query.py" };
+  await writeFile(fixture.savedPath, JSON.stringify(fixture.saved));
+  const workspaceTask = join(fixture.instanceDir, "workspace/task.md");
+  const sessionState = join(fixture.instanceDir, "data/session-state.json");
+  await writeFile(workspaceTask, "keep workspace\n");
+  await writeFile(sessionState, '{"keep":true}\n');
+  const before = JSON.parse(await readFile(fixture.savedPath, "utf8"));
+  const realTrustedScript = await realpath(trustedScript);
+
+  const { stdout } = await runIsolatedCli(
+    fixture,
+    ["configure-bi", "--instance-dir", fixture.instanceDir, "--business", "lzz", "--script", aliasScript],
+    {
+      env: {
+        ...process.env,
+        WECOM_BOT_TRUSTED_DATA_SCRIPTS: JSON.stringify({ lzz: externalScript }),
+      },
+    },
+  );
+
+  assert.deepEqual(JSON.parse(stdout), {
+    status: "ok",
+    instanceDir: fixture.instanceDir,
+    business: "lzz",
+    script: realTrustedScript,
+  });
+  const after = JSON.parse(await readFile(fixture.savedPath, "utf8"));
+  assert.deepEqual(after, {
+    ...before,
+    trustedDataScripts: { ...before.trustedDataScripts, lzz: realTrustedScript },
+  });
+  assert.equal(after.ready, before.ready);
+  assert.deepEqual(after.resources, before.resources);
+  assert.equal(await readFile(workspaceTask, "utf8"), "keep workspace\n");
+  assert.equal(await readFile(sessionState, "utf8"), '{"keep":true}\n');
+});
+
+test("S14 configure-bi 拒绝非法业务、非绝对路径、悬空、目录与任意副本", async (t) => {
+  const fixture = await makeIsolatedCliFixture(t);
+  const trustedScript = defaultBiScript(fixture.knowledgeBase, "lzz");
+  const directoryScript = defaultBiScript(fixture.knowledgeBase, "ajly");
+  const danglingScript = join(fixture.root, "dangling/bi_query.py");
+  const copyScript = join(fixture.root, "copy/bi_query.py");
+  await mkdir(dirname(trustedScript), { recursive: true });
+  await writeFile(trustedScript, "print('trusted')\n");
+  await mkdir(directoryScript, { recursive: true });
+  await mkdir(dirname(danglingScript), { recursive: true });
+  await symlink(join(fixture.root, "missing-target"), danglingScript);
+  await mkdir(dirname(copyScript), { recursive: true });
+  await writeFile(copyScript, "print('copy')\n");
+  const cases = [
+    ["--business", "other", "--script", trustedScript],
+    ["--business", "lzz", "--script", "relative/bi_query.py"],
+    ["--business", "lzz", "--script", join(fixture.root, "missing/bi_query.py")],
+    ["--business", "lzz", "--script", danglingScript],
+    ["--business", "ajly", "--script", directoryScript],
+    ["--business", "lzz", "--script", copyScript],
+    ["--business", "ajly", "--script", trustedScript],
+  ];
+
+  for (const options of cases) {
+    await assert.rejects(
+      runIsolatedCli(fixture, ["configure-bi", "--instance-dir", fixture.instanceDir, ...options]),
+      undefined,
+      options.join(" "),
+    );
+  }
+  const after = JSON.parse(await readFile(fixture.savedPath, "utf8"));
+  assert.equal(Object.hasOwn(after, "trustedDataScripts"), false);
+});
+
+test("S14 configure-bi 按 realpath 拒绝 context、workspace 与 project 保护根别名", async (t) => {
+  for (const rootKind of ["context", "workspace", "project"]) {
+    const fixture = await makeIsolatedCliFixture(t);
+    const blockedRoot = rootKind === "project" ? fixture.projectDir : join(fixture.instanceDir, rootKind);
+    const defaults = JSON.parse(await readFile(fixture.defaultsPath, "utf8"));
+    defaults.roots.knowledgeBase = blockedRoot;
+    await writeFile(fixture.defaultsPath, JSON.stringify(defaults));
+    const blockedScript = defaultBiScript(blockedRoot, "lzz");
+    const aliasScript = join(fixture.root, `${rootKind}-alias/bi_query.py`);
+    await mkdir(dirname(blockedScript), { recursive: true });
+    await mkdir(dirname(aliasScript), { recursive: true });
+    await writeFile(blockedScript, "print('MUST_NOT_BE_CONFIGURED')\n");
+    await symlink(blockedScript, aliasScript);
+
+    await assert.rejects(
+      runIsolatedCli(fixture, [
+        "configure-bi",
+        "--instance-dir", fixture.instanceDir,
+        "--business", "lzz",
+        "--script", aliasScript,
+      ]),
+      undefined,
+      rootKind,
+    );
+    const after = JSON.parse(await readFile(fixture.savedPath, "utf8"));
+    assert.equal(Object.hasOwn(after, "trustedDataScripts"), false, rootKind);
+  }
+});
+
+test("S14 saved.trustedDataScripts 控制只执行适配器，实例别名与外部环境变量不能注入副本 BI", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared");
+  const instanceDir = join(root, "instance");
+  const instanceAlias = join(root, "instance-alias");
+  const trustedScript = join(root, "trusted/lzz-db-wiki/scripts/bi_query.py");
+  const externalScript = join(root, "external-attack/scripts/bi_query.py");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  await mkdir(source);
+  await writeFile(join(source, "handbook.md"), "机构统计口径资料。\n");
+  await writeFile(join(source, "bi_query.py"), "raise SystemExit('UNTRUSTED_COPY_EXECUTED')\n");
+  await mkdir(dirname(trustedScript), { recursive: true });
+  await writeFile(trustedScript, "print('TRUSTED_BI_ONLY')\n", { mode: 0o555 });
+  await mkdir(dirname(externalScript), { recursive: true });
+  await writeFile(externalScript, "print('EXTERNAL_ENV_MUST_NOT_WIN')\n", { mode: 0o555 });
+  await initInstance({
+    instanceDir,
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const copyScript = join(instanceDir, "context/001-shared/bi_query.py");
+  const savedPath = join(instanceDir, "instance.json");
+  const saved = JSON.parse(await readFile(savedPath, "utf8"));
+  saved.trustedDataScripts = { lzz: trustedScript, ajly: copyScript };
+  await writeFile(savedPath, JSON.stringify(saved));
+  await symlink(instanceDir, instanceAlias, "dir");
+  const realTrustedScript = await realpath(trustedScript);
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
+  prompt: process.argv.at(-1),
+  trustedDataScripts: JSON.parse(process.env.WECOM_BOT_TRUSTED_DATA_SCRIPTS || "{}"),
+}) + "\\n");
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "配置检查完成" }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  await runCli(
+    ["ask", "--instance-dir", instanceAlias, "--question", "查一下乐租租机构总数", "--session-key", "saved-bi-config"],
+    {
+      env: {
+        ...process.env,
+        WECOM_BOT_PI_BINARY: fakePi,
+        WECOM_BOT_TRUSTED_DATA_SCRIPTS: JSON.stringify({ lzz: externalScript }),
+        FAKE_PI_LOG: piLog,
+      },
+    },
+  );
+
+  const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(calls.length > 0);
+  for (const call of calls) {
+    assert.deepEqual(call.trustedDataScripts, { lzz: realTrustedScript });
+    assert.equal(JSON.stringify(call.trustedDataScripts).includes(copyScript), false);
+    assert.equal(JSON.stringify(call.trustedDataScripts).includes(externalScript), false);
+  }
+  const initialPrompt = calls[0].prompt;
+  assert.ok(initialPrompt.includes(`python3 "${realTrustedScript}"`));
+  assert.ok(initialPrompt.includes("只执行下列运行时明确配置的可信入口"));
+  assert.equal(initialPrompt.includes(`python3 "${copyScript}"`), false, "实例别名不能把可写副本登记成 BI 执行适配器");
+  assert.equal(initialPrompt.includes(externalScript), false, "外部环境变量不能覆盖 saved.trustedDataScripts");
 });
 
 test("ask 运行链路公开审批摘要、结果与安全理由类别但不泄露敏感原文", async (t) => {
@@ -596,7 +875,8 @@ if (!rework) {
   console.log(JSON.stringify({ type: "tool_execution_end", toolName: "read", args: { path: ${JSON.stringify(localHandbookPath)} }, isError: false }));
 }
 const answer = rework ? "退租审批需要两级审批。" : found ? "退租审批需要两级审批。13800138000" : "没有找到本地资料";
-console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "local-bi", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "local-bi", toolName: "bash", result: { content: [{ type: "text", text: "SELECT 1" }] }, isError: false }));
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }], usage: { input: 10 } } }));
 `,
     { mode: 0o755 },
@@ -764,7 +1044,8 @@ for (const [index, path] of paths.entries()) {
   console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "read-" + index, toolName: "read", result: {}, isError: false }));
 }
 if (prompt.includes("继续完成数据口径任务")) {
-  console.log(JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+  console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "local-data-bi", toolName: "bash", args: { command: "python3 /local/scripts/bi_query.py SELECT" } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "local-data-bi", toolName: "bash", result: { content: [{ type: "text", text: "56" }] }, isError: false }));
 }
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } }));
 `,
@@ -795,6 +1076,89 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   assert.match(calls[0].prompt, /verification: verified/);
   assert.match(calls[0].prompt, /verification: unverified/);
   assert.match(calls[0].prompt, /verification: known-issue/);
+});
+
+test("Skill 根内的查数知识被读取后仍满足经验、指标、SQL 与表文档证据", async (t) => {
+  const root = await makeTempDir(t);
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const source = join(root, "shared-skill-data");
+  const instanceDir = join(root, "instance");
+  const fakePi = join(root, "fake-pi.js");
+  const piLog = join(root, "pi-log.jsonl");
+  const skillRoot = join(source, "skills/data-query");
+  const files = {
+    skill: join(skillRoot, "SKILL.md"),
+    experience: join(skillRoot, ".lzz-db-wiki-evolution/common/机构经验.md"),
+    metrics: join(skillRoot, "metrics/机构总数.md"),
+    sql: join(skillRoot, "queries/机构总数.sql"),
+    table: join(skillRoot, "tables/ajly_flow/system_tenant.md"),
+    unrelatedSkill: join(source, "skills/document-delivery/SKILL.md"),
+  };
+  for (const path of Object.values(files)) await mkdir(dirname(path), { recursive: true });
+  await writeFile(
+    files.skill,
+    "---\nname: data-query\ndescription: 按业务口径只读查数\ntriggers: 查数\ntasks: data\nsource_time: 2026-11-04\n---\nSKILL_DATA_BODY：按需读取本 Skill 中的指标与查询参考。\n",
+  );
+  await writeFile(files.experience, "机构统计排除门店品牌配置。\n");
+  await writeFile(files.metrics, "机构总数只统计有效入驻机构。\n");
+  await writeFile(files.sql, "-- ✅ 已验证\nSELECT tenant_id FROM system_tenant WHERE deleted = 0;\n");
+  await writeFile(files.table, "system_tenant.tenant_id 是机构标识，deleted 是软删标记。\n");
+  await writeFile(files.unrelatedSkill, "---\nname: document-delivery\ndescription: 创建文档\ntriggers: 文档\n---\nUNRELATED_SKILL_BODY\n");
+  await initInstance({
+    instanceDir,
+    template: "team",
+    sources: [{ path: source, scope: "shared" }],
+    baseUrl: models.baseUrl,
+  });
+  const localFiles = Object.fromEntries(
+    Object.entries(files).map(([key, path]) => [key, path.replace(source, join(instanceDir, "context/001-shared-skill-data"))]),
+  );
+  await writeFile(
+    fakePi,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+const prompt = process.argv.at(-1);
+appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ prompt }) + "\\n");
+const files = ${JSON.stringify(localFiles)};
+const paths = [files.skill, files.experience, files.metrics, files.sql, files.table];
+for (const [index, path] of paths.entries()) {
+  readFileSync(path, "utf8");
+  console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "skill-data-" + index, toolName: "read", args: { path } }));
+  console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "skill-data-" + index, toolName: "read", result: {}, isError: false }));
+}
+console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "skill-data-bi", toolName: "bash", args: { command: "python3 /trusted/lzz/bi_query.py SELECT" } }));
+console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "skill-data-bi", toolName: "bash", result: { content: [{ type: "text", text: "56" }] }, isError: false }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "按已确认口径，乐租租目前有 56 家机构。" }] } }));
+`,
+    { mode: 0o755 },
+  );
+
+  const result = await runCli(
+    ["ask", "--instance-dir", instanceDir, "--question", "查一下乐租租目前有多少家机构", "--session-key", "skill-data-evidence"],
+    { env: { ...process.env, WECOM_BOT_PI_BINARY: fakePi, FAKE_PI_LOG: piLog } },
+  );
+
+  assert.equal(result.finalText, "按已确认口径，乐租租目前有 56 家机构。");
+  assert.equal(result.guarded, true);
+  assert.equal(result.currentSkill, "data-query");
+  assert.deepEqual(result.loadedSkills.map((resource) => resource.path), [localFiles.skill]);
+  assert.deepEqual(
+    result.loadedResources.map((resource) => resource.resourceType),
+    ["skill", "experience", "metrics", "sql", "table"],
+  );
+  assert.deepEqual(
+    result.loadedResources.map((resource) => resource.depth),
+    ["skill", "skill-reference", "skill-reference", "skill-reference", "skill-reference"],
+  );
+  assert.ok(result.loadedResources.every((resource) => resource.skillName === "data-query"));
+  assert.equal(result.loadedResources.find((resource) => resource.resourceType === "sql").verification, "verified");
+  assert.equal(result.loadedResources.some((resource) => resource.skillName === "document-delivery"), false);
+  assert.equal(result.loadDepth, "skill-reference");
+  const calls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].prompt.includes("SKILL_DATA_BODY"), false);
+  assert.equal(calls[0].prompt.includes("UNRELATED_SKILL_BODY"), false);
 });
 
 test("本地历史问答公开共享时间线、当时记录和决策资料的来源时间", async (t) => {
@@ -1030,7 +1394,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   }
 });
 
-test("公开查数任务由真实 pi 渐进加载业务知识与 Skill，并从隔离假 BI 取得结果后经过 Guard", { timeout: 120000 }, async (t) => {
+test("公开查数任务拒绝副本同名 BI，并从本地实例可信入口取得结果后经过 Guard", { timeout: 120000 }, async (t) => {
   const realPi = join(homedir(), ".pi-support/bin/pi");
   if (!existsSync(realPi)) {
     t.skip("本机未安装隔离 pi，跳过真实 pi 查数公开工作流验收");
@@ -1040,49 +1404,14 @@ test("公开查数任务由真实 pi 渐进加载业务知识与 Skill，并从�
   const source = join(root, "shared-data-skill");
   const instanceDir = join(root, "instance");
   const isolatedHome = join(root, "home");
-  const defaultKnowledgeRoot = "/Users/kyle/Desktop/PM/信息技术部资产库/知识库";
-  const defaultScriptDir = `${defaultKnowledgeRoot}/数据库/ajly-db-wiki/scripts`;
-  const trustedKnowledgeRoot = join(isolatedHome, "Desktop/PM/信息技术部资产库/知识库");
-  const trustedScriptDir = join(trustedKnowledgeRoot, "数据库/ajly-db-wiki/scripts");
+  const trustedScriptDir = join(root, "trusted/lzz-db-wiki/scripts");
   const fakeBiScript = join(trustedScriptDir, "bi_query.py");
-  const extensionCopy = join(root, "default-mode-extension/bash-whitelist.ts");
-  const realPiWrapper = join(root, "real-pi-default-mode.js");
-  const extensionSource = await readFile(join(projectDir, "extensions/bash-whitelist.ts"), "utf8");
-  const isolatedExtension = extensionSource
-    .replace(JSON.stringify(defaultScriptDir), JSON.stringify(trustedScriptDir))
-    .replace(JSON.stringify(defaultKnowledgeRoot), JSON.stringify(trustedKnowledgeRoot));
-  assert.ok(isolatedExtension.includes(JSON.stringify(trustedScriptDir)));
-  assert.ok(isolatedExtension.includes(JSON.stringify(trustedKnowledgeRoot)));
-  await mkdir(dirname(extensionCopy), { recursive: true });
-  await writeFile(extensionCopy, isolatedExtension, { mode: 0o555 });
-  // 04 不允许本地实例执行副本内 Python。此验收仅借现有 binary 注入点启动真实 pi 的
-  // 默认只读模式，并把既有默认 Wiki 来源重定位到隔离 HOME；白名单规则本身不变。
-  await writeFile(
-    realPiWrapper,
-    `#!/usr/bin/env node
-import { spawn } from "node:child_process";
-const args = process.argv.slice(2);
-const extensionIndex = args.indexOf("--extension");
-if (extensionIndex < 0) throw new Error("missing extension argument");
-args[extensionIndex + 1] = process.env.REAL_PI_TEST_EXTENSION;
-const roots = [...JSON.parse(process.env.WECOM_BOT_ROOTS || "[]"), process.env.REAL_PI_TEST_TRUSTED_ROOT];
-const child = spawn(process.env.REAL_PI_BINARY, args, {
-  env: { ...process.env, WECOM_BOT_LOCAL_INSTANCE: "0", WECOM_BOT_ROOTS: JSON.stringify(roots) },
-  stdio: "inherit",
-});
-child.once("error", (error) => { throw error; });
-child.once("exit", (code, signal) => {
-  if (signal) process.kill(process.pid, signal);
-  else process.exit(code ?? 1);
-});
-`,
-    { mode: 0o755 },
-  );
   const files = {
     concept: join(source, "wiki/概念/机构.md"),
     skill: join(source, "skills/data-query/SKILL.md"),
     reference: join(source, "skills/data-query/references/query-checklist.md"),
     script: join(source, "skills/data-query/scripts/not-needed.sh"),
+    copyBiScript: join(source, "skills/data-query/scripts/bi_query.py"),
     unrelatedSkill: join(source, "skills/document-delivery/SKILL.md"),
     playbook: join(source, "prompts/data-playbook.md"),
     experience: join(source, ".lzz-db-wiki-evolution/common/机构经验.md"),
@@ -1098,6 +1427,7 @@ child.once("exit", (code, signal) => {
   );
   await writeFile(files.reference, "QUERY_REFERENCE：核对经验、指标、已验证 SQL、表文档后才执行只读查询。\n");
   await writeFile(files.script, "UNNEEDED_SCRIPT_BODY\n");
+  await writeFile(files.copyBiScript, "raise SystemExit('UNTRUSTED_COPY_EXECUTED')\n");
   await writeFile(files.unrelatedSkill, "---\nname: document-delivery\ndescription: 创建文档\ntriggers: 文档\n---\nUNRELATED_DOCUMENT_SKILL_BODY\n");
   await writeFile(files.playbook, "查数手册：先口径后查询。\n");
   await writeFile(files.experience, "机构统计排除门店品牌配置。\n");
@@ -1110,9 +1440,11 @@ child.once("exit", (code, signal) => {
     "import sys\nif sys.argv[1:] != ['SELECT 56 AS tenant_count']:\n    raise SystemExit('unexpected test query')\nprint('FAKE_BI_COUNT=56')\n",
     { mode: 0o555 },
   );
+  const trustedBiScript = await realpath(fakeBiScript);
   const localFiles = Object.fromEntries(
     Object.entries(files).map(([key, path]) => [key, path.replace(source, join(instanceDir, "context/001-shared-data-skill"))]),
   );
+  let observedCopyDenial = false;
   let observedExternalResult = false;
   const models = await startModelServer({
     mainReply: (payload) => {
@@ -1137,7 +1469,13 @@ child.once("exit", (code, signal) => {
       if (toolMessages.length === 0) return modelToolCall("data-read-sql", "read", { path: localFiles.sql });
       if (toolMessages.length === 1) return modelToolCall("data-read-table", "read", { path: localFiles.table });
       if (toolMessages.length === 2) {
-        return modelToolCall("data-query-fake-bi", "bash", { command: `python3 "${fakeBiScript}" "SELECT 56 AS tenant_count"` });
+        return modelToolCall("data-query-copy-bi", "bash", { command: `python3 "${localFiles.copyBiScript}" "SELECT 56 AS tenant_count"` });
+      }
+      if (toolMessages.length === 3) {
+        const denial = JSON.stringify(toolMessages.at(-1));
+        if (!denial.includes("DENY") || denial.includes("UNTRUSTED_COPY_EXECUTED")) return "COPY_BI_NOT_DENIED";
+        observedCopyDenial = true;
+        return modelToolCall("data-query-fake-bi", "bash", { command: `python3 "${trustedBiScript}" "SELECT 56 AS tenant_count"` });
       }
       if (!JSON.stringify(toolMessages).includes("FAKE_BI_COUNT=56")) return "EXTERNAL_QUERY_RESULT_MISSING";
       observedExternalResult = true;
@@ -1153,6 +1491,13 @@ child.once("exit", (code, signal) => {
     model: "main-model",
     guardModel: "guard-model",
   });
+  const savedPath = join(instanceDir, "instance.json");
+  const saved = JSON.parse(await readFile(savedPath, "utf8"));
+  saved.trustedDataScripts = {
+    lzz: trustedBiScript,
+    ajly: join(root, "missing/ajly-db-wiki/scripts/bi_query.py"),
+  };
+  await writeFile(savedPath, JSON.stringify(saved));
   models.calls.length = 0;
 
   const result = await runCli(
@@ -1161,10 +1506,7 @@ child.once("exit", (code, signal) => {
       env: {
         ...process.env,
         HOME: isolatedHome,
-        WECOM_BOT_PI_BINARY: realPiWrapper,
-        REAL_PI_BINARY: realPi,
-        REAL_PI_TEST_EXTENSION: extensionCopy,
-        REAL_PI_TEST_TRUSTED_ROOT: trustedKnowledgeRoot,
+        WECOM_BOT_PI_BINARY: realPi,
       },
       timeout: 90000,
     },
@@ -1173,12 +1515,13 @@ child.once("exit", (code, signal) => {
   assert.equal(result.finalText, "按当前指标口径，机构总数为 56 家。");
   assert.equal(result.currentSkill, "data-query");
   assert.equal(result.guarded, true);
+  assert.equal(observedCopyDenial, true);
   assert.equal(observedExternalResult, true);
   assert.equal(result.loadedSkills.length, 1);
   assert.equal(result.loadedSkills[0].skillName, "data-query");
   assert.deepEqual(
     result.loadedResources.map((resource) => resource.resourceType),
-    ["skill", "skill-reference", "concept", "playbook", "experience", "metrics", "sql", "table"],
+    ["skill", "concept", "concept", "playbook", "experience", "metrics", "sql", "table"],
   );
   assert.ok(result.loadedResources.every((resource) => resource.source === "shared-data-skill" && resource.scope === "shared"));
   assert.equal(result.loadedResources.some((resource) => resource.resourceType === "skill-script"), false);
@@ -1190,6 +1533,13 @@ child.once("exit", (code, signal) => {
   assert.equal(executionApprovalCalls.length, 0, "受信任只读查询只直接放行，不进入 write/edit 执行审批");
   assert.ok(models.calls.some((call) => call.model === "guard-model" && JSON.stringify(call.messages).includes("机器人的答复")));
   const mainCalls = models.calls.filter((call) => call.model === "main-model" && call.stream);
+  const initialPrompt = currentAgentPhase(mainCalls[0]).prompt;
+  assert.match(initialPrompt, /可信只读 BI 入口/);
+  assert.match(initialPrompt, /乐租租.*lzz/);
+  assert.ok(initialPrompt.includes(trustedBiScript));
+  assert.ok(initialPrompt.includes("只执行"));
+  assert.equal(initialPrompt.includes(join(root, "missing/ajly-db-wiki/scripts/bi_query.py")), false);
+  assert.equal(initialPrompt.includes(`read ${trustedBiScript}`), false);
   assert.match(JSON.stringify(mainCalls[0].messages), /按业务口径完成\s+只读查数/);
   assert.match(JSON.stringify(mainCalls[0].messages), /capabilities: 口径核对、已验证 SQL、只读 BI/);
   assert.equal(JSON.stringify(mainCalls[0].messages).includes("DATA_SKILL_BODY"), false);
@@ -1287,7 +1637,7 @@ test("公开文档任务由真实 pi 读取 Skill，按 DENY 理由调整并新�
   assert.equal(result.loadedSkills.length, 1);
   assert.equal(result.loadedSkills[0].skillName, "document-delivery");
   assert.equal(result.loadedSkills[0].sourceTime, "2026-11-04");
-  assert.ok(result.loadedResources.some((resource) => resource.resourceType === "skill-reference" && resource.path === localReferencePath));
+  assert.ok(result.loadedResources.some((resource) => resource.skillResourceType === "skill-reference" && resource.resourceType === "concept" && resource.path === localReferencePath));
   assert.ok(result.loadedResources.some((resource) => resource.path === localConceptPath && resource.resourceType === "concept"));
   assert.deepEqual(result.executionApprovals.map((entry) => entry.verdict), ["DENY", "ALLOW", "ALLOW"]);
   assert.deepEqual(result.executionApprovals.map((entry) => entry.toolName), ["write", "write", "edit"]);

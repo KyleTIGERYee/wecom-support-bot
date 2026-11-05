@@ -75,6 +75,7 @@ export function spawnPi({ prompt, sessionId, config, projectDir, thinkingLevel, 
       WECOM_BOT_ROOTS: JSON.stringify(config.roots ?? []),
       WECOM_BOT_LOCAL_INSTANCE: config.pi.localInstance ? "1" : "0",
       WECOM_BOT_EXECUTION_APPROVAL: JSON.stringify(config.executionApproval ?? { enabled: false }),
+      WECOM_BOT_TRUSTED_DATA_SCRIPTS: JSON.stringify(config.trustedDataScripts ?? {}),
       WECOM_BOT_CURRENT_SKILL: currentSkill ?? "unknown",
       WECOM_BOT_WRITE_ROOTS: JSON.stringify(config.writeRoots ?? []),
       WECOM_BOT_PROTECTED_ROOTS: JSON.stringify(config.protectedRoots ?? []),
@@ -150,6 +151,8 @@ export async function runAgentTurn({
     const executionApprovals = [];
     /** @type {Map<string, string>} */
     const pendingReads = new Map();
+    /** @type {Map<string, string>} */
+    const pendingBashCommands = new Map();
     /** @type {NodeJS.Timeout | undefined} */
     let idleTimer;
 
@@ -202,7 +205,15 @@ export async function runAgentTurn({
           buffer = buffer.slice(newlineIndex + 1);
           const parsed = parseEvent(line);
           if (parsed) {
-            if (parsed.biTouched) biTouched = true;
+            if (parsed.bashStarted) {
+              if (parsed.pendingBashId && parsed.bashCommand) {
+                pendingBashCommands.set(parsed.pendingBashId, parsed.bashCommand);
+              }
+            } else if (parsed.bashCompleted) {
+              const command = parsed.bashCommand ?? pendingBashCommands.get(parsed.completedBashId ?? "");
+              if (parsed.completedBashId) pendingBashCommands.delete(parsed.completedBashId);
+              if (parsed.bashSucceeded && command && isBiQueryCommand(command)) biTouched = true;
+            }
             if (parsed.text !== undefined) {
               text = parsed.text;
               contextInsufficient = Boolean(parsed.contextInsufficient);
@@ -278,7 +289,7 @@ function relayExecutionApprovalLog(line) {
  * 解析单行 JSONL 事件，提取对该轮有意义的信息。
  *
  * @param {string} line
- * @returns {{text?: string, contextInsufficient?: boolean, biTouched?: boolean, inputTokens?: number, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean, readContent?: string} | null}
+ * @returns {{text?: string, contextInsufficient?: boolean, inputTokens?: number, bashStarted?: boolean, bashCompleted?: boolean, bashSucceeded?: boolean, pendingBashId?: string, completedBashId?: string, bashCommand?: string, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean, readContent?: string} | null}
  */
 function parseEvent(line) {
   const trimmed = line.trim();
@@ -292,11 +303,22 @@ function parseEvent(line) {
   }
 
   if (event?.type === "tool_execution_start" && event.toolName === "bash") {
-    const command = event.args?.command;
-    if (typeof command === "string" && command.includes(BI_SCRIPT)) {
-      return { biTouched: true };
-    }
-    return null;
+    const command = event.args?.command ?? event.input?.command;
+    return {
+      bashStarted: true,
+      pendingBashId: event.toolCallId,
+      ...(typeof command === "string" ? { bashCommand: command } : {}),
+    };
+  }
+
+  if (event?.type === "tool_execution_end" && event.toolName === "bash") {
+    const command = event.args?.command ?? event.input?.command;
+    return {
+      bashCompleted: true,
+      completedBashId: event.toolCallId,
+      bashSucceeded: isSuccessfulBashExecution(event),
+      ...(typeof command === "string" ? { bashCommand: command } : {}),
+    };
   }
 
   if (event?.type === "tool_execution_start" && event.toolName === "read") {
@@ -339,6 +361,97 @@ function parseEvent(line) {
   }
 
   return null;
+}
+
+/**
+ * 保守识别成功事件对应的命令证据，不做权限判断，也不替代 04 的执行分词器。
+ * 只接受直接以 python/python3 启动、首个参数就是 bi_query.py 的单条命令。
+ * 引号与反斜杠按 shell 词法还原；展开、串联或无法完整解析时宁漏不误标。
+ *
+ * @param {string} command
+ */
+function isBiQueryCommand(command) {
+  const tokens = tokenizeCommandEvidence(command);
+  if (!tokens || !["python", "python3"].includes(tokens[0])) return false;
+  const script = tokens[1] ?? "";
+  if (!script || script.startsWith("-")) return false;
+  return script === BI_SCRIPT || script.endsWith(`/${BI_SCRIPT}`);
+}
+
+/**
+ * 仅供证据识别使用的最小 shell 分词；不展开变量、不执行任何内容。
+ * @param {string} command
+ * @returns {string[]|null}
+ */
+function tokenizeCommandEvidence(command) {
+  /** @type {string[]} */
+  const tokens = [];
+  let token = "";
+  /** @type {"'"|'"'|null} */
+  let quote = null;
+  let started = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      else token += char;
+      started = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') {
+        quote = null;
+      } else if (char === "\\") {
+        const next = command[index + 1];
+        if (next === undefined) return null;
+        index += 1;
+        if (next !== "\n") token += ['"', "\\", "$", "`"].includes(next) ? next : `\\${next}`;
+      } else {
+        if (char === "$" || char === "`") return null;
+        token += char;
+      }
+      started = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+      continue;
+    }
+    if (char === "\\") {
+      const next = command[index + 1];
+      if (next === undefined) return null;
+      index += 1;
+      if (next !== "\n") token += next;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (char === "\n") return null;
+      if (started) tokens.push(token);
+      token = "";
+      started = false;
+      continue;
+    }
+    if ("$`|;&<>\n".includes(char) || (char === "#" && !started)) return null;
+    // 未引用的 glob、brace、extglob、tilde 与进程替换都不是可确认的字面脚本路径。
+    // 圆括号一并拒绝可覆盖所有 extglob 形式；引号或反斜杠包裹的字面字符仍可使用。
+    if ("~{}*?[]()".includes(char)) return null;
+    token += char;
+    started = true;
+  }
+  if (quote) return null;
+  if (started) tokens.push(token);
+  return tokens;
+}
+
+/** @param {any} event */
+function isSuccessfulBashExecution(event) {
+  if (event.isError) return false;
+  const result = event.result;
+  const exitCode = event.exitCode ?? result?.exitCode ?? result?.details?.exitCode;
+  if (exitCode !== undefined && Number(exitCode) !== 0) return false;
+  return !result?.isError && !result?.error && result?.success !== false && result?.ok !== false;
 }
 
 /**

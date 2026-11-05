@@ -46,12 +46,28 @@ function textMessage(text) {
  * 一条 bash 工具调用事件。
  * @param {string} command
  */
-function bashTool(command) {
+function bashTool(command, toolCallId = "call-1") {
   return JSON.stringify({
     type: "tool_execution_start",
-    toolCallId: "call-1",
+    toolCallId,
     toolName: "bash",
     args: { command },
+  });
+}
+
+/**
+ * 一条 bash 工具完成事件。
+ * @param {string} command
+ * @param {{toolCallId?: string, isError?: boolean, exitCode?: number, text?: string, result?: any}} [options]
+ */
+function bashToolEnd(command, { toolCallId = "call-1", isError = false, exitCode = 0, text = "ok", result } = {}) {
+  return JSON.stringify({
+    type: "tool_execution_end",
+    toolCallId,
+    toolName: "bash",
+    args: { command },
+    result: result ?? { content: [{ type: "text", text }], details: { exitCode } },
+    isError,
   });
 }
 
@@ -84,15 +100,148 @@ test("忽略只含工具调用的 assistant 消息", async () => {
   assert.equal(result.text, "真答案");
 });
 
-test("检测到 bi_query.py 调用时 biTouched 为真", async () => {
+test("bi_query.py 真实执行成功完成时 biTouched 才为真", async () => {
+  const command = "python3 /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki/scripts/bi_query.py 'SELECT 1'";
   const runner = fakeRunner([
-    bashTool("python3 /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki/scripts/bi_query.py 'SELECT 1'"),
+    bashTool(command),
+    JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "1" }], details: { exitCode: 0 } },
+      isError: false,
+    }),
     textMessage("查询结果"),
   ]);
 
   const result = await runAgentTurn({ prompt: "查数据", sessionId: "wx-abc", runner });
 
   assert.equal(result.biTouched, true);
+});
+
+test("bi_query.py 证据识别支持合法转义、引号与拼接，并按 toolCallId 关联完成事件", async () => {
+  const commands = [
+    String.raw`python3 /trusted/bi\_query.py "SELECT 1"`,
+    String.raw`python /trusted/data\ folder/bi_query.py "SELECT 1"`,
+    `python3 "/trusted/"'bi_query'".py" "SELECT 1"`,
+    `python3 /trusted/bi''_query.py 'SELECT 1'`,
+    `python3 '/trusted/bi_query.py' "SELECT 1"`,
+    `python3 "/trusted/literal*/bi_query.py" "SELECT 1"`,
+    `python3 '/trusted/{archive}/bi_query.py' "SELECT 1"`,
+    `python3 '/trusted/$HOME/bi_query.py' "SELECT 1"`,
+    `python3 '/trusted/@(literal)/bi_query.py' "SELECT 1"`,
+    String.raw`python3 /trusted/literal\*/bi_query.py "SELECT 1"`,
+    String.raw`python3 /trusted/\~/bi_query.py "SELECT 1"`,
+  ];
+
+  for (const [index, command] of commands.entries()) {
+    const toolCallId = `quoted-bi-${index}`;
+    const other = "echo python3 /trusted/bi_query.py";
+    const runner = fakeRunner([
+      bashTool(command, toolCallId),
+      bashTool(other, `echo-${index}`),
+      bashToolEnd(other, { toolCallId: `echo-${index}` }),
+      JSON.stringify({
+        type: "tool_execution_end",
+        toolCallId,
+        toolName: "bash",
+        result: { content: [{ type: "text", text: "1" }], details: { exitCode: 0 } },
+        isError: false,
+      }),
+      textMessage("查询结果"),
+    ]);
+
+    const result = await runAgentTurn({ prompt: "查数据", sessionId: `wx-${index}`, runner });
+    assert.equal(result.biTouched, true, command);
+  }
+});
+
+test("bi_query.py 证据识别拒绝假阳性、展开和无法安全解析的命令", async () => {
+  const commands = [
+    `echo "python3 /trusted/bi_query.py"`,
+    `python3 /trusted/search_wiki.py "bi_query.py"`,
+    `python3 -c "print('bi_query.py')" /trusted/bi_query.py`,
+    `python3 /trusted/not_bi_query.py "SELECT 1"`,
+    `python3 "$BI_SCRIPT" "SELECT 1"`,
+    `python3 /trusted/*/bi_query.py "SELECT 1"`,
+    `python3 /trusted/?/bi_query.py "SELECT 1"`,
+    `python3 /trusted/[ab]/bi_query.py "SELECT 1"`,
+    `python3 /trusted/{ajly,lzz}/bi_query.py "SELECT 1"`,
+    `python3 /trusted/@(ajly|lzz)/bi_query.py "SELECT 1"`,
+    `python3 /trusted/+(ajly|lzz)/bi_query.py "SELECT 1"`,
+    `python3 /trusted/!(copy)/bi_query.py "SELECT 1"`,
+    `python3 /trusted/*(copy)/bi_query.py "SELECT 1"`,
+    `python3 /trusted/?(copy)/bi_query.py "SELECT 1"`,
+    `python3 ~/bi_query.py "SELECT 1"`,
+    `python3 /trusted/~/bi_query.py "SELECT 1"`,
+    `python3 $(printf /trusted/bi_query.py) "SELECT 1"`,
+    `python3 \`/trusted/bi_query.py\` "SELECT 1"`,
+    `python3 <(printf /trusted/bi_query.py) "SELECT 1"`,
+    `python3 >(printf /trusted/bi_query.py) "SELECT 1"`,
+    `python3 /trusted/bi_query.py SELECT * FROM tenant`,
+    `python3 "/trusted/bi_query.py "SELECT 1"`,
+    "python3 /trusted/bi_query.py\\",
+    `python3 /trusted/bi_query.py "SELECT 1"; echo done`,
+  ];
+
+  for (const [index, command] of commands.entries()) {
+    const runner = fakeRunner([
+      bashTool(command),
+      bashToolEnd(command),
+      textMessage("没有可信 BI 执行证据"),
+    ]);
+    const result = await runAgentTurn({ prompt: "查数据", sessionId: `false-${index}`, runner });
+    assert.equal(result.biTouched, false, command);
+  }
+});
+
+test("bi_query.py 完成事件不能借用其他 toolCallId 的开始命令", async () => {
+  const command = "python3 /trusted/bi_query.py 'SELECT 1'";
+  const runner = fakeRunner([
+    bashTool(command, "actual-bi"),
+    JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "different-call",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "done" }], details: { exitCode: 0 } },
+      isError: false,
+    }),
+    textMessage("没有完成事件对应关系"),
+  ]);
+
+  const result = await runAgentTurn({ prompt: "查数据", sessionId: "wx-mismatch", runner });
+  assert.equal(result.biTouched, false);
+});
+
+test("bi_query.py 只有开始事件或执行 DENY、异常、非零与错误结果时 biTouched 均为假", async () => {
+  const command = "python3 /instance/context/copy/bi_query.py 'SELECT 1'";
+  const cases = [
+    { name: "只有开始", events: [bashTool(command)] },
+    {
+      name: "扩展 DENY",
+      events: [bashTool(command), bashToolEnd(command, { isError: true, text: "执行审批 DENY" })],
+    },
+    {
+      name: "执行异常",
+      events: [bashTool(command), bashToolEnd(command, { isError: true, text: "spawn failed" })],
+    },
+    {
+      name: "非零退出",
+      events: [bashTool(command), bashToolEnd(command, { exitCode: 2, text: "query failed" })],
+    },
+    {
+      name: "错误结果",
+      events: [bashTool(command), bashToolEnd(command, { result: { error: "database unavailable" } })],
+    },
+  ];
+  for (const item of cases) {
+    const result = await runAgentTurn({
+      prompt: "查数据",
+      sessionId: "wx-abc",
+      runner: fakeRunner([...item.events, textMessage("没有查询结果")]),
+    });
+    assert.equal(result.biTouched, false, item.name);
+  }
 });
 
 test("未调用 bi_query.py 时 biTouched 为假", async () => {
@@ -106,10 +255,27 @@ test("未调用 bi_query.py 时 biTouched 为假", async () => {
   assert.equal(result.biTouched, false);
 });
 
-test("同时有多次 bash 调用时任一命中即 biTouched", async () => {
+test("搜索或读取 bi_query.py 文件名成功也不算执行 BI", async () => {
+  const command = "rg bi_query.py /instance/context";
   const runner = fakeRunner([
-    bashTool("python3 .../scripts/search_db.py 退租"),
-    bashTool("python3 .../scripts/bi_query.py 'SELECT 1'"),
+    bashTool(command),
+    bashToolEnd(command, { text: "queries/bi_query.py" }),
+    textMessage("只找到文件"),
+  ]);
+
+  const result = await runAgentTurn({ prompt: "找查询入口", sessionId: "wx-abc", runner });
+
+  assert.equal(result.biTouched, false);
+});
+
+test("多次 bi_query.py 调用只有成功完成的一次会置 biTouched", async () => {
+  const denied = "python3 /instance/context/bi_query.py 'SELECT 1'";
+  const trusted = "python3 /trusted/lzz/scripts/bi_query.py 'SELECT 1'";
+  const runner = fakeRunner([
+    bashTool(denied, "denied"),
+    bashToolEnd(denied, { toolCallId: "denied", isError: true, text: "DENY" }),
+    bashTool(trusted, "trusted"),
+    bashToolEnd(trusted, { toolCallId: "trusted", text: "1" }),
     textMessage("答案"),
   ]);
 

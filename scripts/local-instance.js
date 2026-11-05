@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -24,6 +24,10 @@ async function main() {
     await ask(args);
     return;
   }
+  if (command === "configure-bi") {
+    await configureBi(args);
+    return;
+  }
   if (command === "init") {
     await init(args);
     return;
@@ -40,7 +44,57 @@ async function main() {
     await exportInstance(args);
     return;
   }
-  throw new Error("用法：local-instance.js init|ask|sync|status|export [选项]");
+  throw new Error("用法：local-instance.js init|ask|sync|status|export|configure-bi [选项]");
+}
+
+async function configureBi(args) {
+  const options = parseConfigureBiArgs(args);
+  const instanceDir = resolve(options.instanceDir);
+  const [defaults, saved] = await Promise.all([
+    readFile(join(projectDir, "config/default.json"), "utf8").then(JSON.parse),
+    readFile(join(instanceDir, "instance.json"), "utf8").then(JSON.parse),
+  ]);
+  const knowledgeBase = defaults.roots?.knowledgeBase;
+  if (typeof knowledgeBase !== "string" || !isAbsolute(knowledgeBase)) {
+    throw new Error("config/default.json 缺少绝对路径 roots.knowledgeBase，无法确定默认可信 BI 目录");
+  }
+  if (!isAbsolute(options.script)) throw new Error("configure-bi 的 --script 必须是绝对路径");
+
+  let realScript;
+  let realDefaultScript;
+  try {
+    realScript = await realpath(options.script);
+    const defaultScript = join(knowledgeBase, "数据库", `${options.business}-db-wiki`, "scripts", "bi_query.py");
+    realDefaultScript = join(await realpath(dirname(defaultScript)), "bi_query.py");
+  } catch {
+    throw new Error("BI 脚本或对应业务线的默认可信目录不存在、悬空或无法解析");
+  }
+  if (!(await stat(realScript)).isFile()) throw new Error("BI 脚本真实路径必须是文件");
+  if (realScript !== realDefaultScript) {
+    throw new Error(`BI 脚本必须解析到 ${options.business} 默认可信目录中的 bi_query.py，不能登记任意副本`);
+  }
+
+  const blockedRoots = [join(instanceDir, "context"), join(instanceDir, "workspace"), projectDir];
+  for (const root of blockedRoots) {
+    let realRoot;
+    try {
+      realRoot = await realpath(root);
+    } catch {
+      throw new Error(`无法解析写根或保护根，配置已拒绝：${root}`);
+    }
+    if (realScript === realRoot || realScript.startsWith(`${realRoot}/`)) {
+      throw new Error("context、workspace 写根与 project 保护根及其别名不能登记为可信 BI");
+    }
+  }
+  if (
+    saved.trustedDataScripts !== undefined &&
+    (!saved.trustedDataScripts || typeof saved.trustedDataScripts !== "object" || Array.isArray(saved.trustedDataScripts))
+  ) {
+    throw new Error("instance.json 的 trustedDataScripts 必须是按业务线登记的对象");
+  }
+  saved.trustedDataScripts = { ...saved.trustedDataScripts, [options.business]: realScript };
+  await writeJson(join(instanceDir, "instance.json"), saved);
+  process.stdout.write(`${JSON.stringify({ status: "ok", instanceDir, business: options.business, script: realScript })}\n`);
 }
 
 async function init(args) {
@@ -983,6 +1037,7 @@ async function executeLocalQuestion({
         entries: context.entries,
         skills: context.skills,
         workspaceDir,
+        trustedDataScripts: config.trustedDataScripts,
       },
       runAgent: async ({ prompt, sessionId, currentSkill }) => {
         const turn = await runAgentTurn({
@@ -1020,6 +1075,25 @@ async function executeLocalQuestion({
 async function createLocalRuntimeConfig(options) {
   const defaults = JSON.parse(await readFile(join(projectDir, "config/default.json"), "utf8"));
   return createSharedLocalRuntimeConfig({ ...options, projectDir, defaults });
+}
+
+function parseConfigureBiArgs(args) {
+  const options = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (!value) throw new Error(`${flag} 缺少值`);
+    index += 1;
+    if (flag === "--instance-dir") options.instanceDir = value;
+    else if (flag === "--business") options.business = value;
+    else if (flag === "--script") options.script = value;
+    else throw new Error(`configure-bi 未知选项：${flag}`);
+  }
+  if (!options.instanceDir || !options.business || !options.script) {
+    throw new Error("configure-bi 需要 --instance-dir、--business 与 --script");
+  }
+  if (!["ajly", "lzz"].includes(options.business)) throw new Error("configure-bi 的 --business 只支持 ajly 或 lzz");
+  return options;
 }
 
 function parseExportArgs(args) {

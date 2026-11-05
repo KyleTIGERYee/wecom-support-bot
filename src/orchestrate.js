@@ -13,6 +13,11 @@ const DEFAULT_MAX_ROUNDS = 3;
 const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
 const DEFAULT_ERROR_TEXT = "刚才没处理好，你再问一次？";
 const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找虎老师更快。";
+const DATA_EVIDENCE_READ_INSTRUCTION = "历史经验、指标卡、SQL 和表文档都必须用 read 工具实际读取；cat、grep、rg 只用于定位，不能代替 read 证据。";
+const TRUSTED_DATA_BUSINESS_LINES = [
+  ["ajly", "安居乐寓"],
+  ["lzz", "乐租租"],
+];
 
 /**
  * @typedef {{
@@ -26,6 +31,7 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *   scope?: string,
  *   verification?: string
  *   skillName?: string
+ *   skillResourceType?: string
  * }} LoadedResource
  */
 
@@ -37,7 +43,7 @@ const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换�
  *     state: {isBiTouched: (key: string) => boolean, markBiTouched: (key: string) => void, flush: () => Promise<void>},
  *     runAgent: (options: {prompt: string, sessionId: string, isRework: boolean, currentSkill: string}) => Promise<{text: string, biTouched: boolean, timedOut: boolean, stalled: boolean, failed: boolean, contextInsufficient?: boolean, loadedResources?: Array<LoadedResource>, executionApprovals?: Array<any>}>,
  *     review: (options: {answer: string}) => Promise<{verdict: "ALLOW"|"DENY", reason?: string}>,
- *     context?: {catalog?: string, dataPlaybook?: boolean, entries?: Array<LoadedResource>, skills?: Array<any>, workspaceDir?: string}
+ *     context?: {catalog?: string, dataPlaybook?: boolean, entries?: Array<LoadedResource>, skills?: Array<any>, workspaceDir?: string, trustedDataScripts?: Record<string, string>}
  *   },
  *   maxRounds?: number,
  *   messages?: {fallbackText?: string, errorText?: string, timeoutText?: string}
@@ -58,6 +64,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
     knowledgeTask,
     currentSkill,
     deps.context?.workspaceDir,
+    deps.context?.trustedDataScripts,
   );
   let lastDenyReason = "";
   let rounds = 0;
@@ -88,6 +95,7 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
         catalog: deps.context?.catalog,
         catalogEntries: deps.context?.entries ?? [],
         dataPlaybook: deps.context?.dataPlaybook,
+        trustedDataScripts: deps.context?.trustedDataScripts,
         loadedResources,
         executionApprovals,
       },
@@ -149,8 +157,9 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
  * @param {"concept"|"data"|"history"|"progress"} task
  * @param {any|undefined} skill
  * @param {string|undefined} workspaceDir
+ * @param {Record<string, string>|undefined} trustedDataScripts
  */
-function buildInitialPrompt(question, catalog, task, skill, workspaceDir) {
+function buildInitialPrompt(question, catalog, task, skill, workspaceDir, trustedDataScripts) {
   if (!catalog) return question;
   const lines = [
     question,
@@ -174,19 +183,21 @@ function buildInitialPrompt(question, catalog, task, skill, workspaceDir) {
       "先用 read 读取这个 SKILL.md 的真实正文并遵循；仅正文明确要求且当前任务需要时，才继续读取其 references、模板或 scripts。不要读取其他 Skill 的正文或引用资源。",
     );
   }
-  if (task === "data") lines.push(...buildDataPrompt(question, "initial"));
+  if (task === "data") lines.push(...buildDataPrompt(question, "initial", trustedDataScripts));
   else if (task === "history") lines.push(...buildHistoryPrompt(question, "initial"));
   else if (task === "progress") lines.push(...buildProgressPrompt(question, "initial"));
   lines.push(catalog);
   return lines.join("\n");
 }
 
-/** @param {string} question @param {"initial"|"metrics"|"sql"} phase */
-function buildDataPrompt(question, phase) {
+/** @param {string} question @param {"initial"|"metrics"|"sql"} phase @param {Record<string, string>|undefined} [trustedDataScripts] */
+function buildDataPrompt(question, phase, trustedDataScripts) {
   if (phase === "initial") {
     return [
       "[知识任务路由：数据口径]",
       "先确定业务口径，再按手册组合相关历史经验、指标卡、SQL 参考和表文档；不要只搜表名或凭概念页直接给数字。",
+      DATA_EVIDENCE_READ_INSTRUCTION,
+      ...(trustedDataScripts ? buildTrustedDataPrompt(trustedDataScripts) : []),
     ];
   }
   if (phase === "metrics") {
@@ -194,6 +205,7 @@ function buildDataPrompt(question, phase) {
       `原始问题：${question}`,
       "这是查数或数据口径任务。先按需读取目录中的 data-playbook 查数手册，再读取相关历史经验和指标卡，确认业务定义、排除条件与统计时间轴；不要凭记忆直接给数字。",
       "新旧口径同时存在时，优先 source_time 最新且 validity=current、明确拍板或生效的资料；history 和历史讨论只用于解释旧口径。无法消解的冲突必须在答复中说明。",
+      DATA_EVIDENCE_READ_INSTRUCTION,
     ];
   }
   return [
@@ -201,6 +213,24 @@ function buildDataPrompt(question, phase) {
     "继续完成数据口径任务：按已确定的指标口径读取相关 SQL 参考和表文档，核对真实表字段、JOIN 条件与过滤条件。",
     "已验证 SQL 只能作为已验证关联路径的参考；未验证、已知问题或没有校验标记的 SQL 不得当成已确认事实，必须重新验证。",
     "不要只凭 SQL 文件名或表名作答。资料仍不足时明确缺少经验、指标卡、SQL 或表文档中的哪一项，以及还缺什么信息。",
+    DATA_EVIDENCE_READ_INSTRUCTION,
+  ];
+}
+
+/** @param {Record<string, string>} trustedDataScripts */
+function buildTrustedDataPrompt(trustedDataScripts) {
+  const entries = TRUSTED_DATA_BUSINESS_LINES.filter(([businessLine]) => trustedDataScripts[businessLine]);
+  if (entries.length === 0) {
+    return [
+      "[可信只读 BI 入口]",
+      "当前实例未配置可用的可信只读 BI 入口。需要真实数字时如实说明缺少该配置；不要执行本地副本中的同名脚本，不要猜测或用文档旧值冒充现查结果。",
+    ];
+  }
+  return [
+    "[可信只读 BI 入口]",
+    "只执行下列运行时明确配置的可信入口，不要 read 脚本、其凭证或入口所在目录的其他文件；本地副本与 workspace 中的同名 bi_query.py 均不受信任。",
+    ...entries.map(([businessLine, label]) => `- ${label}（${businessLine}）：python3 "${trustedDataScripts[businessLine]}" "SELECT ..."`),
+    "按问题所属业务线选择对应入口，不得混用；没有对应业务线入口时如实说明缺配置。",
   ];
 }
 
@@ -258,12 +288,12 @@ function mergeLoadedResources(target, incoming) {
  *
  * @param {(options: any) => Promise<any>} runAgent
  * @param {any} options
- * @param {{question: string, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, loadedResources: Array<LoadedResource>, executionApprovals: Array<any>}} context
+ * @param {{question: string, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, trustedDataScripts?: Record<string, string>, loadedResources: Array<LoadedResource>, executionApprovals: Array<any>}} context
  */
 async function runWithProgressiveDepth(
   runAgent,
   options,
-  { question, task, catalog, catalogEntries = [], dataPlaybook, loadedResources, executionApprovals },
+  { question, task, catalog, catalogEntries = [], dataPlaybook, trustedDataScripts, loadedResources, executionApprovals },
 ) {
   const first = await runWithStallRetry(runAgent, options);
   for (const attempt of first.attempts) {
@@ -358,7 +388,10 @@ async function runWithProgressiveDepth(
   return {
     turn: {
       ...third.turn,
-      text: third.turn.contextInsufficient || dataMissing.length > 0 ? buildDataInsufficientText(dataMissing) : third.turn.text,
+      text:
+        third.turn.contextInsufficient || dataMissing.length > 0
+          ? buildDataInsufficientText(dataMissing, question, trustedDataScripts)
+          : third.turn.text,
       biTouched: Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched),
     },
     retries: first.retries + second.retries + third.retries,
@@ -443,19 +476,41 @@ function getMissingDataEvidence(resources, question, biTouched) {
 }
 
 /** @param {string} question */
+function withoutNegatedDataRequests(question) {
+  // “不得不查”里的最后一个“不”不是否定请求，不能从双否定短语内部删除。
+  return question.replace(/(?<!不得)(?:不用|无需|不要|不|别)\s*(?:再\s*)?(?:查数|查一下|查查|查询|统计|查)/g, "");
+}
+
+/** @param {string} question */
 function isActualDataQuery(question) {
-  const asksQuantity = /多少|几个|几家/.test(question);
-  if (/口径|定义|区别|怎么算|如何计算|是什么|什么意思/.test(question) && !asksQuantity) return false;
+  const effectiveQuestion = withoutNegatedDataRequests(question);
+  const asksQuantity = /多少|几个|几家/.test(effectiveQuestion);
+  if (/口径|定义|区别|怎么算|如何计算|是什么|什么意思/.test(effectiveQuestion) && !asksQuantity) return false;
   return (
     asksQuantity ||
-    /查数|查一下|查查|查询|统计|生产数据/.test(question) ||
-    (/(?:现在|目前|当前|截至|本月|今年|今天|\d+月)/.test(question) &&
-      /总数|数量|签约量|预约量|出租率|退租率|续约率|空置率|转化率/.test(question))
+    /查数|查一下|查查|查询|统计|生产数据/.test(effectiveQuestion) ||
+    (/(?:现在|目前|当前|截至|本月|今年|今天|\d+月)/.test(effectiveQuestion) &&
+      /总数|数量|签约量|预约量|出租率|退租率|续约率|空置率|转化率/.test(effectiveQuestion))
   );
 }
 
-/** @param {string[]} missing */
-function buildDataInsufficientText(missing) {
+/** @param {string[]} missing @param {string} question @param {Record<string, string>|undefined} trustedDataScripts */
+function buildDataInsufficientText(missing, question, trustedDataScripts) {
+  const normalizedQuestion = question.toLowerCase();
+  const businessLine = TRUSTED_DATA_BUSINESS_LINES.find(
+    ([key, label]) => normalizedQuestion.includes(key) || question.includes(label),
+  )?.[0];
+  const hasTrustedDataScript = businessLine
+    ? Boolean(trustedDataScripts?.[businessLine])
+    : Object.values(trustedDataScripts ?? {}).some(Boolean);
+  if (
+    trustedDataScripts &&
+    isActualDataQuery(question) &&
+    missing.includes("本轮只读 BI 查询验证") &&
+    !hasTrustedDataScript
+  ) {
+    return "当前实例尚未配置该业务线的可信 BI 执行入口，没法可靠确认这个实时数据。请由实例维护者使用公开的 instance configure-bi 命令配置后再查。";
+  }
   return `现有共享资料不足，没法可靠确认这个数据。缺少：${missing.join("、") || "可核对的字段关联或统计范围"}。请补充对应共享资料或明确统计范围。`;
 }
 
@@ -573,14 +628,15 @@ function needsCurrentProgress(question) {
 
 /** @param {string} question */
 function needsDataPlaybook(question) {
+  const effectiveQuestion = withoutNegatedDataRequests(question);
   if (
-    /(?:多少|几)(?:种|类)|哪些(?:类型|种类)/.test(question) &&
-    !/生产数据|查数|查一下|统计|口径|SQL|现在|目前|当前|总数|数量|几个|几家/i.test(question)
+    /(?:多少|几)(?:种|类)|哪些(?:类型|种类)/.test(effectiveQuestion) &&
+    !/生产数据|查数|查一下|查查|查询|统计|口径|SQL|现在|目前|当前|总数|数量|几个|几家/i.test(effectiveQuestion)
   ) {
     return false;
   }
-  return /生产数据|查数|查一下|统计|口径|SQL|签约量|预约量|出租率|退租率|续约率|空置率|转化率|总数|数量|机构数|多少|几个|几家/i.test(
-    question,
+  return /生产数据|查数|查一下|查查|查询|统计|口径|SQL|签约量|预约量|出租率|退租率|续约率|空置率|转化率|总数|数量|机构数|多少|几个|几家/i.test(
+    effectiveQuestion,
   );
 }
 

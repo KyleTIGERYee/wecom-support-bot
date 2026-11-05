@@ -509,6 +509,50 @@ test("现在有几个机构路由为数据口径而不是当前项目进展", as
 
   assert.match(firstPrompt, /知识任务路由：数据口径/);
   assert.doesNotMatch(firstPrompt, /知识任务路由：当前进展/);
+  assert.doesNotMatch(firstPrompt, /可信只读 BI 入口|未配置可用的可信/);
+});
+
+test("Skill 引用深度保留知识证据且 loadedSkills 只含真实正文", async () => {
+  const skillBody = {
+    source: "共享 Skills",
+    path: "skills/data-query/SKILL.md",
+    depth: "skill",
+    resourceType: "skill",
+    skillResourceType: "skill",
+    skillName: "data-query",
+  };
+  const evidence = dataEvidence().map((resource) => ({
+    ...resource,
+    path: `skills/data-query/${resource.path}`,
+    depth: "skill-reference",
+    skillResourceType: "skill-reference",
+    skillName: "data-query",
+  }));
+  let calls = 0;
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享 Skills 数据目录", dataPlaybook: true },
+    runAgent: async () => {
+      calls += 1;
+      return {
+        text: "按已确认口径，目前有 56 家机构。",
+        biTouched: true,
+        timedOut: false,
+        failed: false,
+        contextInsufficient: false,
+        loadedResources: [skillBody, ...evidence],
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "查一下目前有多少家机构", sessionKey: "wx-abc", deps });
+
+  assert.equal(calls, 1);
+  assert.equal(result.finalText, "按已确认口径，目前有 56 家机构。");
+  assert.deepEqual(result.loadedSkills, [skillBody]);
+  assert.equal(result.loadDepth, "skill-reference");
+  assert.equal(result.guarded, true);
 });
 
 test("查数只读手册不能交付数字，补齐证据组合后仍经过 Guard", async () => {
@@ -695,6 +739,8 @@ test("查数资料不足时按经验、指标、SQL 和表文档继续深化并�
   assert.match(prompts[2], /已验证/);
   assert.match(prompts[2], /未验证/);
   assert.match(prompts[2], /表文档/);
+  assert.match(prompts[2], /read 工具实际读取/);
+  assert.match(prompts[2], /cat、grep、rg 只用于定位/);
   assert.deepEqual(
     result.loadedResources.map((resource) => resource.depth),
     ["concept", "playbook", "experience", "metrics", "sql", "table"],
@@ -761,6 +807,91 @@ test("新旧指标口径对比路由为数据任务并优先最新明确拍板�
   assert.match(prompts[1], /history|历史讨论/);
   assert.match(prompts[1], /冲突/);
   assert.match(result.finalText, /新口径优先/);
+});
+
+test("明确否定查数与查询的纯概念问题不进入数据口径或 BI 门槛", async () => {
+  const questions = [
+    "请只解释线索来源这个概念，不查数、不查询。",
+    "请只解释线索来源这个概念，不用查询。",
+    "请只解释线索来源这个概念，无需查询。",
+    "请只解释线索来源这个概念，不要查、别查。",
+    "请只解释线索来源这个概念，不统计。",
+    "请只解释线索来源这个概念，不查一下、不查查。",
+  ];
+  for (const question of questions) {
+    const prompts = [];
+    let guardCalls = 0;
+    const concept = { source: "共享业务库", path: "wiki/概念/线索.md", depth: "concept", resourceType: "concept" };
+    const deps = {
+      state: fakeState(false),
+      context: { catalog: "共享业务库目录", dataPlaybook: true },
+      runAgent: async ({ prompt }) => {
+        prompts.push(prompt);
+        return {
+          text: "线索来源分为自然流量与渠道导入。",
+          biTouched: false,
+          timedOut: false,
+          failed: false,
+          contextInsufficient: false,
+          loadedResources: [concept],
+        };
+      },
+      review: async () => {
+        guardCalls += 1;
+        return { verdict: "ALLOW" };
+      },
+    };
+
+    const result = await handleTurn({ question, sessionKey: "wx-abc", deps });
+
+    assert.equal(prompts.length, 1, question);
+    assert.doesNotMatch(prompts[0], /知识任务路由：数据口径/, question);
+    assert.equal(result.finalText, "线索来源分为自然流量与渠道导入。", question);
+    assert.equal(result.guarded, false, question);
+    assert.equal(guardCalls, 0, question);
+  }
+});
+
+test("不得不查询类双重否定仍是真实查数，必须具备 SQL、表文档、成功 BI 与 Guard", async () => {
+  const questions = [
+    "不得不查询入驻机构",
+    "不得不查数机构总数",
+    "不得不查一下机构总数",
+    "不得不查查机构总数",
+    "不得不统计机构总数",
+  ];
+  for (const question of questions) {
+    const prompts = [];
+    let guardCalls = 0;
+    const deps = {
+      state: fakeState(false),
+      context: { catalog: "共享数据库目录", dataPlaybook: true, trustedDataScripts: { ajly: "/trusted/ajly/bi_query.py" } },
+      runAgent: async ({ prompt }) => {
+        prompts.push(prompt);
+        const loadedResources = prompts.length === 1 ? dataEvidence().slice(0, 2) : dataEvidence();
+        return {
+          text: "现查有 56 家机构。",
+          biTouched: prompts.length === 3,
+          timedOut: false,
+          failed: false,
+          contextInsufficient: false,
+          loadedResources,
+        };
+      },
+      review: async () => {
+        guardCalls += 1;
+        return { verdict: "ALLOW" };
+      },
+    };
+
+    const result = await handleTurn({ question, sessionKey: "wx-abc", deps });
+
+    assert.equal(prompts.length, 3, `${question} 必须先补 SQL/表文档，再取得成功 BI 证据`);
+    assert.match(prompts[0], /知识任务路由：数据口径/, question);
+    assert.equal(result.finalText, "现查有 56 家机构。", question);
+    assert.equal(result.guarded, true, question);
+    assert.equal(guardCalls, 1, question);
+  }
 });
 
 test("含总数的纯口径解释只需经验和适用指标，不强制 SQL 表文档或 BI", async () => {
@@ -860,19 +991,88 @@ test("首轮已执行 BI 时后续补 SQL 和表文档可累计现查证据", as
   assert.equal(guardCalls, 1);
 });
 
-test("实际查数资源齐全但本轮未执行 BI 时不能交付现查数字", async () => {
+test("当前业务线未配置可信 BI 时明确提示 configure-bi 而不是共享资料不足", async () => {
   let guardCalls = 0;
+  let firstPrompt = "";
   const evidence = dataEvidence();
   const deps = {
     state: fakeState(false),
-    context: { catalog: "共享数据库目录", dataPlaybook: true },
+    context: {
+      catalog: "共享数据库目录",
+      dataPlaybook: true,
+      trustedDataScripts: { ajly: "/trusted/ajly/bi_query.py" },
+    },
+    runAgent: async ({ prompt }) => {
+      firstPrompt ||= prompt;
+      return {
+        text: "现在有 56 家机构。",
+        biTouched: false,
+        timedOut: false,
+        failed: false,
+        contextInsufficient: false,
+        loadedResources: evidence,
+      };
+    },
+    review: async () => {
+      guardCalls += 1;
+      return { verdict: "ALLOW" };
+    },
+  };
+
+  const result = await handleTurn({ question: "查一下乐租租机构总数", sessionKey: "wx-abc", deps });
+
+  assert.equal(result.finalText.includes("56"), false);
+  assert.match(result.finalText, /当前实例尚未配置该业务线的可信 BI 执行入口/);
+  assert.match(result.finalText, /实例维护者.*instance configure-bi/);
+  assert.doesNotMatch(result.finalText, /共享资料不足|本轮只读 BI 查询验证/);
+  assert.match(firstPrompt, /没有对应业务线入口时如实说明缺配置/);
+  assert.equal(result.guarded, false);
+  assert.equal(guardCalls, 0);
+});
+
+test("当前业务线已配置可信 BI 但本轮未成功查询时保留查询验证缺口", async () => {
+  const deps = {
+    state: fakeState(false),
+    context: {
+      catalog: "共享数据库目录",
+      dataPlaybook: true,
+      trustedDataScripts: { lzz: "/trusted/lzz/bi_query.py" },
+    },
     runAgent: async () => ({
       text: "现在有 56 家机构。",
       biTouched: false,
       timedOut: false,
       failed: false,
       contextInsufficient: false,
-      loadedResources: evidence,
+      loadedResources: dataEvidence(),
+    }),
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "查一下乐租租机构总数", sessionKey: "wx-abc", deps });
+
+  assert.equal(result.finalText.includes("56"), false);
+  assert.match(result.finalText, /本轮只读 BI 查询验证/);
+  assert.doesNotMatch(result.finalText, /尚未配置该业务线的可信 BI 执行入口|instance configure-bi/);
+  assert.equal(result.guarded, false);
+});
+
+test("当前业务线配置可信 BI 且本轮查询成功后交付数字并经过 Guard", async () => {
+  let guardCalls = 0;
+  const deps = {
+    state: fakeState(false),
+    context: {
+      catalog: "共享数据库目录",
+      dataPlaybook: true,
+      trustedDataScripts: { lzz: "/trusted/lzz/bi_query.py" },
+    },
+    runAgent: async () => ({
+      text: "现在有 56 家机构。",
+      biTouched: true,
+      timedOut: false,
+      failed: false,
+      contextInsufficient: false,
+      loadedResources: dataEvidence(),
     }),
     review: async () => {
       guardCalls += 1;
@@ -880,12 +1080,11 @@ test("实际查数资源齐全但本轮未执行 BI 时不能交付现查数字"
     },
   };
 
-  const result = await handleTurn({ question: "查一下机构总数", sessionKey: "wx-abc", deps });
+  const result = await handleTurn({ question: "查一下乐租租机构总数", sessionKey: "wx-abc", deps });
 
-  assert.equal(result.finalText.includes("56"), false);
-  assert.match(result.finalText, /BI 查询|BI 查询验证/);
-  assert.equal(result.guarded, false);
-  assert.equal(guardCalls, 0);
+  assert.equal(result.finalText, "现在有 56 家机构。");
+  assert.equal(result.guarded, true);
+  assert.equal(guardCalls, 1);
 });
 
 test("统计一下机构总数属于实际查数并需 BI 与 Guard", async () => {
@@ -1409,7 +1608,8 @@ test("命中文档 Skill 后交接真实身份并只公开实际读取的正文�
     source: skill.source,
     path: "/instance/context/skills/docx/references/layout.md",
     depth: "skill-reference",
-    resourceType: "skill-reference",
+    resourceType: "concept",
+    skillResourceType: "skill-reference",
     skillName: skill.name,
     sourceTime: skill.sourceTime,
     scope: "shared",

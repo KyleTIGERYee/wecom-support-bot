@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import filesystemWhitelist, { processApprovedToolCall } from "../extensions/bash-whitelist.ts";
@@ -510,6 +510,73 @@ test("S13 外部环境变量不能把可写副本的同名 Python 脚本加入�
   assert.match(result?.reason ?? "", /hard-rule/);
   assert.match(result?.reason ?? "", /不在可审批命令白名单内/);
   assert.equal(model.calls.length, 0, "外部环境变量和模型 ALLOW 均不得覆盖可写同名脚本的硬拒绝");
+});
+
+test("S13 本地实例只执行明确配置的可信 BI 入口，配置也不能放行可写副本", async (t) => {
+  const { root, copyRoot } = await makeCopyRoot(t);
+  const trustedScript = join(root, "trusted/lzz-db-wiki/scripts/bi_query.py");
+  const copyScript = join(copyRoot, "bi_query.py");
+  await mkdir(dirname(trustedScript), { recursive: true });
+  await writeFile(trustedScript, "print('trusted read-only result')\n", { mode: 0o555 });
+  await writeFile(copyScript, "raise SystemExit('untrusted code executed')\n");
+  setEnv(t, "WECOM_BOT_TRUSTED_DATA_SCRIPTS", JSON.stringify({ lzz: trustedScript, ajly: copyScript }));
+  const model = await startApprovalModel(t, () => "ALLOW\n理由：模型不应审批只读 BI 硬规则\n风险：低");
+  const handler = await loadEnabledApprovalHook(t, {
+    readRoots: [copyRoot],
+    writeRoots: [copyRoot],
+    baseUrl: model.baseUrl,
+  });
+
+  const deniedCopy = await handler({
+    type: "tool_call",
+    toolCallId: "copy-bi",
+    toolName: "bash",
+    input: { command: `python3 "${copyScript}" "SELECT 1"` },
+  }, taskContext("尝试执行副本 BI"));
+  const allowedTrusted = await handler({
+    type: "tool_call",
+    toolCallId: "trusted-bi",
+    toolName: "bash",
+    input: { command: `python3 "${trustedScript}" "SELECT 1"` },
+  }, taskContext("按乐租租口径执行可信只读 BI"));
+
+  assert.equal(deniedCopy?.block, true);
+  assert.match(deniedCopy?.reason ?? "", /hard-rule/);
+  assert.equal(allowedTrusted, undefined);
+  assert.equal(model.calls.length, 0, "可信只读 BI 与副本硬拒绝都不进入写操作审批模型");
+});
+
+test("S13 保护根符号链接别名与悬空 BI 入口 fail-closed，模型 ALLOW 不可覆盖", async (t) => {
+  const { root, copyRoot } = await makeCopyRoot(t);
+  const protectedRoot = join(root, "protected-project");
+  const protectedAlias = join(root, "protected-alias");
+  const aliasedScript = join(protectedAlias, "scripts/bi_query.py");
+  const danglingAlias = join(root, "dangling-alias");
+  const danglingScript = join(danglingAlias, "bi_query.py");
+  await mkdir(dirname(join(protectedRoot, "scripts/bi_query.py")), { recursive: true });
+  await writeFile(join(protectedRoot, "scripts/bi_query.py"), "print('must not execute through alias')\n", { mode: 0o555 });
+  await symlink(protectedRoot, protectedAlias, "dir");
+  await symlink(join(root, "missing-target"), danglingAlias, "dir");
+  setEnv(t, "WECOM_BOT_TRUSTED_DATA_SCRIPTS", JSON.stringify({ lzz: aliasedScript, ajly: danglingScript }));
+  const model = await startApprovalModel(t, () => "ALLOW\n理由：模型不能扩大 BI 执行边界\n风险：低");
+  const handler = await loadEnabledApprovalHook(t, {
+    readRoots: [copyRoot],
+    writeRoots: [copyRoot],
+    protectedRoots: [protectedRoot],
+    baseUrl: model.baseUrl,
+  });
+
+  for (const [toolCallId, script] of [["protected-alias-bi", aliasedScript], ["dangling-bi", danglingScript]]) {
+    const result = await handler({
+      type: "tool_call",
+      toolCallId,
+      toolName: "bash",
+      input: { command: `python3 "${script}" "SELECT 1"` },
+    }, taskContext("尝试通过别名执行保护根脚本"));
+    assert.equal(result?.block, true, script);
+    assert.match(result?.reason ?? "", /hard-rule/, script);
+  }
+  assert.equal(model.calls.length, 0, "真实路径硬拒绝不能进入模型审批，更不能被 ALLOW 覆盖");
 });
 
 test("S13 Python 选项不能借受信任脚本路径绕过脚本入口硬规则", async () => {

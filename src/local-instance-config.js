@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
 
 /**
  * 本地实例共用的运行时配置。公开 ask 与企微入口必须使用同一份本地副本、
@@ -18,7 +18,7 @@ import { join, resolve } from "node:path";
  *   imagesDir?: string | null
  * }} options
  */
-export function createLocalRuntimeConfig({
+export async function createLocalRuntimeConfig({
   projectDir,
   defaults,
   saved,
@@ -32,10 +32,15 @@ export function createLocalRuntimeConfig({
   const approvalModel = saved.models.executionApproval ?? saved.models.main;
   const quickModel = saved.models.quick ?? saved.models.main;
   const roots = [join(catalogRoot, "context"), workspaceDir, ...(imagesDir ? [imagesDir] : [])];
+  const trustedDataScripts = await resolveTrustedDataScripts({
+    saved,
+    blockedRoots: [join(catalogRoot, "context"), workspaceDir, projectDir],
+  });
   return {
     ...defaults,
     projectDir,
     roots,
+    trustedDataScripts,
     namedRoots: Object.fromEntries(roots.map((path, index) => [`local${index + 1}`, path])),
     writeRoots: [join(catalogRoot, "context"), workspaceDir],
     protectedRoots: [projectDir],
@@ -71,6 +76,43 @@ export function createLocalRuntimeConfig({
 }
 
 /**
+ * 可信 BI 只允许明确配置的两条业务线入口；未显式配置时保持为空。
+ * 这里只检查路径与文件类型，不读取脚本或凭证内容。
+ *
+ * @param {{saved: any, blockedRoots: string[]}} options
+ * @returns {Promise<Record<string, string>>}
+ */
+async function resolveTrustedDataScripts({ saved, blockedRoots }) {
+  const configured = Object.hasOwn(saved, "trustedDataScripts") ? saved.trustedDataScripts : {};
+  if (!configured || typeof configured !== "object" || Array.isArray(configured)) return {};
+
+  /** @type {string[]} */
+  let realBlockedRoots;
+  try {
+    // 候选、写根与保护根必须使用同一真实路径语义；任一根无法解析时整体 fail-closed。
+    realBlockedRoots = await Promise.all(blockedRoots.map((root) => realpath(root)));
+  } catch {
+    return {};
+  }
+
+  /** @type {Record<string, string>} */
+  const trusted = {};
+  for (const businessLine of ["ajly", "lzz"]) {
+    const candidate = configured[businessLine];
+    if (typeof candidate !== "string" || !isAbsolute(candidate) || basename(candidate) !== "bi_query.py") continue;
+    try {
+      const realPath = await realpath(candidate);
+      if (!(await stat(realPath)).isFile()) continue;
+      const blocked = realBlockedRoots.some((root) => realPath === root || realPath.startsWith(`${root}${sep}`));
+      if (!blocked) trusted[businessLine] = realPath;
+    } catch {
+      // 不存在、悬空链接或无法安全解析的入口不注入运行时；查数 prompt 会如实报告缺配置。
+    }
+  }
+  return trusted;
+}
+
+/**
  * 企微服务从控制台选择的本地实例加载配置与当前测试/正式机器人。
  * @param {string} projectDir
  * @param {string} instanceDir
@@ -89,7 +131,7 @@ export async function loadLocalInstanceConfig(projectDir, instanceDir, { env = p
   if (!["test", "production"].includes(active)) throw new Error("企微通道必须明确选择 test 或 production");
   const channel = channels[active];
   if (!channel?.botId || !channel?.secret) throw new Error(`当前 ${active} 企微机器人凭证未配置`);
-  const config = createLocalRuntimeConfig({
+  const config = await createLocalRuntimeConfig({
     projectDir,
     defaults,
     saved,
