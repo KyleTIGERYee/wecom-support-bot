@@ -316,7 +316,12 @@ async function runWithProgressiveDepth(
     dataTask &&
     first.turn.contextInsufficient &&
     !loadedResources.some((resource) => resource.depth === "playbook");
-  const dataEvidenceNeeded = dataTask && getMissingDataEvidence(loadedResources, question, first.turn.biTouched).length > 0;
+  const dataEvidenceNeeded =
+    dataTask &&
+    !deliverableDataEvidence(
+      getMissingDataEvidence(loadedResources, question, Boolean(first.turn.biTouched)),
+      Boolean(first.turn.biTouched),
+    );
   const historyEvidenceNeeded = historyTask && getMissingHistoryEvidence(loadedResources, question, catalogEntries).length > 0;
   const progressEvidenceNeeded = progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries);
   if (
@@ -354,10 +359,15 @@ async function runWithProgressiveDepth(
     : progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries)
       ? ["最新且明确有效的共享项目资料"]
       : [];
+  const secondMissing = getMissingDataEvidence(
+    loadedResources,
+    question,
+    Boolean(first.turn.biTouched || second.turn.biTouched),
+  );
   const dataNeedsThird =
     dataTask &&
     (second.turn.contextInsufficient ||
-      getMissingDataEvidence(loadedResources, question, Boolean(first.turn.biTouched || second.turn.biTouched)).length > 0);
+      !deliverableDataEvidence(secondMissing, Boolean(first.turn.biTouched || second.turn.biTouched)));
   if (!dataTask || !dataNeedsThird || second.turn.failed || second.turn.timedOut || second.turn.stalled) {
     return {
       turn: {
@@ -389,7 +399,8 @@ async function runWithProgressiveDepth(
     turn: {
       ...third.turn,
       text:
-        third.turn.contextInsufficient || dataMissing.length > 0
+        third.turn.contextInsufficient ||
+        !deliverableDataEvidence(dataMissing, Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched))
           ? buildDataInsufficientText(dataMissing, question, trustedDataScripts)
           : third.turn.text,
       biTouched: Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched),
@@ -452,11 +463,20 @@ function buildSharedInsufficientText(task, detail, missing) {
  * 查数证据由编排层验收，不依赖模型自报不足。口径题需要经验和指标；具体数字、
  * 字段或 SQL 任务还需要 SQL 参考和表文档。
  *
+ * 两个收敛边界：
+ * - 同事直接给 SQL 执行属于通道执行任务，没有业务口径问题，唯一要求是本轮真的
+ *   执行过可信查询；
+ * - 其余查数任务里，经验层只用于校准口径。当指标卡、已验证 SQL 与表文档都已读、
+ *   且本轮可信查询真的执行过时，缺经验一项不再否决已经过执行验证的答复。
+ *
  * @param {Array<LoadedResource>} resources
  * @param {string} question
  * @param {boolean} biTouched
  */
 function getMissingDataEvidence(resources, question, biTouched) {
+  if (isExplicitSqlExecution(question)) {
+    return biTouched ? [] : ["本轮只读 BI 查询验证"];
+  }
   const has = (/** @type {string} */ type) =>
     resources.some((resource) => (resource.resourceType ?? resource.depth) === type);
   const missing = [
@@ -475,10 +495,31 @@ function getMissingDataEvidence(resources, question, biTouched) {
   return missing;
 }
 
+/**
+ * 当前缺口是否已经可以交付：要么证据链齐备，要么口径证据齐备且本轮可信查询
+ * 真的执行过、只差校准用的经验层——执行结果就是比经验更强的验证。
+ *
+ * @param {string[]} missing
+ * @param {boolean} biTouched
+ */
+function deliverableDataEvidence(missing, biTouched) {
+  return missing.length === 0 || (biTouched && missing.every((item) => item === "相关历史经验"));
+}
+
 /** @param {string} question */
 function withoutNegatedDataRequests(question) {
   // “不得不查”里的最后一个“不”不是否定请求，不能从双否定短语内部删除。
   return question.replace(/(?<!不得)(?:不用|无需|不要|不|别)\s*(?:再\s*)?(?:查数|查一下|查查|查询|统计|查)/g, "");
+}
+
+/** @param {string} question */
+function isExplicitSqlExecution(question) {
+  // 同事明确给出要执行的 SQL（“执行 SELECT …”“跑一下这条 SQL”或直接粘贴
+  // SELECT … FROM 语句）：这是通道执行任务，不走业务口径证据链。
+  return (
+    /(?:执行|运行|跑(?:一下|一?次)?)\s*(?:这(?:条|个|段)|以下|下面|上述)?\s*(?:SQL|SELECT|语句)/i.test(question) ||
+    /\bSELECT\b[^？?\n]{0,300}\bFROM\b/i.test(question)
+  );
 }
 
 /** @param {string} question */
@@ -628,6 +669,7 @@ function needsCurrentProgress(question) {
 
 /** @param {string} question */
 function needsDataPlaybook(question) {
+  if (isExplicitSqlExecution(question)) return true;
   const effectiveQuestion = withoutNegatedDataRequests(question);
   if (
     /(?:多少|几)(?:种|类)|哪些(?:类型|种类)/.test(effectiveQuestion) &&

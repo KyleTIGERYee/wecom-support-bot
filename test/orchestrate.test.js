@@ -1087,6 +1087,148 @@ test("当前业务线配置可信 BI 且本轮查询成功后交付数字并经�
   assert.equal(guardCalls, 1);
 });
 
+test("同事直接给 SQL 执行且本轮可信查询成功后立即交付，不强制口径证据链", async () => {
+  const prompts = [];
+  let guardCalls = 0;
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享数据库目录", dataPlaybook: true, trustedDataScripts: { ajly: "/trusted/ajly/bi_query.py" } },
+    runAgent: async ({ prompt }) => {
+      prompts.push(prompt);
+      return {
+        text: "查询结果：today = 2026-11-06",
+        biTouched: true,
+        timedOut: false,
+        failed: false,
+        contextInsufficient: false,
+        loadedResources: [],
+      };
+    },
+    review: async () => {
+      guardCalls += 1;
+      return { verdict: "ALLOW" };
+    },
+  };
+
+  const result = await handleTurn({
+    question: "用可信BI入口（python3 bi_query.py）执行 SELECT CURDATE() AS today，把查询结果告诉我",
+    sessionKey: "wx-abc",
+    deps,
+  });
+
+  assert.equal(prompts.length, 1);
+  assert.equal(result.finalText, "查询结果：today = 2026-11-06");
+  assert.equal(result.guarded, true);
+  assert.equal(guardCalls, 1);
+});
+
+test("同事直接给 SQL 但本轮未执行可信查询时不交付编造结果", async () => {
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享数据库目录", dataPlaybook: true, trustedDataScripts: { ajly: "/trusted/ajly/bi_query.py" } },
+    runAgent: async () => ({
+      text: "查询结果：today = 2026-11-06。",
+      biTouched: false,
+      timedOut: false,
+      failed: false,
+      contextInsufficient: false,
+      loadedResources: [],
+    }),
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({
+    question: "用可信BI入口（python3 bi_query.py）执行 SELECT CURDATE() AS today，把查询结果告诉我",
+    sessionKey: "wx-abc",
+    deps,
+  });
+
+  assert.equal(result.finalText.includes("2026-11-06"), false);
+  assert.match(result.finalText, /资料不足|BI/);
+});
+
+test("不含查询字样的显式 SQL 执行请求也路由为数据任务并注入可信 BI 入口", async () => {
+  const prompts = [];
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享数据库目录", dataPlaybook: true, trustedDataScripts: { ajly: "/trusted/ajly/bi_query.py" } },
+    runAgent: async ({ prompt }) => {
+      prompts.push(prompt);
+      return {
+        text: "查询结果：today = 2026-11-06",
+        biTouched: true,
+        timedOut: false,
+        failed: false,
+        contextInsufficient: false,
+        loadedResources: [],
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({
+    question: "执行 SELECT CURDATE() AS today，把结果发我",
+    sessionKey: "wx-abc",
+    deps,
+  });
+
+  assert.match(prompts[0], /可信只读 BI 入口/, "数据任务首提示应包含可信 BI 入口指令");
+  assert.equal(prompts.length, 1);
+  assert.equal(result.finalText, "查询结果：today = 2026-11-06");
+});
+
+test("BI 已执行且指标、已验证 SQL 与表文档齐备时缺经验不再吞掉已验证答案", async () => {
+  const prompts = [];
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享数据库目录", dataPlaybook: true },
+    runAgent: async ({ prompt }) => {
+      prompts.push(prompt);
+      return {
+        text: "净口径在租 50,041 间。",
+        biTouched: true,
+        timedOut: false,
+        failed: false,
+        contextInsufficient: false,
+        loadedResources: [dataEvidence()[1], dataEvidence()[2], dataEvidence()[3]],
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "查一下乐寓在租的房间数是多少", sessionKey: "wx-abc", deps });
+
+  assert.equal(prompts.length, 1, "证据只缺经验且 BI 已真执行时不再追加深化阶段");
+  assert.equal(result.finalText, "净口径在租 50,041 间。");
+  assert.equal(result.guarded, true);
+});
+
+test("BI 在深化阶段才执行且只缺经验时交付该阶段答案，不再强制第三阶段", async () => {
+  const prompts = [];
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享数据库目录", dataPlaybook: true },
+    runAgent: async ({ prompt }) => {
+      prompts.push(prompt);
+      const executed = prompts.length >= 2;
+      return {
+        text: executed ? "已按指标卡和已验证 SQL 复核：净口径在租 50,041 间。" : "需要继续核对指标。",
+        biTouched: executed,
+        timedOut: false,
+        failed: false,
+        contextInsufficient: !executed,
+        loadedResources: prompts.length === 1 ? [dataEvidence()[1]] : [dataEvidence()[1], dataEvidence()[2], dataEvidence()[3]],
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  const result = await handleTurn({ question: "查一下乐寓在租的房间数是多少", sessionKey: "wx-abc", deps });
+
+  assert.equal(prompts.length, 2);
+  assert.equal(result.finalText, "已按指标卡和已验证 SQL 复核：净口径在租 50,041 间。");
+});
+
 test("统计一下机构总数属于实际查数并需 BI 与 Guard", async () => {
   const prompts = [];
   let guardCalls = 0;
