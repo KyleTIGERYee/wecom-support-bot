@@ -2046,6 +2046,9 @@ test("空白实例独立配置四模型并完整检查，快速问题使用快�
   assert.equal(piModels.providers["local-instance-quick"].apiKey, "fake-quick-key");
   assert.equal(piModels.providers["local-instance-approval"].models[0].id, "approval-model");
   assert.equal(piModels.providers["local-instance-guard"].models[0].id, "guard-model");
+  for (const [name, provider] of Object.entries(piModels.providers)) {
+    assert.deepEqual(provider.models[0].input, ["text", "image"], `${name} 的模型必须声明支持图片输入`);
+  }
   const saved = JSON.parse(await readFile(join(instanceDir, "instance.json"), "utf8"));
   assert.deepEqual(saved.models.quick, { baseUrl: models.baseUrl, model: "quick-model" });
 

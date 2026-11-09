@@ -48,3 +48,19 @@ test("initialization.md 提到的 setup 开关都被 setup 接受", async () => 
     }
   }
 });
+
+test("core.md 与 local-instance.md 都包含图片降级话术铁律", async () => {
+  for (const promptFile of ["prompts/core.md", "prompts/local-instance.md"]) {
+    const prompt = await readFile(join(projectDir, promptFile), "utf8");
+    assert.match(
+      prompt,
+      /图这边打不开，麻烦把截图里的关键文字（报错、菜单名、数字）贴给我/,
+      `${promptFile} 应包含标准图片降级话术`,
+    );
+    assert.match(
+      prompt,
+      /不得解释打不开的原因，不得提及模型、机器人、版本或内部实现/,
+      `${promptFile} 应禁止解释原因与提及内部实现`,
+    );
+  }
+});

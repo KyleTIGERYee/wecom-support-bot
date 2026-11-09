@@ -2938,7 +2938,7 @@ function createPiProvider(baseUrl, apiKey, model) {
         id: model,
         name: model,
         reasoning: true,
-        input: ["text"],
+        input: ["text", "image"],
         contextWindow: 200000,
         maxTokens: 32768,
       },
