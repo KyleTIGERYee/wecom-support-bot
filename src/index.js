@@ -17,6 +17,7 @@ import { handleTurn } from "./orchestrate.js";
 import { createDefaultResourceCatalog, createLocalResourceCatalog } from "./resource-catalog.js";
 import { runTurnLifecycle } from "./turn-lifecycle.js";
 import { deliverFinal } from "./deliver.js";
+import { deliverWorkspaceFiles, parseDeliveryMarkers } from "./file-delivery.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
 import { downloadImages } from "./images.js";
 
@@ -39,6 +40,8 @@ const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 async function main() {
   const config = await loadConfig(projectDir);
   const runtimeDir = config.localInstance?.instanceDir ?? projectDir;
+  // 实例模式下 agent 的工作区：答复末尾声明的交付文件从这里读取
+  const workspaceDir = config.localInstance ? join(config.localInstance.instanceDir, "workspace") : undefined;
   const resourceContext = config.localInstance
     ? await createLocalResourceCatalog(
         config.localInstance.instanceDir,
@@ -277,7 +280,7 @@ async function main() {
         sessionKey,
         deps: {
           state,
-          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills, workspaceDir: config.localInstance ? join(config.localInstance.instanceDir, "workspace") : undefined, trustedDataScripts: config.trustedDataScripts },
+          context: { catalog: resourceContext.text, dataPlaybook: resourceContext.dataPlaybook, entries: resourceContext.entries, skills: resourceContext.skills, workspaceDir, trustedDataScripts: config.trustedDataScripts },
           runAgent: async ({ prompt, sessionId, currentSkill }) => {
             const agentStartedAt = Date.now();
             const agentTurn = await runAgentTurn({
@@ -346,7 +349,8 @@ async function main() {
       return;
     }
 
-    const text = outcome.text || config.surface.errorText;
+    // 末尾带 [交付文件： 文件名] 标记的答复：标记行从正文剥掉再发，文件在答复送达后单独投递
+    const { cleanText: text, files: deliveryFiles } = parseDeliveryMarkers(outcome.text || config.surface.errorText);
     const delivery = await sendAnswer({
       // 转后台后流式消息已收尾，只能主动推送
       text,
@@ -365,6 +369,22 @@ async function main() {
     state.recordActivity(userKey, { at: Date.now(), inputTokens: lastInputTokens });
     await state.flush();
 
+    // 答复已送达才补发文件（群聊发群、单聊发人，与 sendAnswer 的推送目标一致）；
+    // 文件发不出去不影响已成功的答复，单文件失败由 deliverWorkspaceFiles 内部记日志
+    /** @type {{sent: string[], failed: string[]}} */
+    let fileDelivery = { sent: [], failed: [] };
+    if (deliveryFiles.length > 0 && delivery.channel !== "none") {
+      if (workspaceDir) {
+        try {
+          fileDelivery = await deliverWorkspaceFiles({ client, target: chatId || userId, workspaceDir, files: deliveryFiles, log });
+        } catch (error) {
+          void log.warn("文件交付异常", { msgid, message: String(/** @type {any} */ (error)?.message ?? error) });
+        }
+      } else {
+        void log.warn("答复声明了交付文件，但当前运行模式没有工作区", { msgid, files: deliveryFiles });
+      }
+    }
+
     await log.info("答复完成", {
       msgid,
       sessionKey,
@@ -373,6 +393,8 @@ async function main() {
       mode: outcome.mode,
       channel: delivery.channel,
       sendFailure: delivery.reason,
+      fileSent: fileDelivery.sent,
+      fileFailed: fileDelivery.failed,
       rounds: outcome.result.rounds,
       guarded: outcome.result.guarded,
       exhausted: outcome.result.exhausted,

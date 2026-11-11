@@ -64,3 +64,12 @@ test("core.md 与 local-instance.md 都包含图片降级话术铁律", async ()
     );
   }
 });
+
+test("core.md 与 local-instance.md 都包含文件交付标记说明", async () => {
+  for (const promptFile of ["prompts/core.md", "prompts/local-instance.md"]) {
+    const prompt = await readFile(join(projectDir, promptFile), "utf8");
+    assert.match(prompt, /\[交付文件[：:]\s*文件名\]/, `${promptFile} 应说明交付标记格式`);
+    assert.match(prompt, /文件会作为企微文件消息直接发给同事/, `${promptFile} 应说明文件直达同事`);
+    assert.match(prompt, /标记行必须独占一行/, `${promptFile} 应要求标记独占一行`);
+  }
+});
