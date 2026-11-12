@@ -73,3 +73,16 @@ test("core.md 与 local-instance.md 都包含文件交付标记说明", async ()
     assert.match(prompt, /标记行必须独占一行/, `${promptFile} 应要求标记独占一行`);
   }
 });
+
+test("core.md 与 local-instance.md 都包含交付文件的脱敏与资源区约束", async () => {
+  for (const promptFile of ["prompts/core.md", "prompts/local-instance.md"]) {
+    const prompt = await readFile(join(projectDir, promptFile), "utf8");
+    assert.match(prompt, /交付的文件同样受隐私守护约束/, `${promptFile} 应说明交付文件受隐私守护约束`);
+    assert.match(prompt, /敏感字段脱敏后再写入文件/, `${promptFile} 应要求敏感字段脱敏后再写入`);
+    assert.match(prompt, /默认给汇总口径/, `${promptFile} 应说明默认汇总口径`);
+    assert.match(prompt, /同事明确要明细就直接给明细/, `${promptFile} 应说明要明细就直接给明细`);
+    assert.match(prompt, /不要推给审批/, `${promptFile} 应说明不推给审批`);
+    assert.match(prompt, /整份拷贝到工作区交付/, `${promptFile} 应禁止整份拷贝资源区文件交付`);
+    assert.match(prompt, /基于资料为同事重新整理生成/, `${promptFile} 应要求基于资料重新整理生成`);
+  }
+});

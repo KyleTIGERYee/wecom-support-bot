@@ -17,7 +17,7 @@ import { handleTurn } from "./orchestrate.js";
 import { createDefaultResourceCatalog, createLocalResourceCatalog } from "./resource-catalog.js";
 import { runTurnLifecycle } from "./turn-lifecycle.js";
 import { deliverFinal } from "./deliver.js";
-import { deliverWorkspaceFiles, parseDeliveryMarkers } from "./file-delivery.js";
+import { deliverWorkspaceFiles, parseDeliveryMarkers, snapshotWorkspace } from "./file-delivery.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
 import { downloadImages } from "./images.js";
 
@@ -261,6 +261,10 @@ async function main() {
     inbox.markRunning(msgid);
     let lastInputTokens = 0;
 
+    // 本轮开始先给工作区拍 mtime 快照：投递时只有本轮新生成/修改过的文件才放行，
+    // 必须赶在 agent 跑起来写文件之前拍
+    const workspaceBaseline = workspaceDir ? await snapshotWorkspace(workspaceDir) : null;
+
     // 先分诊：闲聊与概念题没必要最高思考强度（试运行里连「你好」都要 9–52 秒）
     let route = "deep";
     if (config.routing.enabled) {
@@ -376,7 +380,17 @@ async function main() {
     if (deliveryFiles.length > 0 && delivery.channel !== "none") {
       if (workspaceDir) {
         try {
-          fileDelivery = await deliverWorkspaceFiles({ client, target: chatId || userId, workspaceDir, files: deliveryFiles, log });
+          fileDelivery = await deliverWorkspaceFiles({
+            client,
+            target: chatId || userId,
+            workspaceDir,
+            files: deliveryFiles,
+            log,
+            baseline: workspaceBaseline,
+            // 文件内容与答复正文过同一道隐私守卫：文件名拼进首行，让 guard 知道审的是什么
+            guard: async (content, filename) =>
+              reviewReply({ answer: `待交付文件 ${filename} 的内容：\n${content}`, callModel }),
+          });
         } catch (error) {
           void log.warn("文件交付异常", { msgid, message: String(/** @type {any} */ (error)?.message ?? error) });
         }
