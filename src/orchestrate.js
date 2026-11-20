@@ -8,6 +8,7 @@
 import { dirname } from "node:path";
 
 import { getLoadDepth } from "./resource-catalog.js";
+import { hasAttachedFiles, stripSystemSupplement } from "./files.js";
 
 const DEFAULT_MAX_ROUNDS = 3;
 const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
@@ -56,8 +57,12 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
   const errorText = messages.errorText ?? DEFAULT_ERROR_TEXT;
   const timeoutText = messages.timeoutText ?? DEFAULT_TIMEOUT_TEXT;
 
-  const knowledgeTask = classifyKnowledgeTask(question);
-  const currentSkill = selectSkill(question, deps.context?.skills, knowledgeTask);
+  const rawQuestion = stripSystemSupplement(question);
+  const attachedFiles = hasAttachedFiles(question);
+  const hasUserText =
+    rawQuestion !== "" && !/^（同事(?:只发了(?:图片|文件)|随消息附了图片和文件)，没有附文字）$/.test(rawQuestion);
+  const knowledgeTask = classifyKnowledgeTask(rawQuestion);
+  const currentSkill = hasUserText ? selectSkill(rawQuestion, deps.context?.skills, knowledgeTask) : undefined;
   let prompt = buildInitialPrompt(
     question,
     deps.context?.catalog,
@@ -90,7 +95,8 @@ export async function handleTurn({ question, sessionKey, deps, maxRounds = DEFAU
       runAgent,
       { prompt, sessionId: sessionKey, isRework, currentSkill: currentSkill?.name ?? "unknown" },
       {
-        question,
+        question: rawQuestion,
+        attachedFiles,
         task: knowledgeTask,
         catalog: deps.context?.catalog,
         catalogEntries: deps.context?.entries ?? [],
@@ -231,6 +237,7 @@ function buildTrustedDataPrompt(trustedDataScripts) {
     "只执行下列运行时明确配置的可信入口，不要 read 脚本、其凭证或入口所在目录的其他文件；本地副本与 workspace 中的同名 bi_query.py 均不受信任。",
     ...entries.map(([businessLine, label]) => `- ${label}（${businessLine}）：python3 "${trustedDataScripts[businessLine]}" "SELECT ..."`),
     "按问题所属业务线选择对应入口，不得混用；没有对应业务线入口时如实说明缺配置。",
+    "查数入口单次最多返回 100 行：明细、导出、清单类请求超过 100 行时，不要承诺整表导出，也不要在没写出文件时声明交付；如实说明只能核对样本或汇总，整表建议走 BI 导出或找虎老师。",
   ];
 }
 
@@ -288,12 +295,12 @@ function mergeLoadedResources(target, incoming) {
  *
  * @param {(options: any) => Promise<any>} runAgent
  * @param {any} options
- * @param {{question: string, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, trustedDataScripts?: Record<string, string>, loadedResources: Array<LoadedResource>, executionApprovals: Array<any>}} context
+ * @param {{question: string, attachedFiles?: boolean, task: "concept"|"data"|"history"|"progress", catalog?: string, catalogEntries?: Array<LoadedResource>, dataPlaybook?: boolean, trustedDataScripts?: Record<string, string>, loadedResources: Array<LoadedResource>, executionApprovals: Array<any>}} context
  */
 async function runWithProgressiveDepth(
   runAgent,
   options,
-  { question, task, catalog, catalogEntries = [], dataPlaybook, trustedDataScripts, loadedResources, executionApprovals },
+  { question, attachedFiles = false, task, catalog, catalogEntries = [], dataPlaybook, trustedDataScripts, loadedResources, executionApprovals },
 ) {
   const first = await runWithStallRetry(runAgent, options);
   for (const attempt of first.attempts) {
@@ -316,14 +323,18 @@ async function runWithProgressiveDepth(
     dataTask &&
     first.turn.contextInsufficient &&
     !loadedResources.some((resource) => resource.depth === "playbook");
+  // 同事随消息附了本地文件时，主回答可能完全来自附件本身，不强行要求补齐知识库/BI 证据链
   const dataEvidenceNeeded =
+    !attachedFiles &&
     dataTask &&
     !deliverableDataEvidence(
       getMissingDataEvidence(loadedResources, question, Boolean(first.turn.biTouched)),
       Boolean(first.turn.biTouched),
     );
-  const historyEvidenceNeeded = historyTask && getMissingHistoryEvidence(loadedResources, question, catalogEntries).length > 0;
-  const progressEvidenceNeeded = progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries);
+  const historyEvidenceNeeded =
+    !attachedFiles && historyTask && getMissingHistoryEvidence(loadedResources, question, catalogEntries).length > 0;
+  const progressEvidenceNeeded =
+    !attachedFiles && progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries);
   if (
     !rawNeeded &&
     !playbookNeeded &&
@@ -354,9 +365,9 @@ async function runWithProgressiveDepth(
     mergeLoadedResources(loadedResources, attempt.loadedResources);
     executionApprovals.push(...(attempt.executionApprovals ?? []));
   }
-  const sharedMissing = historyTask
+  const sharedMissing = !attachedFiles && historyTask
     ? getMissingHistoryEvidence(loadedResources, question, catalogEntries)
-    : progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries)
+    : !attachedFiles && progressTask && !hasCurrentProjectEvidence(loadedResources, catalogEntries)
       ? ["最新且明确有效的共享项目资料"]
       : [];
   const secondMissing = getMissingDataEvidence(
@@ -367,7 +378,8 @@ async function runWithProgressiveDepth(
   const dataNeedsThird =
     dataTask &&
     (second.turn.contextInsufficient ||
-      !deliverableDataEvidence(secondMissing, Boolean(first.turn.biTouched || second.turn.biTouched)));
+      (!attachedFiles &&
+        !deliverableDataEvidence(secondMissing, Boolean(first.turn.biTouched || second.turn.biTouched))));
   if (!dataTask || !dataNeedsThird || second.turn.failed || second.turn.timedOut || second.turn.stalled) {
     return {
       turn: {
@@ -395,14 +407,16 @@ async function runWithProgressiveDepth(
     question,
     Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched),
   );
+  const shouldBuildDataInsufficient =
+    third.turn.contextInsufficient ||
+    (!attachedFiles &&
+      !deliverableDataEvidence(dataMissing, Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched)));
   return {
     turn: {
       ...third.turn,
-      text:
-        third.turn.contextInsufficient ||
-        !deliverableDataEvidence(dataMissing, Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched))
-          ? buildDataInsufficientText(dataMissing, question, trustedDataScripts)
-          : third.turn.text,
+      text: shouldBuildDataInsufficient
+        ? buildDataInsufficientText(dataMissing, question, trustedDataScripts)
+        : third.turn.text,
       biTouched: Boolean(first.turn.biTouched || second.turn.biTouched || third.turn.biTouched),
     },
     retries: first.retries + second.retries + third.retries,
@@ -671,6 +685,7 @@ function needsCurrentProgress(question) {
 function needsDataPlaybook(question) {
   if (isExplicitSqlExecution(question)) return true;
   const effectiveQuestion = withoutNegatedDataRequests(question);
+  if (isBulkExportRequest(effectiveQuestion)) return true;
   if (
     /(?:多少|几)(?:种|类)|哪些(?:类型|种类)/.test(effectiveQuestion) &&
     !/生产数据|查数|查一下|查查|查询|统计|口径|SQL|现在|目前|当前|总数|数量|几个|几家/i.test(effectiveQuestion)
@@ -680,6 +695,19 @@ function needsDataPlaybook(question) {
   return /生产数据|查数|查一下|查查|查询|统计|口径|SQL|签约量|预约量|出租率|退租率|续约率|空置率|转化率|总数|数量|机构数|多少|几个|几家/i.test(
     effectiveQuestion,
   );
+}
+
+/**
+ * 导出、要明细、要清单：这类请求同样需要查数手册和可信 BI 入口。
+ * 只认「导出动作 + 数据对象」，避免把「导出按钮在哪」这类界面问题当成查数。
+ *
+ * @param {string} question
+ */
+function isBulkExportRequest(question) {
+  if (/在哪|哪里|按钮|入口|权限/.test(question)) return false;
+  const exportVerb = /导出|导一份|导个|要一份|给我一份|来一份|出一份/;
+  const dataObject = /房源|房间|楼栋|门店|机构|合同|线索|明细|清单|名单|表格|Excel|xlsx|csv/i;
+  return exportVerb.test(question) && dataObject.test(question);
 }
 
 /**

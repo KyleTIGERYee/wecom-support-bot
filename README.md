@@ -216,7 +216,7 @@ node scripts/windows-instance.js build-package --output /path/outside/repo/wecom
 
 ## 已知限制
 
-- 纯文本对话。图片、文件、语音暂未处理（图片需解密下载，语音企微已转文字可直接用）。
+- 语音企微已转文字可直接用；图片与常见文件（Excel/Word/PPT/PDF/Markdown/纯文本）支持解密下载与本地解析处理；视频消息暂未处理。
 - 分级路由判错只会让快答变慢或深答变浅，不会答不了：两条路径都保留全部工具。
 - 会话记忆存在 pi 的 session 里，按企微 userid 隔离，两人不共享。
 - 群聊里所有成员共享同一会话上下文（按 `from.userid` 隔离，群里每个人各自独立）。

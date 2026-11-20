@@ -101,8 +101,9 @@ export function createDefaultResourceCatalog(roots, projectDir) {
  * @param {string} instanceDir
  * @param {Array<{name: string, scope: string, localPath?: string, status: string}>} sources
  * @param {string|null} copiedAt
+ * @param {Record<string, string>} trustedDataScripts 本地实例唯一可信的 BI 执行入口（主工作区绝对路径）
  */
-export async function createLocalResourceCatalog(instanceDir, sources, copiedAt = null) {
+export async function createLocalResourceCatalog(instanceDir, sources, copiedAt = null, trustedDataScripts = {}) {
   /** @type {Array<any>} */
   const entries = [];
   /** @type {Array<any>} */
@@ -209,6 +210,13 @@ export async function createLocalResourceCatalog(instanceDir, sources, copiedAt 
     text: [
       "以下来源均为初始化时选择的本地副本；只能读取目录中的路径。source_time 是资料自身时间，未知为 null；copied_at 是实例复制时间。",
       "validity=history 表示历史资料；validity=current 表示明确标记的当前口径；unmarked 不得在历史冲突时直接当作最新口径。",
+      ...(Object.keys(trustedDataScripts).length > 0
+        ? [
+            "## 查数执行入口",
+            "查生产数据只能按下面的绝对路径执行，不要执行资源目录里的同名脚本副本——副本已排除 .env 凭证，执行必然失败。入口路径只用于执行，不要写进给同事的答复。",
+            ...Object.entries(trustedDataScripts).map(([businessLine, scriptPath]) => `- ${businessLine}：python3 "${scriptPath}" "SELECT ..."`),
+          ]
+        : []),
       ...(useDirectorySummary
         ? [
             "目录只给到二级摘要（来源 → 目录 → 文件数与类型计数）。需要具体文件时先用只读命令探索，例如 `ls <root>/数据库/<db-wiki>/metrics`、`find <root> -name '*.md' | head`、`grep -rl 关键词 <root>`，再 read 命中的文件；不要凭摘要编造路径。",

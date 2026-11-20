@@ -134,8 +134,68 @@ test("图文混排同时取出文字和图片", () => {
   ]);
 });
 
-test("纯文本消息 images 为空数组", () => {
+test("纯文本消息 images 与 files 为空数组", () => {
   const frame = { body: { text: { content: "退租怎么算" }, from: { userid: "zhangsan" } } };
 
-  assert.deepEqual(normalizeMessage(frame).images, []);
+  const message = normalizeMessage(frame);
+  assert.deepEqual(message.images, []);
+  assert.deepEqual(message.files, []);
+});
+
+test("纯文件消息归一化出 files，没有文字也不丢弃", () => {
+  const frame = {
+    body: {
+      msgtype: "file",
+      file: { url: "https://example.com/report.xlsx", aeskey: "fkey1", filename: "月报.xlsx" },
+      from: { userid: "zhangsan" },
+      msgid: "f1",
+    },
+  };
+
+  const message = normalizeMessage(frame);
+
+  assert.notEqual(message, null);
+  assert.equal(message.text, "");
+  assert.deepEqual(message.images, []);
+  assert.deepEqual(message.files, [
+    { url: "https://example.com/report.xlsx", aeskey: "fkey1", filename: "月报.xlsx" },
+  ]);
+});
+
+test("单聊和群聊引用文件消息时取出 quote.file 并标记 fromQuote", () => {
+  const frame = {
+    body: {
+      msgtype: "text",
+      chattype: "group",
+      chatid: "wrGROUP999",
+      text: { content: "@技术支持助手 帮我汇总一下这个表格" },
+      quote: {
+        msgtype: "file",
+        file: { url: "https://example.com/quoted.docx", aeskey: "qkey1" },
+      },
+      from: { userid: "zhangsan" },
+      msgid: "f2",
+    },
+  };
+
+  const message = normalizeMessage(frame);
+
+  assert.notEqual(message, null);
+  assert.equal(message.chatType, "group");
+  assert.equal(message.chatId, "wrGROUP999");
+  assert.deepEqual(message.files, [
+    { url: "https://example.com/quoted.docx", aeskey: "qkey1", fromQuote: true },
+  ]);
+});
+
+test("纯图片消息也带空 files 数组", () => {
+  const frame = {
+    body: {
+      msgtype: "image",
+      image: { url: "https://example.com/img1" },
+      from: { userid: "zhangsan" },
+    },
+  };
+
+  assert.deepEqual(normalizeMessage(frame).files, []);
 });

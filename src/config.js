@@ -34,6 +34,11 @@ export async function loadConfig(projectDir, { env = process.env } = {}) {
   // WECOM_BOT_ROOTS 既可以是数组（扩展的白名单），也可以是带名字的对象（默认模式的根目录清单）。
   const envRoots = env.WECOM_BOT_ROOTS ? JSON.parse(env.WECOM_BOT_ROOTS) : null;
   const namedRoots = envRoots && !Array.isArray(envRoots) ? { ...roots, ...envRoots } : roots;
+  const baseRoots = Array.isArray(envRoots) ? envRoots : Object.values(namedRoots);
+  const finalRoots = [...baseRoots];
+  for (const dir of [join(projectDir, "data/images"), join(projectDir, "data/files")]) {
+    if (!finalRoots.includes(dir)) finalRoots.push(dir);
+  }
   return {
     ...defaults,
     projectDir,
@@ -43,7 +48,7 @@ export async function loadConfig(projectDir, { env = process.env } = {}) {
       binary: env.WECOM_BOT_PI_BINARY || defaults.pi?.binary || join(homedir(), ".pi-support/bin/pi"),
       agentDir: defaults.pi?.agentDir || join(homedir(), ".pi-support/agent"),
     },
-    roots: Array.isArray(envRoots) ? envRoots : Object.values(namedRoots),
+    roots: finalRoots,
     namedRoots,
   };
 }

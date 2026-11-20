@@ -358,7 +358,7 @@ export function checkReadPath(path: string): { allowed: boolean; reason?: string
 		return { allowed: true };
 	}
 	if (!isInsideRoots(path)) {
-		return { allowed: false, reason: `路径越界：${path}，只能读取知识库、代码仓库与会话图片目录` };
+		return { allowed: false, reason: `路径越界：${path}，只能读取知识库、代码仓库与会话图片/文件目录` };
 	}
 	return { allowed: true };
 }
@@ -667,7 +667,7 @@ export default function filesystemWhitelist(pi: any) {
 		if (event.toolName === "read") {
 			const verdict = checkReadPath(event.input?.path ?? "");
 			if (verdict.allowed) return;
-			return { block: true, reason: `${verdict.reason}。请只读取知识库、代码仓库与会话图片目录里的文件。` };
+			return { block: true, reason: `${verdict.reason}。请只读取知识库、代码仓库与会话图片/文件目录里的文件。` };
 		}
 
 		if (event.toolName === "bash") {
@@ -680,6 +680,11 @@ export default function filesystemWhitelist(pi: any) {
 					block: true,
 					reason: "执行审批 DENY（hard-rule，风险类别：unknown）：可信 BI 入口的真实路径不存在、发生变化或落入可写副本、保护根。",
 				};
+			}
+			// 只读脚本类命令不进写审批：否则真实原因会被「命令不在可审批白名单」覆盖，
+			// agent 会误判成解释器不可用而放弃换正确路径重试。
+			if (/^\s*(?:\/usr\/bin\/)?(?:python3|node)(?:\s|$)/.test(command)) {
+				return { block: true, reason: `执行审批 DENY（hard-rule，风险类别：unknown）：${verdict.reason ?? "命令未通过只读白名单"}。` };
 			}
 		} else if (event.toolName !== "write" && event.toolName !== "edit") {
 			return;

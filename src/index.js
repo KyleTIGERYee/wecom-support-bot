@@ -20,6 +20,7 @@ import { deliverFinal } from "./deliver.js";
 import { deliverWorkspaceFiles, parseDeliveryMarkers, snapshotWorkspace } from "./file-delivery.js";
 import { normalizeMessage, toSessionKey, stripMention, isNewSessionRequest } from "./wecom.js";
 import { downloadImages } from "./images.js";
+import { downloadAndProcessFiles, FileIngestError, withAttachmentInstructions, hasAttachedFiles } from "./files.js";
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -47,6 +48,7 @@ async function main() {
         config.localInstance.instanceDir,
         config.localInstance.saved.contextSources,
         config.localInstance.saved.resources?.syncedAt ?? config.localInstance.saved.initializedAt ?? null,
+        config.trustedDataScripts,
       )
     : createDefaultResourceCatalog(config.namedRoots, projectDir);
   const log = createLogger({ logPath: join(runtimeDir, "logs/bot.log") });
@@ -108,7 +110,7 @@ async function main() {
         msgtype: "text",
         text: {
           content:
-            "我是赛博阿虎。我能查数据库、翻知识库、看截图，查出来的结果还能整理成文件直接发给你。安居乐寓和乐租租的事都可以来问我。想让我忘掉前面聊的重新开始，发「新会话」或「/new」就行。有什么事情不要找阿虎，请找我。",
+            "我是赛博阿虎。我能查数据库、翻知识库、看截图、读文件（Excel/PPT/Word/PDF/Markdown 等），查出来的结果还能整理成文件直接发给你。安居乐寓和乐租租的事都可以来问我。想让我忘掉前面聊的重新开始，发「新会话」或「/new」就行。有什么事情不要找阿虎，请找我。",
         },
       })
       .catch((error) => log.warn("欢迎语发送失败", { message: String(error?.message ?? error) }));
@@ -148,8 +150,8 @@ async function main() {
   });
 
   /**
-   * 收一条企微消息：指令识别 → 图片下载 → 落收件箱 → 排队执行。
-   * 图片 URL 只有五分钟有效期，必须在入队前下载，所以整个处理是异步的；
+   * 收一条企微消息：指令识别 → 图片/文件下载与本地解析 → 落收件箱 → 排队执行。
+   * 图片和文件 URL 只有五分钟有效期，必须在入队前下载，所以整个处理是异步的；
    * 同一同事的消息由 ingestChains 保证按到达顺序走完这段。
    *
    * @param {any} frame
@@ -158,10 +160,10 @@ async function main() {
    */
   async function handleIncomingMessage(frame, message, userKey) {
     const question = stripMention(message.text);
-    if (!question && message.images.length === 0) return;
+    if (!question && message.images.length === 0 && message.files.length === 0) return;
 
     // 开新会话：抬一代代号，上一轮的上下文和粘性标记一并作废
-    if (isNewSessionRequest(question)) {
+    if (message.images.length === 0 && message.files.length === 0 && isNewSessionRequest(question)) {
       const sessionId = state.startNewSession(userKey);
       void state.flush();
       void log.info("开新会话", { user: message.userId, sessionId });
@@ -171,17 +173,17 @@ async function main() {
 
     const msgid = message.msgid ?? fallbackMsgid();
 
-    // 图片立刻下载解密存盘（URL 五分钟过期），路径拼进提问，让 agent 用 read 工具看图
-    let finalQuestion = question;
+    // 图片和文件立刻下载解密存盘（URL 五分钟过期），路径拼进提问，让 agent 用 read 工具查看
+    /** @type {string[]} */
+    let imagePaths = [];
     if (message.images.length > 0) {
       try {
-        const imagePaths = await downloadImages({
+        imagePaths = await downloadImages({
           client,
           images: message.images,
           dir: join(runtimeDir, "data/images"),
           msgid,
         });
-        finalQuestion = withImageInstructions(question, imagePaths);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         void log.warn("图片下载失败", { msgid, message: reason });
@@ -189,6 +191,35 @@ async function main() {
         return;
       }
     }
+
+    /** @type {import("./files.js").ProcessedFile[]} */
+    let processedFiles = [];
+    if (message.files.length > 0) {
+      try {
+        processedFiles = await downloadAndProcessFiles({
+          client,
+          files: message.files,
+          dir: join(runtimeDir, "data/files"),
+          msgid,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        const userMessage =
+          error instanceof FileIngestError ? error.userMessage : "文件我这边没收到，麻烦再发一次。";
+        void log.warn("文件接收失败", {
+          msgid,
+          code: error instanceof FileIngestError ? error.code : "UNKNOWN",
+          message: reason,
+        });
+        replyImmediate(frame, userMessage, "文件失败提示发送失败");
+        return;
+      }
+    }
+
+    const finalQuestion = withAttachmentInstructions(question, {
+      imagePaths,
+      files: processedFiles,
+    });
 
     // 问题先落到收件箱，再考虑执行：企微重推靠 msgid 去重，进程重启靠它补跑
     const { isNew } = inbox.accept({
@@ -210,7 +241,14 @@ async function main() {
       return;
     }
 
-    void log.info("收到提问", { msgid, user: message.userId, chatType: message.chatType, length: finalQuestion.length, images: message.images.length });
+    void log.info("收到提问", {
+      msgid,
+      user: message.userId,
+      chatType: message.chatType,
+      length: finalQuestion.length,
+      images: message.images.length,
+      files: processedFiles.length,
+    });
     void enqueueTurn({ question: finalQuestion, userKey, msgid, userId: message.userId, chatId: message.chatId, frame });
   }
 
@@ -265,9 +303,10 @@ async function main() {
     // 必须赶在 agent 跑起来写文件之前拍
     const workspaceBaseline = workspaceDir ? await snapshotWorkspace(workspaceDir) : null;
 
-    // 先分诊：闲聊与概念题没必要最高思考强度（试运行里连「你好」都要 9–52 秒）
+    // 先分诊：闲聊与概念题没必要最高思考强度（试运行里连「你好」都要 9–52 秒）；
+    // 附带文件时直接走 deep，确保有足够思考深度完整阅读解析产物
     let route = "deep";
-    if (config.routing.enabled) {
+    if (config.routing.enabled && !hasAttachedFiles(question)) {
       const t = Date.now();
       route = await classifyQuestion({ question, callModel: callQuickModel });
       lap("route", t);
@@ -531,19 +570,6 @@ async function main() {
  */
 function fallbackMsgid() {
   return `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/**
- * 把图片路径拼进提问正文：agent 用 read 工具看图，后续分诊、收件箱、补跑都与纯文本提问一致。
- *
- * @param {string} question
- * @param {string[]} imagePaths
- * @returns {string}
- */
-function withImageInstructions(question, imagePaths) {
-  const base = question || "（同事只发了图片，没有附文字）";
-  const lines = imagePaths.map((path) => `- ${path}`).join("\n");
-  return `${base}\n\n[系统补充] 同事随消息附了 ${imagePaths.length} 张图片，已保存到本地：\n${lines}\n请先用 read 工具逐张查看图片内容，再结合图片回答。`;
 }
 
 main().catch((error) => {

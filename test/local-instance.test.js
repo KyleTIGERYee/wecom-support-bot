@@ -2690,3 +2690,183 @@ emit({ type: "message_end", message: { role: "assistant", content: [{ type: "tex
   assert.ok(replies.some((entry) => entry.finish && entry.text === "企微报告已生成"));
   assert.ok(models.calls.some((call) => call.messages.some((message) => typeof message.content === "string" && message.content.includes("你是独立的执行审批模型"))));
 });
+
+test("企微服务收到文件消息与群聊引用文件时下载解密并本地解析，data/files 只读放行且拒绝不支持格式", { timeout: 30000 }, async (t) => {
+  const root = await makeTempDir(t);
+  const instanceDir = join(root, "instance");
+  const contextDir = join(instanceDir, "context/shared");
+  const workspace = join(instanceDir, "workspace");
+  await mkdir(contextDir, { recursive: true });
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(instanceDir, "data"), { recursive: true });
+  await mkdir(join(instanceDir, "agent"), { recursive: true });
+  await writeFile(join(contextDir, "handbook.md"), "# 员工手册\n\n通用流程。\n");
+
+  const xlsxPath = join(root, "source.xlsx");
+  await execFileAsync(
+    "python3",
+    [
+      "-c",
+      `import sys, openpyxl
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "门店统计"
+ws.append(["门店", "单量"])
+ws.append(["深圳南山店", 42])
+wb.save(sys.argv[1])`,
+      xlsxPath,
+    ],
+    { timeout: 15000 },
+  );
+
+  const models = await startModelServer();
+  t.after(() => models.close());
+  const sdkLog = join(root, "sdk.log");
+  const piLog = join(root, "pi.log");
+  const modelConfig = { baseUrl: models.baseUrl, model: "local-main-model" };
+
+  await writeFile(join(instanceDir, "instance.json"), JSON.stringify({
+    version: 2,
+    instance: { id: "file-service-instance", template: "team" },
+    ready: true,
+    initializedAt: "2026-11-20T00:00:00.000Z",
+    models: { main: modelConfig, quick: modelConfig, guard: modelConfig, executionApproval: modelConfig },
+    contextSources: [{ name: "shared", type: "directory", scope: "shared", localPath: "context/shared", status: "ok", version: "resource-v1" }],
+    resources: { version: "resource-v1", catalogVersion: "resource-v1", syncedAt: "2026-11-20T00:00:00.000Z", files: ["context/shared/handbook.md"] },
+    checks: {},
+  }));
+  await writeFile(join(instanceDir, "secrets.json"), JSON.stringify({ mainApiKey: "k", quickApiKey: "k", guardApiKey: "k", executionApprovalApiKey: "k" }));
+  await writeFile(join(instanceDir, "wecom.json"), JSON.stringify({ active: "test", test: { botId: "file-test-bot", secret: "file-test-secret" } }));
+
+  const fakeSdk = join(root, "fake-wecom-sdk-files.mjs");
+  await writeFile(fakeSdk, `import { EventEmitter } from "node:events";
+import { appendFileSync, readFileSync } from "node:fs";
+const log = (entry) => appendFileSync(${JSON.stringify(sdkLog)}, JSON.stringify(entry) + "\\n");
+const xlsxBuf = readFileSync(${JSON.stringify(xlsxPath)});
+let finishedReplies = 0;
+class WSClient extends EventEmitter {
+  constructor(options) { super(); this.options = options; }
+  connect() {
+    setTimeout(() => {
+      this.emit("authenticated");
+      this.emit("message", {
+        headers: { req_id: "req-1" },
+        body: {
+          msgid: "file-msg-1",
+          msgtype: "file",
+          file: { url: "https://example.test/report.xlsx", aeskey: "k1", filename: "月报.xlsx" },
+          from: { userid: "u-file-1" },
+          chattype: "single",
+        },
+      });
+      this.emit("message", {
+        headers: { req_id: "req-2" },
+        body: {
+          msgid: "file-msg-2",
+          msgtype: "text",
+          chattype: "group",
+          chatid: "grp-file-1",
+          text: { content: "@技术支持助手 看看这份纪要" },
+          quote: {
+            msgtype: "file",
+            file: { url: "https://example.test/notes.md", aeskey: "k2", filename: "会议纪要.md" },
+          },
+          from: { userid: "u-file-2" },
+        },
+      });
+      this.emit("message", {
+        headers: { req_id: "req-3" },
+        body: {
+          msgid: "file-msg-3",
+          msgtype: "file",
+          file: { url: "https://example.test/bad.exe", aeskey: "k3", filename: "app.exe" },
+          from: { userid: "u-file-3" },
+          chattype: "single",
+        },
+      });
+    }, 20);
+  }
+  async downloadFile(url) {
+    if (url.endsWith("report.xlsx")) return { buffer: xlsxBuf, filename: "月报.xlsx" };
+    if (url.endsWith("notes.md")) return { buffer: Buffer.from("# 周例会纪要\\n- 下周上线文件接收\\n", "utf8"), filename: "会议纪要.md" };
+    return { buffer: Buffer.from("MZ", "utf8"), filename: "app.exe" };
+  }
+  replyStream(frame, streamId, text, finish) {
+    log({ type: "reply", msgid: frame.body?.msgid, text, finish });
+    if (finish) {
+      finishedReplies += 1;
+      if (finishedReplies >= 3) setTimeout(() => process.kill(process.pid, "SIGTERM"), 120);
+    }
+    return Promise.resolve({});
+  }
+  disconnect() {}
+}
+function generateReqId(prefix) { return prefix + "-fake"; }
+export default { WSClient, generateReqId };
+`);
+  const loader = join(root, "fake-wecom-loader-files.mjs");
+  await writeFile(loader, `export async function resolve(specifier, context, nextResolve) {
+  if (specifier === "@wecom/aibot-node-sdk") return { url: ${JSON.stringify(pathToFileURL(fakeSdk).href)}, shortCircuit: true };
+  return nextResolve(specifier, context);
+}
+`);
+  const fakePi = join(root, "file-pi.mjs");
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+import { checkReadPath, processApprovedToolCall } from ${JSON.stringify(pathToFileURL(join(projectDir, "extensions/bash-whitelist.ts")).href)};
+const prompt = process.argv.at(-1);
+const parsedPath = prompt.match(/(?:解析文本路径|文件路径)[^：]*：(\\/[^\\n]+)/)?.[1] ?? "";
+const readCheck = parsedPath ? checkReadPath(parsedPath) : { allowed: false, reason: "no path" };
+const writeCheck = parsedPath
+  ? await processApprovedToolCall({
+      event: { type: "tool_call", toolCallId: "w-1", toolName: "write", input: { path: parsedPath, content: "tamper" } },
+      writeRoots: JSON.parse(process.env.WECOM_BOT_WRITE_ROOTS),
+      protectedRoots: JSON.parse(process.env.WECOM_BOT_PROTECTED_ROOTS),
+      enabled: true,
+    })
+  : { verdict: "DENY" };
+const content = readCheck.allowed ? readFileSync(parsedPath, "utf8") : "";
+appendFileSync(${JSON.stringify(piLog)}, JSON.stringify({
+  parsedPath,
+  readAllowed: readCheck.allowed,
+  writeVerdict: writeCheck.verdict,
+  roots: JSON.parse(process.env.WECOM_BOT_ROOTS),
+  writeRoots: JSON.parse(process.env.WECOM_BOT_WRITE_ROOTS),
+}) + "\\n");
+const summary = content.includes("深圳南山店")
+  ? "已读取表格：深圳南山店 42 单"
+  : content.includes("下周上线文件接收")
+    ? "已读取纪要：下周上线文件接收"
+    : "未读到内容";
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: summary }] } }));
+`, { mode: 0o755 });
+
+  const child = spawn(process.execPath, ["--experimental-loader", loader, join(projectDir, "src/index.js")], {
+    cwd: projectDir,
+    env: { ...process.env, WECOM_BOT_INSTANCE_DIR: instanceDir, WECOM_BOT_PI_BINARY: fakePi },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`企微文件假服务未及时退出：${stderr}`)); }, 20000);
+    child.on("error", reject);
+    child.on("exit", (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.equal(exit.code, 0, stderr);
+
+  const piCalls = (await readFile(piLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(piCalls.length, 2);
+  for (const call of piCalls) {
+    assert.equal(call.readAllowed, true);
+    assert.equal(call.writeVerdict, "DENY", "data/files 必须对 agent 保持只读");
+    assert.ok(call.roots.includes(join(instanceDir, "data/files")));
+    assert.equal(call.writeRoots.includes(join(instanceDir, "data/files")), false);
+  }
+
+  const replies = (await readFile(sdkLog, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(replies.some((entry) => entry.msgid === "file-msg-1" && entry.finish && entry.text.includes("深圳南山店 42 单")));
+  assert.ok(replies.some((entry) => entry.msgid === "file-msg-2" && entry.finish && entry.text.includes("下周上线文件接收")));
+  assert.ok(replies.some((entry) => entry.msgid === "file-msg-3" && entry.finish && entry.text.includes("暂不支持解析")));
+});

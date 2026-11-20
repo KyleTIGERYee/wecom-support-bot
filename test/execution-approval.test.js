@@ -528,7 +528,8 @@ test("S13 外部环境变量不能把可写副本的同名 Python 脚本加入�
 
   assert.equal(result?.block, true);
   assert.match(result?.reason ?? "", /hard-rule/);
-  assert.match(result?.reason ?? "", /不在可审批命令白名单内/);
+  // 真实原因必须透传给 agent：报「命令不可用」会让它放弃换正确路径重试。
+  assert.match(result?.reason ?? "", /脚本来源不受信任/);
   assert.equal(model.calls.length, 0, "外部环境变量和模型 ALLOW 均不得覆盖可写同名脚本的硬拒绝");
 });
 

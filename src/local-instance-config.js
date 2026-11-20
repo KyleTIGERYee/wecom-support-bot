@@ -15,7 +15,8 @@ import { basename, isAbsolute, join, resolve, sep } from "node:path";
  *   workspaceDir: string,
  *   agentDir: string,
  *   piBinary?: string,
- *   imagesDir?: string | null
+ *   imagesDir?: string | null,
+ *   filesDir?: string | null
  * }} options
  */
 export async function createLocalRuntimeConfig({
@@ -28,10 +29,16 @@ export async function createLocalRuntimeConfig({
   agentDir,
   piBinary = process.env.WECOM_BOT_PI_BINARY || join(homedir(), ".pi-support/bin/pi"),
   imagesDir = null,
+  filesDir = null,
 }) {
   const approvalModel = saved.models.executionApproval ?? saved.models.main;
   const quickModel = saved.models.quick ?? saved.models.main;
-  const roots = [join(catalogRoot, "context"), workspaceDir, ...(imagesDir ? [imagesDir] : [])];
+  const roots = [
+    join(catalogRoot, "context"),
+    workspaceDir,
+    ...(imagesDir ? [imagesDir] : []),
+    ...(filesDir ? [filesDir] : []),
+  ];
   const trustedDataScripts = await resolveTrustedDataScripts({
     saved,
     blockedRoots: [join(catalogRoot, "context"), workspaceDir, projectDir],
@@ -141,6 +148,7 @@ export async function loadLocalInstanceConfig(projectDir, instanceDir, { env = p
     agentDir: join(resolvedInstanceDir, "agent"),
     piBinary: env.WECOM_BOT_PI_BINARY,
     imagesDir: join(resolvedInstanceDir, "data/images"),
+    filesDir: join(resolvedInstanceDir, "data/files"),
   });
   return {
     ...config,

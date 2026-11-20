@@ -512,6 +512,59 @@ test("现在有几个机构路由为数据口径而不是当前项目进展", as
   assert.doesNotMatch(firstPrompt, /可信只读 BI 入口|未配置可用的可信/);
 });
 
+test("导出房源明细路由为数据口径并注入可信 BI 入口与 100 行提示", async () => {
+  let firstPrompt = "";
+  const deps = {
+    state: fakeState(false),
+    context: {
+      catalog: "共享数据库目录",
+      dataPlaybook: true,
+      trustedDataScripts: { lzz: "/trusted/lzz/bi_query.py" },
+    },
+    runAgent: async ({ prompt }) => {
+      firstPrompt ||= prompt;
+      return {
+        text: "查数入口一次最多 100 行，整表建议走 BI 导出。",
+        biTouched: true,
+        timedOut: false,
+        failed: false,
+        loadedResources: dataEvidence(),
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  await handleTurn({ question: "麻烦导出乐租租目前上架的所有房源明细", sessionKey: "wx-abc", deps });
+
+  assert.match(firstPrompt, /知识任务路由：数据口径/);
+  assert.match(firstPrompt, /可信只读 BI 入口/);
+  assert.match(firstPrompt, /\/trusted\/lzz\/bi_query\.py/);
+  assert.match(firstPrompt, /最多返回 100 行/);
+});
+
+test("导出按钮位置这类界面问题不进入数据口径", async () => {
+  let firstPrompt = "";
+  const deps = {
+    state: fakeState(false),
+    context: { catalog: "共享业务库目录", dataPlaybook: true },
+    runAgent: async ({ prompt }) => {
+      firstPrompt ||= prompt;
+      return {
+        text: "房间管理的导出入口在列表右上角。",
+        biTouched: false,
+        timedOut: false,
+        failed: false,
+        loadedResources: [],
+      };
+    },
+    review: async () => ({ verdict: "ALLOW" }),
+  };
+
+  await handleTurn({ question: "房间管理的导出按钮在哪？", sessionKey: "wx-abc", deps });
+
+  assert.doesNotMatch(firstPrompt, /知识任务路由：数据口径/);
+});
+
 test("Skill 引用深度保留知识证据且 loadedSkills 只含真实正文", async () => {
   const skillBody = {
     source: "共享 Skills",
@@ -1902,4 +1955,44 @@ test("中文最长精确触发优先于宽泛触发，同级歧义仍保守 unkn
   ]);
   assert.equal(ambiguous.result.currentSkill, "unknown");
   assert.equal(ambiguous.runs[0].currentSkill, "unknown");
+});
+
+test("附带文件提问包含统计/进展/历史词时不强行覆盖正常答复，且保留可信 BI 提示", async () => {
+  const cases = [
+    "帮我统计一下这份表格有多少家门店",
+    "看看这份方案，目前最新进展是什么",
+    "为什么之前是这样安排的，帮我总结这份文档",
+  ];
+
+  for (const raw of cases) {
+    const question =
+      `${raw}\n\n[系统补充] 同事随消息附了 1 个文件，已保存到本地并完成解析：\n` +
+      "- 文件名：测试.xlsx（1.0 KB，共 1 个工作表，累计 5 行）\n" +
+      "  解析文本路径（请优先用 read 读取）：/tmp/data/files/m1-1.parsed.md";
+    const prompts = [];
+    const deps = {
+      state: fakeState(false),
+      context: {
+        catalog: "[知识目录]\n- 来源：共享手册 | 路径：/ctx/data-playbook.md | 类型：playbook",
+        dataPlaybook: true,
+        trustedDataScripts: { ajly: "/trusted/ajly/scripts/bi_query.py" },
+        entries: [],
+        skills: [{ name: "file-helper", path: "/skills/file-helper/SKILL.md", triggers: ["read", "rg"] }],
+      },
+      runAgent: async ({ prompt }) => {
+        prompts.push(prompt);
+        return { text: "根据你发的文件，共统计到 5 家门店。", biTouched: false, timedOut: false, failed: false };
+      },
+      review: async () => ({ verdict: "ALLOW" }),
+    };
+
+    const result = await handleTurn({ question, sessionKey: "wx-file-1", deps });
+
+    assert.equal(prompts.length, 1, `不应触发多余深化：${raw}`);
+    assert.equal(result.finalText, "根据你发的文件，共统计到 5 家门店。");
+    assert.equal(result.currentSkill, "unknown", "不应被 [系统补充] 里的 read/rg 误命中 Skill");
+    if (raw.includes("统计")) {
+      assert.match(prompts[0], /bi_query\.py/, "数据类提问仍保留可信 BI 入口提示");
+    }
+  }
 });

@@ -5,10 +5,10 @@
  */
 
 /**
- * 把企微消息帧归一化成网关需要的形状；无法提取文本且没有图片时返回 null。
+ * 把企微消息帧归一化成网关需要的形状；无法提取文本、图片且没有文件时返回 null。
  *
  * @param {any} frame
- * @returns {{text: string, userId: string, chatType: string, chatId: string, msgid: string | null, images: Array<{url: string, aeskey?: string}>} | null}
+ * @returns {{text: string, userId: string, chatType: string, chatId: string, msgid: string | null, images: Array<{url: string, aeskey?: string}>, files: Array<{url: string, aeskey?: string, filename?: string, fromQuote?: boolean}>} | null}
  */
 export function normalizeMessage(frame) {
   const body = frame?.body;
@@ -16,8 +16,9 @@ export function normalizeMessage(frame) {
 
   const text = extractText(body);
   const images = extractImages(body);
+  const files = extractFiles(body);
   const userId = body.from?.userid;
-  if ((!text && images.length === 0) || !userId) return null;
+  if ((!text && images.length === 0 && files.length === 0) || !userId) return null;
 
   return {
     text,
@@ -27,6 +28,7 @@ export function normalizeMessage(frame) {
     // 去重要用的消息唯一标识；缺了它退化成「按内容去重」，由上层兜底
     msgid: typeof body.msgid === "string" && body.msgid ? body.msgid : null,
     images,
+    files,
   };
 }
 
@@ -95,6 +97,46 @@ function extractImages(body) {
     }
   }
   return images;
+}
+
+/**
+ * 取出消息里的文件（纯文件消息、混排中的文件及引用消息里的文件）。
+ * 下载链接只有五分钟有效期，由上层收到后立刻下载。
+ *
+ * @param {any} body
+ * @returns {Array<{url: string, aeskey?: string, filename?: string, fromQuote?: boolean}>}
+ */
+function extractFiles(body) {
+  /** @type {Array<{url: string, aeskey?: string, filename?: string, fromQuote?: boolean}>} */
+  const files = [];
+  const push = (/** @type {any} */ file, /** @type {boolean} */ fromQuote) => {
+    if (typeof file?.url === "string" && file.url) {
+      const filename =
+        typeof file.filename === "string" && file.filename
+          ? file.filename
+          : typeof file.name === "string" && file.name
+            ? file.name
+            : undefined;
+      /** @type {{url: string, aeskey?: string, filename?: string, fromQuote?: boolean}} */
+      const entry = {
+        url: file.url,
+        aeskey: typeof file.aeskey === "string" ? file.aeskey : undefined,
+      };
+      if (filename) entry.filename = filename;
+      if (fromQuote) entry.fromQuote = true;
+      files.push(entry);
+    }
+  };
+  push(body.file, false);
+  if (Array.isArray(body.mixed?.msg_item)) {
+    for (const item of body.mixed.msg_item) {
+      if (item?.msgtype === "file") push(item.file, false);
+    }
+  }
+  if (body.quote && (body.quote.msgtype === "file" || body.quote.file?.url)) {
+    push(body.quote.file, true);
+  }
+  return files;
 }
 
 /**

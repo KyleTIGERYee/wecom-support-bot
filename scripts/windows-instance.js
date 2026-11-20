@@ -685,7 +685,7 @@ async function stateExport(options, internal = {}) {
     throw new Error("迁移状态包与实例目录不能互相包含");
   }
   const files = await collectStateFiles(instanceDir, options.legacyAgentDir);
-  const plan = { status: options.execute ? "executing" : "planned", executes: Boolean(options.execute), instanceDir, output: outputDir, files: files.length, bytes: files.reduce((sum, file) => sum + file.size, 0), excludes: ["context", "secrets.json", "wecom.json", "agent/models.json", "credentials/auth/token/provider keys", "data/images", "locks", "node_modules", "launchd"] };
+  const plan = { status: options.execute ? "executing" : "planned", executes: Boolean(options.execute), instanceDir, output: outputDir, files: files.length, bytes: files.reduce((sum, file) => sum + file.size, 0), excludes: ["context", "secrets.json", "wecom.json", "agent/models.json", "credentials/auth/token/provider keys", "data/images", "data/files", "locks", "node_modules", "launchd"] };
   if (!options.execute) return plan;
   requireConfirmation(options, "state-export", internal.confirmOverride);
   if (!options.sourceStopped && !internal.stoppedVerified) throw new Error("正式导出必须确认源服务已停止（--source-stopped），避免导出半写入状态");
