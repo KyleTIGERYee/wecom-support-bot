@@ -521,3 +521,19 @@ test("三轮同文中间日志矛盾只降级整组，不影响前后不同问�
   assert.equal(dashboard.getMeta().diagnostics.mappedTurns, 2);
   assert.equal(dashboard.getMeta().diagnostics.unmatchedTurns, 3);
 });
+
+test("实例内人员映射覆盖全局映射", async () => {
+  const { root, sources } = await createFixture();
+  const instanceMap = join(root, "instance-user-map.json");
+  await writeFile(instanceMap, JSON.stringify({ u1: { name: "实例内同事" } }));
+  sources.userMapPaths = [instanceMap];
+  await writeFile(sources.instances[0].inboxPath, JSON.stringify(inboxMessage({
+    msgid: "map-1",
+    userId: "u1",
+    question: "映射覆盖",
+    receivedAt: "2026-11-12T01:00:00.000Z",
+  })));
+
+  const dashboard = await buildDashboard({ sources });
+  assert.equal(dashboard.getDay({ date: "2026-11-12" }).turns[0].colleagueName, "实例内同事");
+});

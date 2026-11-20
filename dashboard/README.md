@@ -54,12 +54,30 @@ WECOM_DASHBOARD_BIND=0.0.0.0 npm run dashboard
 
 pi 文件不含 msgid。索引只接受完成日志中的 `sessionKey` 精确匹配的 `wx-*` 文件，并以“同用户严格串行 + 首轮 user 与原始问题完整匹配”作为锚点；下一轮锚点直接截断上一轮，缺完成日志的轮次也保留边界。相似问题、重复来源或段内出现无法解释的新问题时保持未关联，不使用完成时间宽限窗，不借用邻轮内容。
 
-## 固定数据源
+## 数据源发现与覆盖
 
-- 主实例：`~/.wecom-support-bot/instances/main/data/inbox.jsonl`、`logs/bot.log`、agent sessions、`data/images`。
-- 旧实例：仓库 `data/inbox.jsonl`、`logs/bot.log`、`~/.pi-support/agent/sessions/--Users-kyle-Desktop-VIBECODING-wecom-support-bot--`、仓库 `data/images`。
-- 原始入站：仓库 `logs/launchd.stdout.log`，仅抽取 msgid、用户、聊天类型、文字与图片数量等白名单字段。
-- 人员映射：`~/.wecom-support-bot/user-map.json`，支持直接 userid 与现有 base64url `b64` 规则；未知或错误映射使用兜底名称。
+默认自动发现本机所有机器人实例，不依赖固定实例名：
+
+- `~/.wecom-support-bot/instances/*`
+- 仓库 `instances/*`
+- 机器人进程正在使用的 `WECOM_BOT_INSTANCE_DIR`（若已设置）
+
+目录里有 `instance.json` 或 `data/inbox.jsonl` 才会被当成实例；实例内的收件箱、`logs/bot.log`、`data/images` 直接按目录读取，pi 会话目录取 `<实例>/agent/sessions/*` 下最新的子目录。仓库根目录若还有旧的 `data/inbox.jsonl`，会作为 `legacy` 实例一并展示。
+
+实例不在上述位置时，显式指定目录（可重复）：
+
+```bash
+npm run dashboard -- --instance-dir /path/to/instance --instance-dir /path/to/another
+```
+
+也可以用环境变量（多个目录按系统路径分隔符拆开）：
+
+```bash
+WECOM_DASHBOARD_INSTANCE_DIRS=/path/a:/path/b npm run dashboard
+```
+
+- 原始入站：仓库 `logs/launchd.stdout.log`（存在时），仅抽取 msgid、用户、聊天类型、文字与图片数量等白名单字段；可用 `WECOM_DASHBOARD_RAW_LOG` 覆盖。
+- 人员映射：全局 `~/.wecom-support-bot/user-map.json`；实例内 `data/user-map.json` 可覆盖全局。支持直接 userid 与现有 base64url `b64` 规则；未知或错误映射使用兜底名称。
 
 不扫描备份目录，不修改源数据，不读取机器人凭证配置，不向外部服务发送数据。
 

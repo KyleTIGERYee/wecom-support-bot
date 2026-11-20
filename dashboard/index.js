@@ -12,7 +12,8 @@ const DEFAULT_TIMEZONE = "Asia/Shanghai";
  * @param {{sources: {
  *   instances: Array<{id: string, inboxPath: string, logPath: string, piDir: string, imagesDir: string}>,
  *   rawLogPath?: string,
- *   userMapPath?: string
+ *   userMapPath?: string,
+ *   userMapPaths?: string[]
  * }, timezone?: string}} options
  */
 export async function buildDashboard({ sources, timezone = DEFAULT_TIMEZONE }) {
@@ -46,7 +47,7 @@ export async function buildDashboard({ sources, timezone = DEFAULT_TIMEZONE }) {
     }
   }
 
-  const userMap = await readUserMap(sources.userMapPath, diagnostics);
+  const userMap = await readUserMaps([sources.userMapPath, ...(sources.userMapPaths ?? [])], diagnostics);
   const rawById = await readRawInbound(sources.rawLogPath, diagnostics);
   const ids = new Set([...inboxById.keys(), ...completionById.keys()]);
   const turns = [...ids].map((msgid) => normalizeTurn(msgid, inboxById.get(msgid), completionById.get(msgid), rawById.get(msgid), userMap, timezone))
@@ -208,6 +209,15 @@ async function readRawInbound(path, diagnostics) {
     }
   }
   return messages;
+}
+
+/** 全局映射先读，实例内映射后读，同名用户以实例内为准。 @param {Array<string|undefined>} paths @param {any} diagnostics */
+async function readUserMaps(paths, diagnostics) {
+  const merged = new Map();
+  for (const path of paths) {
+    for (const [userId, mapping] of await readUserMap(path, diagnostics)) merged.set(userId, mapping);
+  }
+  return merged;
 }
 
 /** @param {string|undefined} path @param {any} diagnostics */
