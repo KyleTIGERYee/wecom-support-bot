@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.js", "extensions/**/*.ts"]
+  "include": ["src/**/*.js", "extensions/**/*.ts", "dashboard/*.js"]
 }

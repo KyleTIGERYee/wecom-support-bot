@@ -11,7 +11,8 @@
     "instance": "node scripts/local-instance.js",
     "windows": "node scripts/windows-instance.js",
     "test": "node scripts/check-roots-consistency.js && node --test \"test/**/*.test.js\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "dashboard": "node dashboard/start.js"
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7"

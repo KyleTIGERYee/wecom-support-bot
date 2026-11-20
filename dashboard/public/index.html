@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>对话审计</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar" aria-label="会话列表">
+      <div class="brand-row">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">对话审计</span>
+        </div>
+        <button class="icon-button" id="refresh" type="button" aria-label="刷新" title="刷新">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20 11a8 8 0 1 0-2.3 5.7"></path>
+            <path d="M20 4v7h-7"></path>
+          </svg>
+        </button>
+      </div>
+
+      <div class="date-row">
+        <button class="icon-button" id="prev-day" type="button" aria-label="前一天" title="前一天">←</button>
+        <label class="date-picker" title="选择日期">
+          <span class="date-label" id="date-label">选择日期</span>
+          <input class="date-input" id="date-input" type="date" aria-label="选择日期">
+        </label>
+        <button class="icon-button" id="next-day" type="button" aria-label="后一天" title="后一天">→</button>
+        <button class="text-button" id="latest-day" type="button">最近</button>
+      </div>
+
+      <div class="filter-row">
+        <select class="colleague-select" id="colleague-select" aria-label="按人员筛选">
+          <option value="">全部人员</option>
+        </select>
+        <input class="search-input" id="search" type="search" placeholder="搜索消息" autocomplete="off" maxlength="200" aria-label="搜索消息">
+      </div>
+
+      <div class="session-list" id="session-list" aria-label="会话">
+        <div class="session-skeleton" aria-hidden="true">
+          <span class="skeleton-line w60"></span>
+          <span class="skeleton-line w85"></span>
+          <span class="skeleton-line w40"></span>
+        </div>
+        <div class="session-skeleton" aria-hidden="true">
+          <span class="skeleton-line w55"></span>
+          <span class="skeleton-line w75"></span>
+          <span class="skeleton-line w45"></span>
+        </div>
+        <div class="session-skeleton" aria-hidden="true">
+          <span class="skeleton-line w65"></span>
+          <span class="skeleton-line w80"></span>
+          <span class="skeleton-line w35"></span>
+        </div>
+      </div>
+
+      <div class="sidebar-stats" id="sidebar-stats" aria-live="polite"></div>
+    </aside>
+
+    <div class="scrim" id="scrim" hidden></div>
+
+    <main class="main">
+      <header class="main-header">
+        <button class="icon-button menu-button" id="menu-button" type="button" aria-label="打开会话列表" aria-expanded="false" aria-controls="sidebar">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16"></path>
+            <path d="M4 12h16"></path>
+            <path d="M4 17h16"></path>
+          </svg>
+        </button>
+        <div class="main-heading">
+          <h1 class="session-title" id="session-title">对话审计</h1>
+          <p class="session-meta" id="session-meta"></p>
+        </div>
+      </header>
+
+      <div class="error-line" id="error" role="alert" hidden></div>
+
+      <div class="conversation" id="conversation">
+        <div class="conversation-inner is-empty" id="conversation-inner">
+          <div class="empty-state">
+            <p class="empty-title">正在读取…</p>
+            <p class="empty-hint">从本机日志整理对话记录</p>
+          </div>
+        </div>
+      </div>
+
+      <footer class="boundary-note">模型答复来自本机 pi 会话；投递只核验状态与通道，历史出站正文没有独立归档。</footer>
+    </main>
+  </div>
+
+  <dialog class="image-dialog" id="image-dialog" aria-label="查看图片">
+    <div class="image-dialog-body">
+      <img id="dialog-image" alt="入站图片">
+      <p class="dialog-fallback" id="dialog-fallback" hidden>图片不可用</p>
+      <button class="dialog-close" id="dialog-close" type="button">关闭</button>
+    </div>
+  </dialog>
+</body>
+</html>
