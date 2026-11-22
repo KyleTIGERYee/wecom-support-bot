@@ -1318,6 +1318,10 @@ async function detectLocalModifications(instanceDir, saved) {
  * 只有提交成功才把它替换成 snapshots/previous（只保留最近一版）；
  * 提交失败时删除 next，旧的上一版保持不动。
  *
+ * macOS/APFS 优先用 clonefile 复制：内容与全量复制完全一致，
+ * 但快照与 context 共享磁盘块，后续写入时才按块复制，不再为快照多付一份空间。
+ * 非 macOS、非 APFS 或克隆失败时回退为普通复制。
+ *
  * @param {string} instanceDir
  * @returns {Promise<boolean>}
  */
@@ -1327,8 +1331,26 @@ async function stagePreviousContext(instanceDir) {
   const next = join(instanceDir, "snapshots/previous.next");
   await mkdir(dirname(next), { recursive: true });
   await rm(next, { recursive: true, force: true });
-  await cp(current, next, { recursive: true, dereference: false });
+  if (!(await cloneDirectory(current, next))) {
+    await cp(current, next, { recursive: true, dereference: false });
+  }
   return true;
+}
+
+/**
+ * @param {string} source
+ * @param {string} target
+ * @returns {Promise<boolean>}
+ */
+async function cloneDirectory(source, target) {
+  if (process.platform !== "darwin") return false;
+  try {
+    await execFileAsync("cp", ["-cR", source, target]);
+    return true;
+  } catch {
+    await rm(target, { recursive: true, force: true }).catch(() => {});
+    return false;
+  }
 }
 
 /**
