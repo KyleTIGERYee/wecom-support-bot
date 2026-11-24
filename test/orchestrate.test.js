@@ -161,7 +161,7 @@ test("连续 3 次 DENY 后走兜底话术", async () => {
   const result = await handleTurn({ question: "问", sessionKey: "wx-abc", deps, maxRounds: 3 });
 
   assert.equal(result.exhausted, true);
-  assert.match(result.finalText, /没法直接确认|问虎老师/);
+  assert.match(result.finalText, /没法直接确认|问技术同事/);
 });
 
 test("agent 失败时返回错误话术", async () => {

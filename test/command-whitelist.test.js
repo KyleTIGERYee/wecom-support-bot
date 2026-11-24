@@ -1,17 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { isCommandAllowed } from "../src/command-whitelist.js";
 
-const ROOTS = ["/Users/kyle/Desktop/PM/.agents/skills/ajly-wiki", "/Users/kyle/Desktop/VIBECODING/ajly"];
+const ROOTS = ["/tmp/fixture/.agents/skills/ajly-wiki", "/tmp/fixture/code/ajly"];
 
-const AJLY_WIKI_ROOT = "/Users/kyle/Desktop/PM/.agents/skills/ajly-wiki";
+const AJLY_WIKI_ROOT = "/tmp/fixture/.agents/skills/ajly-wiki";
 
-/** 四个 wiki 的检索脚本路径（真实路径，用于断言放行） */
+/** 四个 wiki 的检索脚本路径（通用占位路径，用于断言放行） */
 const SCRIPT = {
-  searchDb: "/Users/kyle/Desktop/PM/.agents/skills/ajly-wiki/scripts/search_db.py",
-  searchWiki: "/Users/kyle/Desktop/PM/.agents/skills/ajly-wiki/scripts/search_wiki.py",
+  searchDb: `${AJLY_WIKI_ROOT}/scripts/search_db.py`,
+  searchWiki: `${AJLY_WIKI_ROOT}/scripts/search_wiki.py`,
 };
+
+/** 受信任的 node 只读脚本按真实项目位置解析，测试里不写某台机器的绝对路径。 */
+const READ_EVOLUTION = join(dirname(dirname(fileURLToPath(import.meta.url))), "scripts/read-evolution.js");
 
 test("放行 wiki 检索脚本", () => {
   const result = isCommandAllowed(`python3 ${SCRIPT.searchDb} 退租`, ROOTS);
@@ -32,7 +37,7 @@ test("放行只读文件命令", () => {
 });
 
 test("拒绝删除命令", () => {
-  const result = isCommandAllowed("rm -rf /Users/kyle/Desktop/PM/.agents/skills/ajly-wiki", ROOTS);
+  const result = isCommandAllowed(`rm -rf ${AJLY_WIKI_ROOT}`, ROOTS);
 
   assert.equal(result.allowed, false);
   assert.match(result.reason ?? "", /不在白名单/);
@@ -65,7 +70,7 @@ test("拒绝命令替换", () => {
 });
 
 test("拒绝读取白名单外的路径（如 pi 凭证）", () => {
-  const result = isCommandAllowed("cat /Users/kyle/.pi/agent/models.json", ROOTS);
+  const result = isCommandAllowed("cat /tmp/outside/.pi/agent/models.json", ROOTS);
 
   assert.equal(result.allowed, false);
   assert.match(result.reason ?? "", /路径越界/);
@@ -101,8 +106,8 @@ test("拒绝变量展开逃逸（$HOME）", () => {
   assert.equal(result.allowed, false);
 });
 
-test("拒绝波浪号展开（~kyle）", () => {
-  const result = isCommandAllowed("cat ~kyle/.pi/agent/models.json", ROOTS);
+test("拒绝波浪号展开（~someone）", () => {
+  const result = isCommandAllowed("cat ~someone/.pi/agent/models.json", ROOTS);
 
   assert.equal(result.allowed, false);
 });
@@ -154,7 +159,7 @@ test("拒绝把路径当 grep 搜索模式", () => {
 
 test("允许运行经验检索脚本", () => {
   const result = isCommandAllowed(
-    `node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js ${AJLY_WIKI_ROOT} "机构数量"`,
+    `node ${READ_EVOLUTION} ${AJLY_WIKI_ROOT} "机构数量"`,
     ROOTS,
   );
 
@@ -170,7 +175,7 @@ test("拒绝运行其他 node 脚本", () => {
 
 test("拒绝用经验脚本读取白名单外的目录", () => {
   const result = isCommandAllowed(
-    "node /Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js /Users/kyle/.pi/agent 机构",
+    `node ${READ_EVOLUTION} /tmp/outside/.pi/agent 机构`,
     ROOTS,
   );
 

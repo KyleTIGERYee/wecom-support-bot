@@ -3,11 +3,13 @@ import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { findPersonalResidue } from "../scripts/personal-residue.js";
 
 const execFileAsync = promisify(execFile);
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -36,7 +38,9 @@ const ACCEPTANCE_SCENARIOS = {
   "final-delivery": ["inline-stream", "stream-failure-push", "all-failed"],
   "migration-comparison": ["fixed-question-comparison"],
 };
-const MODELS = Object.fromEntries(["main", "quick", "guard", "executionApproval"].map((role) => [role, { baseUrl: "http://192.168.1.20:3425/v1", model: `${role}-model` }]));
+/** 模型地址用通用占位（非回环即可通过 validate-model-url），测试里不写任何真实局域网 IP。 */
+const MODEL_URL = "http://10.0.0.1:3425/v1";
+const MODELS = Object.fromEntries(["main", "quick", "guard", "executionApproval"].map((role) => [role, { baseUrl: MODEL_URL, model: `${role}-model` }]));
 
 async function makeTempDir(t) {
   const dir = await mkdtemp(join(tmpdir(), "wsb-windows-"));
@@ -87,14 +91,25 @@ async function makeInstance(dir, { id = "instance-1", productionBotId = "product
   return saved;
 }
 
-async function makeFakeServiceBinaries(root) {
+/**
+ * 假 launchctl 严格模拟 launchd 的 label 语义，专门用来抓“查固定标签而不是 plist 真实 Label”的回归：
+ * - load/unload 只接受 plist 路径，Label 一律从 plist 的 <key>Label</key> 解析；plist 不存在或没有 Label 直接失败；
+ * - list <label>：已加载 → 0；已知但未加载 → 1；从未出现过的 label → 113（真实 launchctl 的
+ *   “Could not find service”）。“已知”= 初始登记或经 load/unload 的 plist 登记过。CLI 若传了与 plist
+ *   不一致的 label（例如固定默认标签），就会得到 113 并被 assertLaunchLabelsKnown 抓到；
+ * - 每次调用把 { args, code } 写入 launchLog，测试据此断言 list 用的 label 必须等于 plist 的 Label。
+ * 环境开关：FAKE_LAUNCHD_START_FAIL=1 让 load 失败；FAKE_LAUNCHD_LOAD_UNVERIFIABLE=1 让 load 成功后
+ * 的第一次 list 查不到、=2 之后一直查不到（模拟恢复后无法验证，触发失败清理）；FAKE_LAUNCHD_UNLOAD_IGNORED=1
+ * 让 unload 不生效（模拟服务卡住）；FAKE_LAUNCHD_UNLOAD_FAIL=1 让 unload 直接报错（模拟旧系统对未加载服务 unload 出错）。
+ */
+async function makeFakeServiceBinaries(root, { launchdLabels = ["com.wecom-support-bot"], knownLabels = launchdLabels } = {}) {
   const systemLog = join(root, "systemctl.jsonl");
   const systemState = join(root, "systemd-state.json");
   const launchLog = join(root, "launchctl.jsonl");
   const launchState = join(root, "launchd-state.json");
   const chownLog = join(root, "chown.jsonl");
   await writeJson(systemState, { active: true, enabled: true });
-  await writeJson(launchState, { loaded: true });
+  await writeJson(launchState, { loaded: launchdLabels, known: knownLabels, unverifiable: [] });
   const systemctl = join(root, "systemctl.cjs");
   const launchctl = join(root, "launchctl.cjs");
   const chown = join(root, "chown.cjs");
@@ -120,16 +135,48 @@ process.exit(0);
   await writeFile(launchctl, `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(launchLog)}, JSON.stringify(args) + "\\n");
-const state = JSON.parse(fs.readFileSync(${JSON.stringify(launchState)}, "utf8"));
-const save = () => fs.writeFileSync(${JSON.stringify(launchState)}, JSON.stringify(state));
-if (args[0] === "unload") { state.loaded = false; save(); process.exit(0); }
-if (args[0] === "load") {
-  if (process.env.FAKE_LAUNCHD_START_FAIL === "1") process.exit(1);
-  state.loaded = true; save(); process.exit(0);
+const statePath = ${JSON.stringify(launchState)};
+const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+const save = () => fs.writeFileSync(statePath, JSON.stringify(state));
+const finish = (code) => {
+  save();
+  fs.appendFileSync(${JSON.stringify(launchLog)}, JSON.stringify({ args, code }) + "\\n");
+  process.exit(code);
+};
+const labelOf = (plist) => {
+  if (typeof plist !== "string" || !fs.existsSync(plist)) { console.error("fake launchctl: plist 不存在：" + plist); finish(2); }
+  const match = fs.readFileSync(plist, "utf8").match(/<key>\\s*Label\\s*<\\/key>\\s*<string>([^<]*)<\\/string>/);
+  // 与真实 launchd 一致：没有 Label、空 Label、含空白/控制字符的 Label 都不是合法服务。
+  if (!match || !match[1] || /[\\s\\x00-\\x1f\\x7f]/.test(match[1])) { console.error("fake launchctl: plist 缺少有效 Label：" + plist); finish(2); }
+  if (!state.known.includes(match[1])) state.known.push(match[1]);
+  return match[1];
+};
+const [command, ...rest] = args;
+if (command === "unload" && rest[0] === "-w" && rest.length === 2) {
+  const label = labelOf(rest[1]);
+  if (process.env.FAKE_LAUNCHD_UNLOAD_FAIL === "1") { console.error("fake launchctl: unload 失败（模拟）"); finish(1); }
+  if (!process.env.FAKE_LAUNCHD_UNLOAD_IGNORED) state.loaded = state.loaded.filter((item) => item !== label);
+  state.unverifiable = [];
+  save(); finish(0);
 }
-if (args[0] === "list") process.exit(state.loaded ? 0 : 1);
-process.exit(0);
+if (command === "load" && rest[0] === "-w" && rest.length === 2) {
+  const label = labelOf(rest[1]);
+  if (process.env.FAKE_LAUNCHD_START_FAIL === "1") { console.error("fake launchctl: load 失败（模拟）"); finish(1); }
+  state.loaded.push(label);
+  if (process.env.FAKE_LAUNCHD_LOAD_UNVERIFIABLE) state.unverifiable.push(label);
+  save(); finish(0);
+}
+if (command === "list" && rest.length === 1) {
+  const label = rest[0];
+  if (!state.known.includes(label)) { console.error('Could not find service "' + label + '"：label 与传入 plist 的 Label 不一致'); finish(113); }
+  // FAKE_LAUNCHD_LOAD_UNVERIFIABLE=1：只让 load 后的第一次 list 查不到；=2：之后一直查不到（launchd 始终无法确认）。
+  if (state.unverifiable.includes(label)) {
+    if (process.env.FAKE_LAUNCHD_LOAD_UNVERIFIABLE !== "2") state.unverifiable = state.unverifiable.filter((item) => item !== label);
+    finish(1);
+  }
+  finish(state.loaded.includes(label) ? 0 : 1);
+}
+console.error("fake launchctl: 不支持的调用 " + JSON.stringify(args)); finish(2);
 `, { mode: 0o755 });
   await writeFile(chown, `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -141,6 +188,45 @@ fs.appendFileSync(${JSON.stringify(chownLog)}, JSON.stringify(process.argv.slice
 async function readLines(path) {
   if (!existsSync(path)) return [];
   return (await readFile(path, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+}
+
+/** 写一个最小 XML launchd plist；Label 是 launchctl 查找服务的唯一依据，与文件名无关。 */
+async function writeLaunchdPlist(path, label) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/true</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+`);
+}
+
+/** 假 launchctl 收到的全部调用参数（按顺序）。 */
+async function launchCalls(binaries) {
+  return (await readLines(binaries.launchLog)).map((call) => call.args);
+}
+
+async function launchdState(binaries) {
+  return JSON.parse(await readFile(binaries.launchState, "utf8"));
+}
+
+/**
+ * 任何 list 都不得得到 113：113 表示 CLI 传的 label 既不是测试登记过的服务、也不是任何传入 plist 的 Label
+ * （例如写死了默认标签）。使用前请确保合法 label 已通过 launchdLabels/knownLabels 登记或经 plist 登记。
+ */
+async function assertLaunchLabelsKnown(binaries) {
+  for (const call of await readLines(binaries.launchLog)) {
+    assert.notEqual(call.code, 113, `launchctl 收到了与 plist 不一致的 label：${JSON.stringify(call.args)}`);
+  }
 }
 
 async function runWithInput(command, args, input, { env = process.env } = {}) {
@@ -252,11 +338,36 @@ async function passAcceptance(record) {
   }
 }
 
-function cutoverArgs(oldInstance, newInstance, acceptance, output, binaries) {
+function cutoverArgs(oldInstance, newInstance, acceptance, output, binaries, plist) {
   return {
-    old: ["cutover-old", "--instance-dir", oldInstance, "--acceptance", acceptance, "--output", output, "--plist", join(dirname(output), "old.plist"), "--launchctl", binaries.launchctl],
+    old: ["cutover-old", "--instance-dir", oldInstance, "--acceptance", acceptance, "--output", output, "--plist", plist, "--launchctl", binaries.launchctl],
     new: ["cutover-new", "--instance-dir", newInstance, "--acceptance", acceptance, "--old-stopped", join(output, "old-stopped.json"), "--snapshot", join(output, "state"), "--systemctl", binaries.systemctl, "--chown", binaries.chown],
+    rollbackNew: ["rollback-new", "--instance-dir", newInstance, "--output", join(dirname(output), "rollback"), "--systemctl", binaries.systemctl],
   };
+}
+
+function rollbackOldArgsFor(oldInstance, root, binaries, plist) {
+  const rollbackOutput = join(root, "rollback");
+  return ["rollback-old", "--instance-dir", oldInstance, "--windows-stopped", join(rollbackOutput, "windows-stopped.json"), "--snapshot", join(rollbackOutput, "state"), "--plist", plist, "--launchctl", binaries.launchctl];
+}
+
+/**
+ * 准备一套完整的切换 fixture：旧/新实例、已通过的验收记录、假 systemctl/launchctl（旧端按 label 处于已加载），
+ * 以及旧端 plist——文件名故意与 Label 无关，证明 CLI 只信 plist 内的 Label、不靠文件名或默认命名猜。
+ */
+async function prepareCutover(root, { label = "com.wecom-support-bot", plistName = "old.plist" } = {}) {
+  const oldInstance = join(root, "old");
+  const newInstance = join(root, "new");
+  await makeInstance(oldInstance, { id: "old" });
+  await makeInstance(newInstance, { id: "new" });
+  const acceptance = join(root, "acceptance.json");
+  await runCli(["acceptance-create", "--instance-dir", newInstance, "--output", acceptance]);
+  await passAcceptance(acceptance);
+  const binaries = await makeFakeServiceBinaries(root, { launchdLabels: [label] });
+  const output = join(root, "cutover");
+  const plist = join(root, plistName);
+  await writeLaunchdPlist(plist, label);
+  return { oldInstance, newInstance, acceptance, binaries, output, plist, label, args: cutoverArgs(oldInstance, newInstance, acceptance, output, binaries, plist) };
 }
 
 test("安装公开计划校验安全参数，Linux dry-run 不修改系统且拒绝 /mnt/c", async (t) => {
@@ -304,11 +415,16 @@ test("安装资源包只含白名单并在内容篡改或追加凭证时校验�
   const packagedPlan = JSON.parse(await readFile(join(output, "windows/wsl-plan.json"), "utf8"));
   assert.equal(packagedPlan.windowsCommands.planOnly.at(-2), "<package>/windows/install.ps1");
   assert.equal(manifest.files.some((entry) => /secrets|node_modules|launchd|workspace|data\//.test(entry.path)), false);
+  // 内部回归题文档不进安装包；个人残留守卫随 CLI 一起打包，目标 Linux 的 build/verify 同样生效。
+  assert.equal(manifest.files.some((entry) => entry.path === "docs/regression-questions.md"), false);
+  assert.ok(manifest.files.some((entry) => entry.path === "scripts/personal-residue.js"));
   const verified = await runCli(["verify-package", "--package-dir", output]);
   assert.equal(verified.status, "ok");
   const defaults = await readFile(join(output, "config/default.json"), "utf8");
   assert.equal(defaults.includes("/Users/"), false);
   assert.deepEqual(JSON.parse(defaults).roots, {});
+  assert.equal(typeof JSON.parse(defaults).surface.welcomeText, "string");
+  assert.equal(findPersonalResidue(defaults), null, "包内 default.json（含 surface 话术）不得带个人称呼");
 
   await writeFile(join(output, "config/secrets.json"), '{"botId":"real-looking-secret"}\n');
   const extra = await runCli(["verify-package", "--package-dir", output], { allowFailure: true });
@@ -317,6 +433,153 @@ test("安装资源包只含白名单并在内容篡改或追加凭证时校验�
   await writeFile(join(output, "prompts/local-instance.md"), "tampered\n");
   const changed = await runCli(["verify-package", "--package-dir", output], { allowFailure: true });
   assert.match(changed.error, /校验失败/);
+  // verify-package 自带个人残留扫描：即使清单哈希被重新签发、校验全部通过，带个人称呼的文件仍会被拒绝。
+  // 目标 Linux 的 install.sh 只跑 verify-package，这道门不能只存在于 build-package。
+  await writeFile(join(output, "prompts/local-instance.md"), `这条我没法直接确认，建议直接问${"\u864e\u8001\u5e08"}。\n`);
+  const manifestPath = join(output, "windows-package.json");
+  const reissued = JSON.parse(await readFile(manifestPath, "utf8"));
+  reissued.files.find((entry) => entry.path === "prompts/local-instance.md").sha256 = sha256(await readFile(join(output, "prompts/local-instance.md")));
+  await writeJson(manifestPath, reissued);
+  const residue = await runCli(["verify-package", "--package-dir", output], { allowFailure: true });
+  assert.equal(residue.status, "error");
+  assert.match(residue.error, /安装包文件包含个人称呼/);
+  assert.match(residue.error, /prompts\/local-instance\.md/);
+});
+
+/**
+ * 从 install.ps1 按文本顺序提取 WSL 侧命令，兼容两种写法：
+ *   Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", cmd...)
+ *   & wsl.exe --distribution $Distro --user root -- cmd...
+ * 返回 [{ index, args }]，args 是去掉 wsl.exe 前缀后的参数，保留 $变量 引用。
+ */
+function extractWslCommands(script) {
+  const pattern = /"wsl\.exe"\s*@\(([^)]*)\)|&\s*wsl\.exe\s+--distribution\s+\$Distro\s+--user\s+root\s+--\s+([^|\r\n)]+)/g;
+  const commands = [];
+  for (const match of script.matchAll(pattern)) {
+    const args = match[1]
+      ? match[1].split(",").map((token) => token.trim().replace(/^"|"$/g, "")).filter(Boolean)
+      : match[2].trim().split(/\s+/);
+    const separator = args.indexOf("--");
+    commands.push({ index: match.index, args: separator === -1 ? args : args.slice(separator + 1) });
+  }
+  return commands;
+}
+
+/** 读取 install.ps1 中 `$name = "..."` 的双引号字符串定义。 */
+function psStringDefinition(script, name) {
+  const match = script.match(new RegExp(`\\$${name}\\s*=\\s*"([^"\\r\\n]*)"`, "m"));
+  assert.ok(match, `install.ps1 应定义 $${name}`);
+  return match[1];
+}
+
+function expandPsVars(text, vars) {
+  return text.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (whole, name) => (vars[name] === undefined ? whole : vars[name]));
+}
+
+test("install.ps1 不会把 package.tar.gz 留在传给 install.sh --bundle 的目录里", async (t) => {
+  const root = await makeTempDir(t);
+  const script = await readFile(join(projectDir, "windows/install.ps1"), "utf8");
+  const installSh = await readFile(join(projectDir, "windows/linux/install.sh"), "utf8");
+
+  // install.sh 对 --bundle 目录执行 verify-package，任何未登记文件都会让安装失败。
+  assert.match(installSh, /verify-package --package-dir "\$BUNDLE"/);
+  // install.ps1 传给 install.sh 的 <package> 正是 $linuxPackage。
+  assert.match(script, /\.Replace\("<package>", \$linuxPackage\)/);
+
+  // 静态校验：压缩包副本定义在 $linuxPackage 之外，脚本中不存在 $linuxPackage/....tar.gz。
+  const bundleDefinition = psStringDefinition(script, "linuxPackage");
+  assert.match(bundleDefinition, /^\/tmp\/wecom-support-bot-\$token$/);
+  const copyDefinition = psStringDefinition(script, "linuxArchiveCopy");
+  assert.match(copyDefinition, /^\$linuxPackage[^/]/, "压缩包副本必须由 $linuxPackage 派生，且不能放在该目录内（同级路径）");
+  assert.match(copyDefinition, /\.tar\.gz$/);
+  assert.doesNotMatch(script, /\$linuxPackage\/[^\s"]*/);
+
+  const commands = extractWslCommands(script);
+  // 只看资源包解包这一段：从 $linuxPackage 定义处到 install.sh 调用处之前的命令，以及其后的 finally 清理。
+  const packageBlockStart = script.indexOf("$linuxPackage = ");
+  const installCall = script.indexOf("$installArgs = @($plan.wslCommands.installLinux");
+  assert.ok(packageBlockStart > 0 && installCall > packageBlockStart, "install.ps1 应先准备 $linuxPackage 再调用 install.sh");
+  const packageCommands = commands.filter((command) => command.index > packageBlockStart && command.args[0] !== "wslpath");
+  const beforeInstall = packageCommands.filter((command) => command.index < installCall);
+  const afterInstall = packageCommands.filter((command) => command.index > installCall);
+  assert.ok(beforeInstall.length >= 5, `应提取到解包前的 WSL 命令：${JSON.stringify(beforeInstall)}`);
+  const copiesArchive = ({ args }) => args[0] === "cp" || (args[0] === "tar" && args.includes("-xzf"));
+  for (const { args } of beforeInstall.filter(copiesArchive)) {
+    for (const token of args) assert.equal(token.startsWith("$linuxPackage/"), false, `压缩包不能落在 bundle 目录内：${args.join(" ")}`);
+  }
+  const tar = beforeInstall.find(({ args }) => args[0] === "tar");
+  const copy = beforeInstall.find(({ args }) => args[0] === "cp");
+  assert.deepEqual(tar?.args, ["tar", "-xzf", "$linuxArchiveCopy", "-C", "$linuxPackage"]);
+  assert.equal(copy?.args.at(-1), "$linuxArchiveCopy");
+  const removesCopy = ({ args }) => args[0] === "rm" && args[1] === "-f" && args[2] === "$linuxArchiveCopy";
+  assert.ok(beforeInstall.some(removesCopy), "解包后应立即删除压缩包副本");
+  assert.ok(afterInstall.some(removesCopy), "finally 兜底应删除压缩包副本");
+
+  // 行为校验：用真实安装包按脚本顺序在本机重放 WSL 侧命令，再对 bundle 目录跑 verify-package。
+  const packageDir = join(root, "package");
+  await runCli(["build-package", "--output", packageDir]);
+  const bundle = join(root, bundleDefinition.replace("/tmp/", "").replace("$token", "fixture"));
+  const archive = join(root, "windows-side.tar.gz");
+  await execFileAsync("tar", ["-czf", archive, "-C", packageDir, "."]);
+  const vars = { Distro: "Ubuntu-24.04", linuxPackage: bundle, linuxArchiveCopy: expandPsVars(copyDefinition, { linuxPackage: bundle }), linuxArchive: archive, token: "fixture" };
+  const replay = async ({ args }) => {
+    const resolved = args.map((token) => expandPsVars(token, vars));
+    for (const token of resolved) assert.equal(token.includes("$"), false, `变量未解析：${token}`);
+    if (resolved[0] === "rm") {
+      for (const target of resolved.slice(1)) if (!target.startsWith("-")) assert.ok(target.startsWith(root), `拒绝重放删除测试目录之外的路径：${target}`);
+    }
+    await execFileAsync(resolved[0], resolved.slice(1));
+  };
+  for (const command of beforeInstall) await replay(command);
+  assert.equal(existsSync(bundle), true);
+  assert.equal((await readdir(bundle)).some((name) => name.endsWith(".tar.gz")), false, "bundle 目录内不得残留压缩包");
+  assert.equal(existsSync(vars.linuxArchiveCopy), false, "解包后压缩包副本应已删除");
+  const verifiedBundle = await runCli(["verify-package", "--package-dir", bundle]);
+  assert.equal(verifiedBundle.status, "ok", "传给 install.sh 的 bundle 目录必须能通过 verify-package");
+  assert.equal(verifiedBundle.packageDir, bundle);
+  assert.equal(verifiedBundle.files, JSON.parse(await readFile(join(bundle, "windows-package.json"), "utf8")).files.length);
+  for (const command of afterInstall) await replay(command);
+  assert.equal(existsSync(vars.linuxArchiveCopy), false);
+});
+
+test("verify-package 拒绝 bundle 目录里残留的 package.tar.gz（旧安装器的必败路径）", async (t) => {
+  const root = await makeTempDir(t);
+  const packageDir = join(root, "package");
+  await runCli(["build-package", "--output", packageDir]);
+  const archive = join(root, "package.tar.gz");
+  await execFileAsync("tar", ["-czf", archive, "-C", packageDir, "."]);
+  await cp(archive, join(packageDir, "package.tar.gz"));
+  const rejected = await runCli(["verify-package", "--package-dir", packageDir], { allowFailure: true });
+  assert.equal(rejected.status, "error");
+  assert.match(rejected.error, /安装包包含未登记内容：package\.tar\.gz/);
+  await rm(join(packageDir, "package.tar.gz"));
+  assert.equal((await runCli(["verify-package", "--package-dir", packageDir])).status, "ok");
+});
+
+test("build-package 拒绝带个人残留的源文件（含 surface 话术）并指出文件与修复方式", async (t) => {
+  const root = await makeTempDir(t);
+  // 先用真实项目打出一份标准包，再把它当作源目录：标准包本身就是合法的 build-package 输入。
+  const source = join(root, "source");
+  await runCli(["build-package", "--output", source]);
+  const defaultsPath = join(source, "config/default.json");
+  const defaults = JSON.parse(await readFile(defaultsPath, "utf8"));
+  defaults.surface.fallbackText = `这条我没法直接确认，建议直接问${"\u864e\u8001\u5e08"}。`;
+  await writeFile(defaultsPath, JSON.stringify(defaults, null, 2));
+  const output = join(root, "package");
+  const rejected = await runCli(["build-package", "--source-dir", source, "--output", output], { allowFailure: true });
+  assert.equal(rejected.status, "error");
+  assert.match(rejected.error, /config\/default\.json/);
+  assert.match(rejected.error, /个人称呼/);
+  assert.match(rejected.error, /技术同事/);
+  assert.equal(existsSync(output), false, "拒绝时不得留下半成品安装包");
+
+  defaults.surface.fallbackText = "这条涉及生产数据，我没法直接确认。建议直接问技术同事。";
+  await writeFile(defaultsPath, JSON.stringify(defaults, null, 2));
+  const built = await runCli(["build-package", "--source-dir", source, "--output", output]);
+  assert.equal(built.status, "ok");
+  const packaged = await readFile(join(output, "config/default.json"), "utf8");
+  assert.equal(findPersonalResidue(packaged), null);
+  assert.match(packaged, /技术同事/);
 });
 
 test("systemd 单元由公开命令生成，服务脚本通过假 systemctl 启停并先验实例", async (t) => {
@@ -387,7 +650,7 @@ test("模型回环地址明确拒绝，企微测试/正式配置不会直接启�
   await rm(join(instance, "wecom.json"));
   const loopback = await runCli(["validate-model-url", "--url", "http://127.0.0.1:3425/v1"], { allowFailure: true });
   assert.match(loopback.error, /不能沿用/);
-  const routed = await runCli(["validate-model-url", "--url", "http://192.168.1.20:3425/v1"]);
+  const routed = await runCli(["validate-model-url", "--url", MODEL_URL]);
   assert.equal(routed.connectionTest, "not-run");
   await runCli(["configure-channel", "--instance-dir", instance, "--kind", "test", "--bot-id", "test-only", "--secret", "test-secret"]);
   await runCli(["configure-channel", "--instance-dir", instance, "--kind", "production", "--bot-id", "production-only", "--secret", "production-secret"]);
@@ -644,13 +907,15 @@ test("验收硬门拒绝空路径、占位、未运行、正式 botId、缺场�
   const oldInstance = join(root, "old");
   await makeInstance(oldInstance, { id: "old" });
   const binaries = await makeFakeServiceBinaries(root);
-  const oldArgs = ["cutover-old", "--instance-dir", oldInstance, "--acceptance", record, "--output", join(root, "cutover"), "--launchctl", binaries.launchctl];
+  const plist = join(root, "old.plist");
+  await writeLaunchdPlist(plist, "com.wecom-support-bot");
+  const oldArgs = ["cutover-old", "--instance-dir", oldInstance, "--acceptance", record, "--output", join(root, "cutover"), "--plist", plist, "--launchctl", binaries.launchctl];
   const dry = await runCli(oldArgs);
   assert.equal(dry.executes, false);
   await rm(join(root, "evidence/wecom-text/group-chat.json"));
   const tampered = await runCli(oldArgs, { allowFailure: true });
   assert.match(tampered.error, /证据|结果|不存在/);
-  assert.deepEqual(await readLines(binaries.launchLog), []);
+  assert.deepEqual(await launchCalls(binaries), []);
 });
 
 test("固定问题对照同时校验 ID 与正文哈希，换题、漏题和基线升级均失败", async (t) => {
@@ -691,6 +956,8 @@ test("acceptance-run 通过公开 ask 边界记录真实执行结果且不把未
   await mkdir(join(isolated, "docs"), { recursive: true });
   await writeJson(join(isolated, "package.json"), { type: "module" });
   await writeFile(join(isolated, "scripts/windows-instance.js"), await readFile(cliPath, "utf8"));
+  // windows-instance.js 依赖同目录的个人残留守卫模块，隔离副本需一并带上。
+  await writeFile(join(isolated, "scripts/personal-residue.js"), await readFile(join(projectDir, "scripts/personal-residue.js"), "utf8"));
   await writeFile(join(isolated, "docs/windows-migration-questions.json"), await readFile(join(projectDir, "docs/windows-migration-questions.json"), "utf8"));
   const askLog = join(root, "ask.jsonl");
   await writeFile(join(isolated, "scripts/local-instance.js"), `import { appendFileSync } from "node:fs";
@@ -749,26 +1016,29 @@ console.log(JSON.stringify({ finalText: "真实执行结果：" + question, load
 
 test("正式切换与回滚通过假服务边界严格排序，并带回 Windows 新状态", async (t) => {
   const root = await makeTempDir(t);
-  const oldInstance = join(root, "old");
-  const newInstance = join(root, "new");
-  await makeInstance(oldInstance, { id: "old" });
-  await makeInstance(newInstance, { id: "new" });
+  const DEFAULT_LABEL = "com.wecom-support-bot";
+  const { oldInstance, newInstance, acceptance, binaries, output, plist, args } = await prepareCutover(root);
   await writeFile(join(oldInstance, "data/inbox.jsonl"), JSON.stringify({ msgid: "old-message", question: "旧端最后问题", userId: "u-old", receivedAt: "2026-11-05T00:00:00.000Z", state: "received" }) + "\n");
   await writeFile(join(oldInstance, "workspace/old-task.md"), "old\n");
   await writeFile(join(newInstance, "data/inbox.jsonl"), JSON.stringify({ msgid: "test-only-message", question: "测试机器人问题", userId: "u-test", receivedAt: "2026-11-04T23:00:00.000Z", state: "received" }) + "\n");
-  const acceptance = join(root, "acceptance.json");
-  await runCli(["acceptance-create", "--instance-dir", newInstance, "--output", acceptance]);
-  await passAcceptance(acceptance);
-  const binaries = await makeFakeServiceBinaries(root);
-  const output = join(root, "cutover");
-  const args = cutoverArgs(oldInstance, newInstance, acceptance, output, binaries);
+
+  // 不传 --plist 时默认路径仍是通用命名；该路径不存在时 dry-run 直接失败（plist 缺失就没有可信 Label），
+  // 不会带着固定标签走到 execute 才发现查错服务。
+  const missingDefault = await runCli(["cutover-old", "--instance-dir", oldInstance, "--acceptance", acceptance, "--output", output], { allowFailure: true });
+  assert.equal(missingDefault.status, "error");
+  assert.match(missingDefault.error, /无法读取旧端 launchd plist/);
+  assert.match(missingDefault.error, /launchd\/com\.wecom-support-bot\.plist/);
+  assert.deepEqual(await launchCalls(binaries), []);
 
   const dryOld = await runCli(args.old);
   assert.equal(dryOld.executes, false);
-  assert.deepEqual(await readLines(binaries.launchLog), []);
+  assert.equal(dryOld.steps[0], `${binaries.launchctl} unload -w ${plist}`);
+  assert.deepEqual(dryOld.launchd, { plist, label: DEFAULT_LABEL });
+  assert.deepEqual(await launchCalls(binaries), []);
   const stopped = await runCli([...args.old, "--execute", "--confirm", "STOP_OLD_PRODUCTION"]);
   assert.equal(stopped.status, "old-stopped-new-not-started");
-  assert.deepEqual((await readLines(binaries.launchLog)).map((entry) => entry[0]), ["list", "unload", "list"]);
+  assert.equal(stopped.attestation.launchdLabel, DEFAULT_LABEL);
+  assert.deepEqual(await launchCalls(binaries), [["list", DEFAULT_LABEL], ["unload", "-w", plist], ["list", DEFAULT_LABEL]]);
   const dryNew = await runCli(args.new);
   assert.equal(dryNew.executes, false);
   assert.deepEqual(await readLines(binaries.systemLog), []);
@@ -798,7 +1068,7 @@ test("正式切换与回滚通过假服务边界严格排序，并带回 Windows
   assert.deepEqual(systemCalls[0], ["disable", "--now", "wecom-support-bot.service"]);
   assert.deepEqual(systemCalls.at(-2), ["enable", "--now", "wecom-support-bot.service"]);
   assert.deepEqual(systemCalls.at(-1), ["is-active", "wecom-support-bot.service"]);
-  assert.deepEqual((await readLines(binaries.launchLog)).map((entry) => entry[0]), ["list", "unload", "list"]);
+  assert.deepEqual((await launchCalls(binaries)).map((entry) => entry[0]), ["list", "unload", "list"]);
   assert.equal(JSON.parse(await readFile(join(newInstance, "wecom.json"), "utf8")).active, "production");
   assert.equal(await readFile(join(newInstance, "workspace/old-task.md"), "utf8"), "old\n");
   assert.doesNotMatch(await readFile(join(newInstance, "data/inbox.jsonl"), "utf8"), /test-only-message/);
@@ -807,15 +1077,16 @@ test("正式切换与回滚通过假服务边界严格排序，并带回 Windows
   await writeFile(join(newInstance, "workspace/windows-task.md"), "created-on-windows\n");
   await writeFile(join(newInstance, "data/inbox.jsonl"), (await readFile(join(newInstance, "data/inbox.jsonl"), "utf8")) + JSON.stringify({ msgid: "windows-message", question: "Windows 新问题", userId: "u-new", receivedAt: "2026-11-05T01:00:00.000Z", state: "received" }) + "\n");
   const rollbackOutput = join(root, "rollback");
-  const rollbackNewArgs = ["rollback-new", "--instance-dir", newInstance, "--output", rollbackOutput, "--systemctl", binaries.systemctl];
+  const rollbackNewArgs = args.rollbackNew;
   const dryRollback = await runCli(rollbackNewArgs);
   assert.equal(dryRollback.executes, false);
   const windowsStopped = await runCli([...rollbackNewArgs, "--execute", "--confirm", "STOP_WINDOWS_PRODUCTION"]);
   assert.equal(windowsStopped.status, "windows-stopped-old-not-started");
   assert.equal(JSON.parse(await readFile(join(newInstance, "wecom.json"), "utf8")).active, "none");
-  const rollbackOldArgs = ["rollback-old", "--instance-dir", oldInstance, "--windows-stopped", join(rollbackOutput, "windows-stopped.json"), "--snapshot", join(rollbackOutput, "state"), "--plist", join(root, "old.plist"), "--launchctl", binaries.launchctl];
+  const rollbackOldArgs = rollbackOldArgsFor(oldInstance, root, binaries, plist);
   const dryRestore = await runCli(rollbackOldArgs);
   assert.equal(dryRestore.executes, false);
+  assert.deepEqual(dryRestore.launchd, { plist, label: DEFAULT_LABEL });
   const windowsStoppedValue = JSON.parse(await readFile(join(rollbackOutput, "windows-stopped.json"), "utf8"));
   const wrongWindowsStopped = join(root, "wrong-windows-stopped.json");
   await writeJson(wrongWindowsStopped, { ...windowsStoppedValue, snapshotManifestSha256: "f".repeat(64) });
@@ -829,36 +1100,222 @@ test("正式切换与回滚通过假服务边界严格排序，并带回 Windows
   assert.equal(tamperedRollbackPlan.status, "error");
   assert.match(tamperedRollbackPlan.error, /校验失败/);
   await writeFile(rollbackTask, rollbackTaskBytes);
-  assert.deepEqual((await readLines(binaries.launchLog)).map((entry) => entry[0]), ["list", "unload", "list"]);
+  assert.deepEqual((await launchCalls(binaries)).map((entry) => entry[0]), ["list", "unload", "list"]);
   const restored = await runCli([...rollbackOldArgs, "--execute", "--confirm", "RESTORE_OLD_PRODUCTION"]);
   assert.equal(restored.status, "old-active-windows-stopped");
+  assert.deepEqual(restored.launchd, { plist, label: DEFAULT_LABEL });
   assert.equal(await readFile(join(oldInstance, "workspace/windows-task.md"), "utf8"), "created-on-windows\n");
   assert.match(await readFile(join(oldInstance, "data/inbox.jsonl"), "utf8"), /windows-message/);
-  assert.deepEqual((await readLines(binaries.launchLog)).map((entry) => entry[0]).slice(-4), ["list", "list", "load", "list"]);
+  // 合并前再次停用：list → unload -w → list；恢复：load -w → list。全部按 plist 的真实 Label。
+  assert.deepEqual((await launchCalls(binaries)).slice(-5), [["list", DEFAULT_LABEL], ["unload", "-w", plist], ["list", DEFAULT_LABEL], ["load", "-w", plist], ["list", DEFAULT_LABEL]]);
+  assert.deepEqual((await readLines(binaries.launchLog)).slice(-5).map((call) => call.code), [1, 0, 1, 0, 0]);
   assert.equal(JSON.parse(await readFile(binaries.systemState), "utf8").active, false);
-  assert.equal(JSON.parse(await readFile(binaries.launchState), "utf8").loaded, true);
+  assert.deepEqual((await launchdState(binaries)).loaded, [DEFAULT_LABEL]);
+  await assertLaunchLabelsKnown(binaries);
 });
 
 test("新端正式启用失败时改回 none 并停用，不自动拉起旧端", async (t) => {
   const root = await makeTempDir(t);
-  const oldInstance = join(root, "old");
-  const newInstance = join(root, "new");
-  await makeInstance(oldInstance, { id: "old" });
-  await makeInstance(newInstance, { id: "new" });
-  const acceptance = join(root, "acceptance.json");
-  await runCli(["acceptance-create", "--instance-dir", newInstance, "--output", acceptance]);
-  await passAcceptance(acceptance);
-  const binaries = await makeFakeServiceBinaries(root);
-  const output = join(root, "cutover");
-  const args = cutoverArgs(oldInstance, newInstance, acceptance, output, binaries);
+  const { newInstance, binaries, args } = await prepareCutover(root);
   await runCli([...args.old, "--execute", "--confirm", "STOP_OLD_PRODUCTION"]);
   const failed = await runCli([...args.new, "--execute", "--confirm", "ACTIVATE_NEW_PRODUCTION"], { allowFailure: true, env: { ...process.env, FAKE_SYSTEMD_START_FAIL: "1" } });
   assert.match(failed.error, /已安全停用新端且未重启旧端/);
   assert.equal(JSON.parse(await readFile(join(newInstance, "wecom.json"), "utf8")).active, "none");
   assert.equal(JSON.parse(await readFile(binaries.systemState), "utf8").active, false);
   assert.equal(JSON.parse(await readFile(binaries.systemState), "utf8").enabled, false);
-  assert.equal(JSON.parse(await readFile(binaries.launchState), "utf8").loaded, false);
-  assert.deepEqual((await readLines(binaries.launchLog)).map((entry) => entry[0]), ["list", "unload", "list"]);
+  assert.deepEqual((await launchdState(binaries)).loaded, []);
+  assert.deepEqual((await launchCalls(binaries)).map((entry) => entry[0]), ["list", "unload", "list"]);
+  await assertLaunchLabelsKnown(binaries);
+});
+
+test("旧 Mac 自定义 Label 的历史 plist：cutover-old / rollback-old 全程按 plist 内真实 Label 查卸载，传错 label 会被假 launchctl 拒绝", async (t) => {
+  const root = await makeTempDir(t);
+  // 历史 plist：文件名与默认命名完全无关，Label 是当年自定义的；旧服务正以这个 Label 运行。
+  const CUSTOM_LABEL = "com.example.legacy-support-bot";
+  const { oldInstance, newInstance, binaries, plist, args } = await prepareCutover(root, { label: CUSTOM_LABEL, plistName: "historic-agent.plist" });
+  await writeFile(join(oldInstance, "workspace/old-task.md"), "old\n");
+
+  // 先证明假 launchctl 自身足够严格：写死的默认标签会得到 113（Could not find service），
+  // plist 不存在 / 没有 Label / 空 Label 的 load、unload 直接失败。否则下面的断言没有说服力。
+  const exitCode = (promise) => promise.then(() => 0, (error) => error.code);
+  assert.equal(await exitCode(execFileAsync(binaries.launchctl, ["list", "com.wecom-support-bot"])), 113);
+  assert.equal(await exitCode(execFileAsync(binaries.launchctl, ["list", CUSTOM_LABEL])), 0);
+  assert.notEqual(await exitCode(execFileAsync(binaries.launchctl, ["unload", "-w", join(root, "missing.plist")])), 0);
+  await writeFile(join(root, "no-label.plist"), '<plist version="1.0"><dict><key>ProgramArguments</key><array/></dict></plist>\n');
+  assert.notEqual(await exitCode(execFileAsync(binaries.launchctl, ["load", "-w", join(root, "no-label.plist")])), 0);
+  await writeLaunchdPlist(join(root, "empty-label.plist"), "");
+  assert.notEqual(await exitCode(execFileAsync(binaries.launchctl, ["load", "-w", join(root, "empty-label.plist")])), 0);
+  assert.deepEqual((await launchdState(binaries)).loaded, [CUSTOM_LABEL], "被拒绝的调用不得改变已加载状态");
+  await rm(binaries.launchLog);
+
+  const dryOld = await runCli(args.old);
+  assert.equal(dryOld.executes, false);
+  assert.deepEqual(dryOld.launchd, { plist, label: CUSTOM_LABEL }, "dry-run 必须公开将要操作的 plist 与其真实 Label");
+  assert.deepEqual(await launchCalls(binaries), []);
+  const stopped = await runCli([...args.old, "--execute", "--confirm", "STOP_OLD_PRODUCTION"]);
+  assert.equal(stopped.status, "old-stopped-new-not-started");
+  assert.equal(stopped.attestation.launchdLabel, CUSTOM_LABEL);
+  assert.deepEqual(await launchCalls(binaries), [["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL]]);
+  assert.deepEqual((await launchdState(binaries)).loaded, [], "旧服务按真实 Label 停用");
+
+  const active = await runCli([...args.new, "--execute", "--confirm", "ACTIVATE_NEW_PRODUCTION"]);
+  assert.equal(active.status, "new-active-old-stopped");
+  const windowsStopped = await runCli([...args.rollbackNew, "--execute", "--confirm", "STOP_WINDOWS_PRODUCTION"]);
+  assert.equal(windowsStopped.status, "windows-stopped-old-not-started");
+
+  const rollbackOldArgs = rollbackOldArgsFor(oldInstance, root, binaries, plist);
+  const dryRestore = await runCli(rollbackOldArgs);
+  assert.equal(dryRestore.executes, false);
+  assert.deepEqual(dryRestore.launchd, { plist, label: CUSTOM_LABEL });
+  const restored = await runCli([...rollbackOldArgs, "--execute", "--confirm", "RESTORE_OLD_PRODUCTION"]);
+  assert.equal(restored.status, "old-active-windows-stopped");
+  assert.deepEqual(restored.launchd, { plist, label: CUSTOM_LABEL });
+  assert.equal(JSON.parse(await readFile(join(oldInstance, "wecom.json"), "utf8")).active, "production");
+  assert.deepEqual((await launchCalls(binaries)).slice(-5), [["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL], ["load", "-w", plist], ["list", CUSTOM_LABEL]]);
+  assert.deepEqual((await readLines(binaries.launchLog)).slice(-5).map((call) => call.code), [1, 0, 1, 0, 0]);
+  assert.deepEqual((await launchdState(binaries)).loaded, [CUSTOM_LABEL]);
+  assert.equal(JSON.stringify(await launchCalls(binaries)).includes("com.wecom-support-bot"), false, "默认标签从未出现：每次 launchctl list 都用 plist 的真实 Label");
+  await assertLaunchLabelsKnown(binaries);
+});
+
+test("旧端 plist 无效（缺失 / 无 Label / 空 Label / 含空白 / 二进制）时 dry-run 直接失败，绝不回退到固定标签", async (t) => {
+  const root = await makeTempDir(t);
+  const oldInstance = join(root, "old");
+  await makeInstance(oldInstance, { id: "old" });
+  const binaries = await makeFakeServiceBinaries(root, { launchdLabels: [] });
+  const windowsStopped = join(root, "windows-stopped.json");
+  const attestation = { format: "wecom-support-bot-endpoint-stopped", formatVersion: 1, endpoint: "windows", verifiedStopped: true, autoRestartDisabled: true, productionBotFingerprint: sha256("production-bot"), snapshotManifestSha256: "a".repeat(64) };
+  await writeJson(windowsStopped, attestation);
+  const rollbackOld = (plist) => ["rollback-old", "--instance-dir", oldInstance, "--windows-stopped", windowsStopped, "--snapshot", join(root, "snapshot"), "--launchctl", binaries.launchctl, ...(plist ? ["--plist", plist] : [])];
+  const writePlist = async (name, contents) => {
+    const path = join(root, name);
+    await writeFile(path, contents);
+    return path;
+  };
+  await writePlist("no-label.plist", '<plist version="1.0"><dict><key>ProgramArguments</key><array/></dict></plist>\n');
+  await writePlist("empty-label.plist", '<plist version="1.0"><dict><key>Label</key><string></string></dict></plist>\n');
+  await writePlist("space-label.plist", '<plist version="1.0"><dict><key>Label</key><string>com.example .bot</string></dict></plist>\n');
+  await writePlist("newline-label.plist", '<plist version="1.0"><dict><key>Label</key><string>\n  com.example.formatted\n</string></dict></plist>\n');
+  await writePlist("binary.plist", "bplist00\u0000\u0001\u0002");
+  for (const [plist, pattern] of [
+    [join(root, "missing.plist"), /无法读取旧端 launchd plist/],
+    [join(root, "no-label.plist"), /缺少有效 Label/],
+    [join(root, "empty-label.plist"), /缺少有效 Label/],
+    [join(root, "space-label.plist"), /缺少有效 Label/],
+    // launchd 原样读取 <string> 内容：值里夹换行的标签不是合法服务名，不能靠 trim 猜。
+    [join(root, "newline-label.plist"), /缺少有效 Label/],
+    [join(root, "binary.plist"), /二进制格式/],
+    // 不传 --plist 时默认路径同样是通用命名；文件不存在就在计划阶段失败。
+    [null, /无法读取旧端 launchd plist.*launchd\/com\.wecom-support-bot\.plist/],
+  ]) {
+    const rejected = await runCli(rollbackOld(plist), { allowFailure: true });
+    assert.equal(rejected.status, "error", JSON.stringify(plist));
+    assert.match(rejected.error, pattern, JSON.stringify(plist));
+  }
+  assert.deepEqual(await launchCalls(binaries), [], "无效 plist 不得触达 launchctl");
+
+  // 合法 plist：标签之间有换行缩进、前面有注释与其他键，仍能解析出真实 Label 并在 dry-run 公开。
+  const snapshot = join(root, "snapshot");
+  const exported = await runCli(["state-export", "--instance-dir", oldInstance, "--output", snapshot, "--execute", "--source-stopped", "--confirm", "EXPORT_STATE"]);
+  await writeJson(windowsStopped, { ...attestation, snapshotManifestSha256: exported.manifestSha256 });
+  const formatted = await writePlist("formatted.plist", '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <!-- 历史文件：标签之间换行缩进 -->\n  <key>KeepAlive</key>\n  <true/>\n  <key>\n    Label\n  </key>\n  <string>com.example.formatted</string>\n</dict>\n</plist>\n');
+  const plan = await runCli(rollbackOld(formatted));
+  assert.equal(plan.executes, false);
+  assert.deepEqual(plan.launchd, { plist: formatted, label: "com.example.formatted" });
+  assert.deepEqual(await launchCalls(binaries), []);
+});
+
+test("旧端 unload 报错时：已停用的旧 Mac 仍可回滚（以最终 list 为准），仍在运行的旧端则停在这里、不合并不 load", async (t) => {
+  const root = await makeTempDir(t);
+  const oldInstance = join(root, "old");
+  await makeInstance(oldInstance, { id: "old" });
+  const LABEL = "com.example.formatted";
+  // launchd 认识这个服务（cutover-old 时加载过），但现在没在运行。
+  const binaries = await makeFakeServiceBinaries(root, { launchdLabels: [], knownLabels: [LABEL] });
+  const plist = join(root, "old.plist");
+  await writeLaunchdPlist(plist, LABEL);
+  // rollbackOldArgsFor 约定回滚包在 <root>/rollback 下：state/ 是 Windows 导出的状态包，windows-stopped.json 是停用证明。
+  const rollbackOutput = join(root, "rollback");
+  const snapshot = join(rollbackOutput, "state");
+  const exported = await runCli(["state-export", "--instance-dir", oldInstance, "--output", snapshot, "--execute", "--source-stopped", "--confirm", "EXPORT_STATE"]);
+  const windowsStopped = join(rollbackOutput, "windows-stopped.json");
+  await writeJson(windowsStopped, { format: "wecom-support-bot-endpoint-stopped", formatVersion: 1, endpoint: "windows", verifiedStopped: true, autoRestartDisabled: true, productionBotFingerprint: sha256("production-bot"), snapshotManifestSha256: exported.manifestSha256 });
+  const rollbackOld = () => [...rollbackOldArgsFor(oldInstance, root, binaries, plist), "--execute", "--confirm", "RESTORE_OLD_PRODUCTION"];
+  const unloadFails = { ...process.env, FAKE_LAUNCHD_UNLOAD_FAIL: "1" };
+
+  // 旧端早已停用（cutover-old 之后）：unload 再报错也不该挡住回滚，最终 list 确认不存在即可放行。
+  const restored = await runCli(rollbackOld(), { env: unloadFails });
+  assert.equal(restored.status, "old-active-windows-stopped");
+  assert.deepEqual((await readLines(binaries.launchLog)).slice(-5).map((call) => call.code), [1, 1, 1, 0, 0]);
+  assert.deepEqual((await launchdState(binaries)).loaded, [LABEL]);
+  await assertLaunchLabelsKnown(binaries);
+
+  // 旧端仍在运行：unload 报错必须原样上抛——不合并状态、不改 active、不 load，也不会报成已停。
+  await rm(binaries.launchLog);
+  await writeJson(binaries.launchState, { loaded: [LABEL], known: [LABEL], unverifiable: [] });
+  await writeJson(join(oldInstance, "wecom.json"), { ...JSON.parse(await readFile(join(oldInstance, "wecom.json"), "utf8")), active: "test" });
+  const refused = await runCli(rollbackOld(), { allowFailure: true, env: unloadFails });
+  assert.equal(refused.status, "error");
+  assert.match(refused.error, /fake launchctl: unload 失败（模拟）/);
+  assert.deepEqual(await launchCalls(binaries), [["list", LABEL], ["unload", "-w", plist]]);
+  assert.equal(JSON.parse(await readFile(join(oldInstance, "wecom.json"), "utf8")).active, "test", "停用失败前不得改 active");
+  assert.deepEqual((await launchdState(binaries)).loaded, [LABEL]);
+});
+
+test("rollback-old 恢复失败时按真实 Label 重新 unload：确认停掉才说双端停止，服务卡住则如实报告", async (t) => {
+  const root = await makeTempDir(t);
+  const CUSTOM_LABEL = "com.example.legacy-support-bot";
+  const { oldInstance, binaries, plist, args } = await prepareCutover(root, { label: CUSTOM_LABEL, plistName: "historic-agent.plist" });
+  await runCli([...args.old, "--execute", "--confirm", "STOP_OLD_PRODUCTION"]);
+  await runCli([...args.new, "--execute", "--confirm", "ACTIVATE_NEW_PRODUCTION"]);
+  await runCli([...args.rollbackNew, "--execute", "--confirm", "STOP_WINDOWS_PRODUCTION"]);
+  const rollbackOldArgs = rollbackOldArgsFor(oldInstance, root, binaries, plist);
+  const restore = (env) => runCli([...rollbackOldArgs, "--execute", "--confirm", "RESTORE_OLD_PRODUCTION"], { allowFailure: true, env: { ...process.env, ...env } });
+
+  // 场景 1：load 成功但随后 list 查不到（恢复后验证失败）。旧服务此时可能真的在跑，
+  // 清理必须按真实 plist 重新 unload；确认停掉后才允许说“已保持双端停止”。
+  const unverifiable = await restore({ FAKE_LAUNCHD_LOAD_UNVERIFIABLE: "1" });
+  assert.equal(unverifiable.status, "error");
+  assert.match(unverifiable.error, new RegExp(`launchd 服务 ${CUSTOM_LABEL} 恢复后未通过 list 验证`));
+  assert.match(unverifiable.error, /已保持双端停止/);
+  assert.equal(JSON.parse(await readFile(join(oldInstance, "wecom.json"), "utf8")).active, "none");
+  assert.deepEqual((await launchdState(binaries)).loaded, [], "清理已按真实 Label unload");
+  assert.deepEqual((await launchCalls(binaries)).slice(-8), [
+    ["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL],
+    ["load", "-w", plist],
+    ["list", CUSTOM_LABEL],
+    ["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL],
+  ]);
+  assert.deepEqual((await readLines(binaries.launchLog)).slice(-8).map((call) => call.code), [1, 0, 1, 0, 1, 0, 0, 1]);
+  await assertLaunchLabelsKnown(binaries);
+
+  // 场景 1b：launchd 始终无法通过 list 确认这个服务。清理不能因为“list 查不到”就跳过 unload
+  // （旧逻辑正是这样漏掉了仍在运行的旧服务）：必须照常 unload 真实 plist，把服务从 launchd 撤掉。
+  const neverListable = await restore({ FAKE_LAUNCHD_LOAD_UNVERIFIABLE: "2" });
+  assert.equal(neverListable.status, "error");
+  assert.match(neverListable.error, /已保持双端停止/);
+  assert.deepEqual((await launchdState(binaries)).loaded, [], "list 永远查不到时仍必须 unload 真实 plist");
+  assert.deepEqual((await launchCalls(binaries)).slice(-8), [
+    ["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL],
+    ["load", "-w", plist],
+    ["list", CUSTOM_LABEL],
+    ["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL],
+  ]);
+  assert.deepEqual((await readLines(binaries.launchLog)).slice(-8).map((call) => call.code), [1, 0, 1, 0, 1, 1, 0, 1], "load 后与清理时的 list 始终查不到（113 以外），unload 仍被执行");
+  await assertLaunchLabelsKnown(binaries);
+
+  // 场景 2：清理时 unload 不生效（服务卡住）。不得再谎称“双端停止”，必须如实报告仍在运行，
+  // 并给出按真实 plist 与真实 Label 手动处理的命令。
+  const stuck = await restore({ FAKE_LAUNCHD_LOAD_UNVERIFIABLE: "1", FAKE_LAUNCHD_UNLOAD_IGNORED: "1" });
+  assert.equal(stuck.status, "error");
+  assert.match(stuck.error, /仍未能停止/);
+  assert.doesNotMatch(stuck.error, /已保持双端停止/);
+  assert.ok(stuck.error.includes(`${binaries.launchctl} unload -w ${plist}`), stuck.error);
+  assert.ok(stuck.error.includes(`${binaries.launchctl} list ${CUSTOM_LABEL}`), stuck.error);
+  assert.equal(JSON.parse(await readFile(join(oldInstance, "wecom.json"), "utf8")).active, "none");
+  assert.deepEqual((await launchdState(binaries)).loaded, [CUSTOM_LABEL]);
+  assert.deepEqual((await launchCalls(binaries)).slice(-3), [["list", CUSTOM_LABEL], ["unload", "-w", plist], ["list", CUSTOM_LABEL]]);
+  await assertLaunchLabelsKnown(binaries);
 });
 
 test("PowerShell 标准包 PlanOnly 与控制台假 WSL 使用同一 runtime pi（可用时执行）", async (t) => {
@@ -895,7 +1352,7 @@ if (args.includes("wslpath")) {
   assert.equal(plan.packageLayout.manifest, "windows-package.json");
 
   const commands = [
-    ["init", "--template", "team", "--source", "https://example.invalid/shared.git", "--scope", "shared", "--base-url", "http://192.168.1.20:3425/v1", "--api-key", "test-only-key", "--model", "main-model"],
+    ["init", "--template", "team", "--source", "https://example.invalid/shared.git", "--scope", "shared", "--base-url", MODEL_URL, "--api-key", "test-only-key", "--model", "main-model"],
     ["status"],
     ["sync", "--source", "https://example.invalid/shared.git", "--scope", "shared"],
     ["ask", "--question", "测试问题", "--session-key", "console-test"],

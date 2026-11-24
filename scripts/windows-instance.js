@@ -15,6 +15,8 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { decodeTextForScan, findPersonalResidue } from "./personal-residue.js";
+
 const execFileAsync = promisify(execFile);
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const PACKAGE_MANIFEST = "windows-package.json";
@@ -41,6 +43,10 @@ const ACCEPTANCE_SCENARIOS = {
   "migration-comparison": ["fixed-question-comparison"],
 };
 const ACCEPTANCE_CASES = Object.keys(ACCEPTANCE_SCENARIOS);
+// macOS 旧端 launchd 单元的默认 plist 路径；--plist 仍可传入任意自定义路径。
+// 注意：launchctl list/load/unload 只认 plist 内的 Label，不认文件名，所以不存在“默认标签”；
+// 每次操作都从传入 plist 解析真实 Label（见 readLaunchdLabel），兼容旧 Mac 上的任意自定义标签。
+const LAUNCHD_PLIST = "launchd/com.wecom-support-bot.plist";
 const PACKAGE_FILES = [
   "package.json",
   "package-lock.json",
@@ -50,7 +56,7 @@ const PACKAGE_FILES = [
   "prompts/local-instance.md",
   "scripts/local-instance.js",
   "scripts/windows-instance.js",
-  "docs/regression-questions.md",
+  "scripts/personal-residue.js",
   "docs/windows-wsl2.md",
   "docs/windows-acceptance.md",
   "docs/windows-migration-questions.json",
@@ -234,6 +240,8 @@ async function buildPackage(options) {
       await cp(source, target, { recursive: false, dereference: false });
     }
     // default.json 在源仓库含 Mac 私人路径；安装包只保留跨平台运行参数。
+    // pi/roots/guard/executionApproval 清空机器相关值；surface 话术不改写，
+    // 由下方个人残留扫描统一把关（含 fallbackText/timeoutText/welcomeText）。
     const defaults = JSON.parse(await readFile(join(sourceDir, "config/default.json"), "utf8"));
     const sanitized = {
       ...defaults,
@@ -254,6 +262,7 @@ async function buildPackage(options) {
       nodeEngine: JSON.parse(await readFile(join(sourceDir, "package.json"), "utf8")).engines.node,
       files: entries,
     });
+    // 个人残留扫描在 verifyPackage 内执行：staging 与目标机的 verify 走同一道门。
     await verifyPackage(staging);
     await rename(staging, outputDir);
     return { status: "ok", output: outputDir, files: entries.length, excludes: ["secrets", "private sources", "runtime state", "node_modules", "launchd", "Mac pi"] };
@@ -285,7 +294,20 @@ async function verifyPackage(packageDir) {
     if ((await lstat(path)).isSymbolicLink()) throw new Error(`安装包不允许符号链接：${name}`);
     if ((await hashFile(path)) !== entry.sha256) throw new Error(`安装包文件校验失败：${name}`);
   }
+  // 哈希只证明“内容与清单一致”，不证明“内容干净”：目标机 verify 同样扫描个人残留，
+  // 防止被重新签发清单的包带个人称呼、本机路径或私人地址上线。
+  await assertNoPersonalResidue(root);
   return { status: "ok", packageDir: root, files: manifest.files.length, nodeEngine: manifest.nodeEngine };
+}
+
+/** 包内任何文本文件都不得残留个人称呼、本机路径或私人地址；命中即拒绝并指出文件与修复方式。 */
+async function assertNoPersonalResidue(root) {
+  for (const path of await listFiles(root)) {
+    const residue = findPersonalResidue(decodeTextForScan(await readFile(path)));
+    if (residue) {
+      throw new Error(`安装包文件包含${residue.label}：${relative(root, path).replaceAll(sep, "/")}；请${residue.fix}后重新打包`);
+    }
+  }
 }
 
 async function assertEmptyOrMissing(path) {
@@ -1002,10 +1024,13 @@ async function cutoverOld(options) {
   if (!(await acceptanceReady(acceptance, acceptancePath))) throw acceptanceReadyError();
   const production = await productionChannel(instanceDir, options.legacy);
   assertFingerprint(acceptance.productionBotFingerprint, production.botId, "验收记录与旧端正式 botId 不一致");
-  const plist = resolve(options.plist ?? join(projectDir, "launchd/com.kyle.wecom-support-bot.plist"));
+  const plist = resolve(options.plist ?? join(projectDir, LAUNCHD_PLIST));
+  // dry-run 也解析真实 Label：plist 缺失或没有 Label 时在计划阶段就失败，并让操作者核对
+  // “将要 unload 的是哪个服务”，而不是带着固定标签走到 execute 才发现查错服务。
+  const label = await readLaunchdLabel(plist);
   const launchctl = options.launchctl ?? "launchctl";
   const steps = [`${launchctl} unload -w ${plist}`, "确认 launchd 不再持有服务且 pid 锁无存活进程", "导出最终 inbox/session/workspace/pi sessions", "写入旧端停用证明"];
-  if (!options.execute) return { status: "planned", executes: false, steps, next: "把最终状态包与 old-stopped.json 传到 Windows，再执行 cutover-new" };
+  if (!options.execute) return { status: "planned", executes: false, steps, launchd: { plist, label }, next: "把最终状态包与 old-stopped.json 传到 Windows，再执行 cutover-new" };
   requireConfirmation(options, "cutover-old");
   await stopLaunchd({ launchctl, plist });
   await assertNoLiveLocks(instanceDir);
@@ -1019,6 +1044,7 @@ async function cutoverOld(options) {
     service: "macos-launchd",
     autoRestartDisabled: true,
     verifiedStopped: true,
+    launchdLabel: label,
     productionBotFingerprint: fingerprint(production.botId),
     snapshotManifestSha256: exported.manifestSha256,
   };
@@ -1119,12 +1145,13 @@ async function rollbackOld(options) {
   const windowsStopped = await readStoppedAttestation(required(options, "windowsStopped"), "windows");
   const production = await productionChannel(instanceDir, options.legacy);
   assertFingerprint(windowsStopped.productionBotFingerprint, production.botId, "Windows 停用证明与旧端正式 botId 不一致");
-  const plist = resolve(options.plist ?? join(projectDir, "launchd/com.kyle.wecom-support-bot.plist"));
+  const plist = resolve(options.plist ?? join(projectDir, LAUNCHD_PLIST));
+  const label = await readLaunchdLabel(plist);
   const launchctl = options.launchctl ?? "launchctl";
   const snapshotDir = resolve(required(options, "snapshot"));
-  if (!options.execute) return { status: "planned", executes: false, steps: ["验证 Windows 已停用", "合并 Windows 新任务/inbox/会话", "旧端恢复 production", "launchctl load -w；失败则立即停用旧端"], merge: await stateMerge({ ...options, instanceDir, snapshot: snapshotDir, execute: false }, { expectedManifestSha256: windowsStopped.snapshotManifestSha256 }) };
+  if (!options.execute) return { status: "planned", executes: false, steps: ["验证 Windows 已停用", "合并 Windows 新任务/inbox/会话", "旧端恢复 production", "launchctl load -w；失败则立即停用旧端"], launchd: { plist, label }, merge: await stateMerge({ ...options, instanceDir, snapshot: snapshotDir, execute: false }, { expectedManifestSha256: windowsStopped.snapshotManifestSha256 }) };
   requireConfirmation(options, "rollback-old");
-  await stopLaunchd({ launchctl, plist, tolerateAlreadyStopped: true });
+  await stopLaunchd({ launchctl, plist });
   await assertNoLiveLocks(instanceDir);
   await stateMerge({ ...options, confirm: CONFIRMS["state-merge"], instanceDir, snapshot: snapshotDir, execute: true }, { stoppedVerified: true, confirmOverride: CONFIRMS["state-merge"], expectedManifestSha256: windowsStopped.snapshotManifestSha256 });
   if (!options.legacy) {
@@ -1140,10 +1167,20 @@ async function rollbackOld(options) {
       channels.active = "none";
       await writeJson(join(instanceDir, "wecom.json"), channels, 0o600);
     }
-    await stopLaunchd({ launchctl, plist, tolerateAlreadyStopped: true }).catch(() => {});
+    // 清理失败不能被吞掉后再声称“双端停止”：只有重新 unload 并经 list 确认不存在才这么说，
+    // 否则如实报告旧端仍在运行，并给出按真实 plist 手动 unload 的命令。
+    let cleanupMessage = null;
+    try {
+      await stopLaunchd({ launchctl, plist });
+    } catch (cleanupError) {
+      cleanupMessage = cleanupError.message;
+    }
+    if (cleanupMessage) {
+      throw new Error(`旧端恢复失败，且旧端 launchd 服务（Label ${label}）仍未能停止：${cleanupMessage}；请手动执行 ${launchctl} unload -w ${plist} 并用 ${launchctl} list ${label} 确认不存在，再决定重试或保持 Windows 端停用。原始错误：${error.message}`);
+    }
     throw new Error(`旧端恢复失败，已保持双端停止：${error.message}`);
   }
-  return { status: "old-active-windows-stopped", mergedState: snapshotDir };
+  return { status: "old-active-windows-stopped", launchd: { plist, label }, mergedState: snapshotDir };
 }
 
 async function readInstanceEndpoint(instanceDir) {
@@ -1183,17 +1220,51 @@ function assertFingerprint(expected, actual, message) {
   if (!actual || expected !== fingerprint(actual)) throw new Error(message);
 }
 
-async function stopLaunchd({ launchctl, plist, tolerateAlreadyStopped = false }) {
-  const before = await commandResult(launchctl, ["list", "com.kyle.wecom-support-bot"]);
-  if (before.code === 0 || !tolerateAlreadyStopped) await execFileAsync(launchctl, ["unload", "-w", plist]);
-  const result = await commandResult(launchctl, ["list", "com.kyle.wecom-support-bot"]);
-  if (result.code === 0) throw new Error("launchd 服务仍在运行，禁止启用另一端");
+/**
+ * 从 launchd plist 读取真实 Label。launchctl list/load/unload 都以 plist 内的 Label 为准，
+ * 文件名和任何固定标签都不可靠；读不到有效 Label 就拒绝执行，绝不回退到默认标签
+ * （旧 Mac 的历史 plist 可能带任意自定义 Label）。只支持 XML plist；二进制 plist 需先
+ * `plutil -convert xml1 <plist>`。Label 原样使用、不 trim（launchd 原样读取 <string> 内容），
+ * 含空白或控制字符即视为无效，避免把猜出来的字符串传给 launchctl。
+ */
+async function readLaunchdLabel(plist) {
+  let text;
+  try {
+    text = await readFile(plist, "utf8");
+  } catch (error) {
+    throw new Error(`无法读取旧端 launchd plist：${plist}（${error.message}）；请用 --plist 指向旧端实际加载的 plist`);
+  }
+  if (text.startsWith("bplist00")) throw new Error(`旧端 launchd plist 是二进制格式，无法解析 Label：${plist}；请先执行 plutil -convert xml1 "${plist}"`);
+  const label = text.match(/<key>\s*Label\s*<\/key>\s*<string>([^<]*)<\/string>/)?.[1];
+  if (!label || /[\s\0-\x1f\x7f]/.test(label)) {
+    throw new Error(`旧端 launchd plist 缺少有效 Label：${plist}；launchctl 按 plist 内的 Label 查找服务，请修正 plist 或用 --plist 指向旧端实际加载的 plist`);
+  }
+  return label;
+}
+
+/**
+ * 停用旧端 launchd 服务：list → unload -w → list，全部使用 plist 内的真实 Label。
+ * unload -w 无条件尝试（对未加载的服务是幂等操作，并写入 disabled 键防止登录自启），失败清理也走这里，
+ * 不再出现“list 查不到就跳过 unload”导致旧服务仍在运行的情况。唯一的放行条件是最后一次 list
+ * 确认服务不存在：unload 本身报错时，只有在此前 list 已显示未加载的情况下才忽略该错误。
+ */
+async function stopLaunchd({ launchctl, plist }) {
+  const label = await readLaunchdLabel(plist);
+  const before = await commandResult(launchctl, ["list", label]);
+  try {
+    await execFileAsync(launchctl, ["unload", "-w", plist]);
+  } catch (error) {
+    if (before.code === 0) throw error;
+  }
+  const result = await commandResult(launchctl, ["list", label]);
+  if (result.code === 0) throw new Error(`launchd 服务 ${label} 仍在运行，禁止启用另一端`);
 }
 
 async function startLaunchd({ launchctl, plist }) {
+  const label = await readLaunchdLabel(plist);
   await execFileAsync(launchctl, ["load", "-w", plist]);
-  const result = await commandResult(launchctl, ["list", "com.kyle.wecom-support-bot"]);
-  if (result.code !== 0) throw new Error("launchd 服务恢复后未通过 list 验证");
+  const result = await commandResult(launchctl, ["list", label]);
+  if (result.code !== 0) throw new Error(`launchd 服务 ${label} 恢复后未通过 list 验证`);
 }
 
 async function stopSystemd(systemctl) {

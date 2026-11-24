@@ -25,11 +25,12 @@
     "timeoutMs": 10000
   },
   "surface": {
+    "welcomeText": "我是公司内部技术支持助手。我能查数据库、翻知识库、看截图、读文件（Excel/PPT/Word/PDF/Markdown 等），查出来的结果还能整理成文件直接发给你。安居乐寓和乐租租的事都可以来问我。想让我忘掉前面聊的重新开始，发「新会话」或「/new」就行。",
     "progressText": "正在查，稍等一下…",
     "slowProgressText": "这个查得有点慢，我再看看，马上就好。",
     "slowProgressAfterMs": 20000,
-    "fallbackText": "这条涉及生产数据，我没法直接确认。建议直接问虎老师。",
-    "timeoutText": "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找虎老师更快。",
+    "fallbackText": "这条涉及生产数据，我没法直接确认。建议直接问技术同事。",
+    "timeoutText": "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找技术同事更快。",
     "errorText": "刚才没处理好，你再问一次？",
     "queuedProgressText": "前面那条还在查，查完马上看这条…",
     "handoffText": "这个要多查一会儿，我先把这条聊完，查好了单独发你。"

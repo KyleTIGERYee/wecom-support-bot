@@ -24,6 +24,10 @@ import { downloadAndProcessFiles, FileIngestError, withAttachmentInstructions, h
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
+/** config.surface.welcomeText 缺失时使用的通用欢迎语。 */
+const DEFAULT_WELCOME_TEXT =
+  "我是公司内部技术支持助手。我能查数据库、翻知识库、看截图、读文件（Excel/PPT/Word/PDF/Markdown 等），查出来的结果还能整理成文件直接发给你。安居乐寓和乐租租的事都可以来问我。想让我忘掉前面聊的重新开始，发「新会话」或「/new」就行。";
+
 /**
  * 一条待处理的提问。收件箱记录与排队的任务共用这个形状。
  *
@@ -105,12 +109,13 @@ async function main() {
   });
 
   client.on("event.enter_chat", (frame) => {
+    // 欢迎语优先取 config.surface.welcomeText，便于按实例配置；缺失时用通用默认文案。
+    const welcomeText = config.surface?.welcomeText || DEFAULT_WELCOME_TEXT;
     client
       .replyWelcome(frame, {
         msgtype: "text",
         text: {
-          content:
-            "我是赛博阿虎。我能查数据库、翻知识库、看截图、读文件（Excel/PPT/Word/PDF/Markdown 等），查出来的结果还能整理成文件直接发给你。安居乐寓和乐租租的事都可以来问我。想让我忘掉前面聊的重新开始，发「新会话」或「/new」就行。有什么事情不要找阿虎，请找我。",
+          content: welcomeText,
         },
       })
       .catch((error) => log.warn("欢迎语发送失败", { message: String(error?.message ?? error) }));

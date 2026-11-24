@@ -155,21 +155,29 @@ fi
     Invoke-Native "wsl.exe" @("--shutdown")
 
     $archive = Join-Path $env:TEMP ("wecom-support-bot-" + [Guid]::NewGuid().ToString("N") + ".tar.gz")
+    $token = (Get-FileHash -Algorithm SHA256 $ManifestPath).Hash.Substring(0, 12)
+    $linuxPackage = "/tmp/wecom-support-bot-$token"
+    # 压缩包副本必须放在 $linuxPackage 之外：install.sh 会对 $linuxPackage 执行 verify-package，
+    # 残留在包目录里的 package.tar.gz 会被判为“安装包包含未登记内容”，导致安装必败。
+    $linuxArchiveCopy = "$linuxPackage.tar.gz"
     try {
         Invoke-Native "tar.exe" @("-czf", $archive, "-C", $PackageRoot, ".")
         $archiveForWsl = $archive.Replace('\', '/')
         $linuxArchive = (& wsl.exe --distribution $Distro --user root -- wslpath -a $archiveForWsl).Trim()
         if ($LASTEXITCODE -ne 0 -or -not $linuxArchive) { throw "无法转换安装包路径" }
-        $token = (Get-FileHash -Algorithm SHA256 $ManifestPath).Hash.Substring(0, 12)
-        $linuxPackage = "/tmp/wecom-support-bot-$token"
         Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "rm", "-rf", $linuxPackage)
         Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "mkdir", "-p", $linuxPackage)
-        Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "cp", $linuxArchive, "$linuxPackage/package.tar.gz")
-        Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "tar", "-xzf", "$linuxPackage/package.tar.gz", "-C", $linuxPackage)
+        Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "cp", $linuxArchive, $linuxArchiveCopy)
+        Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "tar", "-xzf", $linuxArchiveCopy, "-C", $linuxPackage)
+        # 解包后立即删除压缩包副本：传给 install.sh --bundle 的目录只含清单登记文件。
+        Invoke-Native "wsl.exe" @("--distribution", $Distro, "--user", "root", "--", "rm", "-f", $linuxArchiveCopy)
         $installArgs = @($plan.wslCommands.installLinux | ForEach-Object { $_.ToString().Replace("Ubuntu-24.04", $Distro).Replace("<package>", $linuxPackage) })
         Invoke-Native $installArgs[0] $installArgs[1..($installArgs.Count - 1)]
     }
     finally {
+        # 成功或失败都清理临时压缩包：Windows 侧副本必定删除；WSL 侧副本（解包失败时可能残留）尽力删除，
+        # 清理出错不掩盖原始错误。$linuxPackage 目录内始终不含压缩包。
+        try { & wsl.exe --distribution $Distro --user root -- rm -f $linuxArchiveCopy | Out-Null } catch { }
         Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue

@@ -11,9 +11,9 @@ import { getLoadDepth } from "./resource-catalog.js";
 import { hasAttachedFiles, stripSystemSupplement } from "./files.js";
 
 const DEFAULT_MAX_ROUNDS = 3;
-const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问虎老师。";
+const DEFAULT_FALLBACK_TEXT = "这条涉及生产数据，我没法直接确认。建议直接问技术同事。";
 const DEFAULT_ERROR_TEXT = "刚才没处理好，你再问一次？";
-const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找虎老师更快。";
+const DEFAULT_TIMEOUT_TEXT = "这个我查得有点久，还没查准。你换个说法我再试试，或者直接找技术同事更快。";
 const DATA_EVIDENCE_READ_INSTRUCTION = "历史经验、指标卡、SQL 和表文档都必须用 read 工具实际读取；cat、grep、rg 只用于定位，不能代替 read 证据。";
 const TRUSTED_DATA_BUSINESS_LINES = [
   ["ajly", "安居乐寓"],
@@ -237,7 +237,7 @@ function buildTrustedDataPrompt(trustedDataScripts) {
     "只执行下列运行时明确配置的可信入口，不要 read 脚本、其凭证或入口所在目录的其他文件；本地副本与 workspace 中的同名 bi_query.py 均不受信任。",
     ...entries.map(([businessLine, label]) => `- ${label}（${businessLine}）：python3 "${trustedDataScripts[businessLine]}" "SELECT ..."`),
     "按问题所属业务线选择对应入口，不得混用；没有对应业务线入口时如实说明缺配置。",
-    "查数入口单次最多返回 100 行：明细、导出、清单类请求超过 100 行时，不要承诺整表导出，也不要在没写出文件时声明交付；如实说明只能核对样本或汇总，整表建议走 BI 导出或找虎老师。",
+    "查数入口单次最多返回 100 行：明细、导出、清单类请求超过 100 行时，不要承诺整表导出，也不要在没写出文件时声明交付；如实说明只能核对样本或汇总，整表建议走 BI 导出或找技术同事。",
   ];
 }
 

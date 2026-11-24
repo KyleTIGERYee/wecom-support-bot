@@ -29,9 +29,9 @@ wecom-windows-package/
 
 `install-plan` 的 `windowsCommands.planOnly` 会生成指向 `<package>/windows/install.ps1` 的公开检查命令；也可在包根执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install.ps1 -PlanOnly`。安装器从脚本位置向上定位包根并校验清单。资源包采用文件白名单和逐文件 SHA-256：
 
-- 只含运行源码、06 公开 CLI、07 控制台/安装器、提示词和验收文档。
+- 只含运行源码、本地实例公开 CLI、Windows 控制台/安装器、提示词和验收文档。
 - 不含 `config/secrets*.json`、实例 `secrets.json` / `wecom.json`、真实 API Key、私人知识来源、workspace、会话、inbox、`node_modules`、launchd、Mac pi 或 models.json。
-- 包内 `config/default.json` 已清空 Mac 路径和模型地址；目标实例通过 06 初始化重新生成配置。
+- 包内 `config/default.json` 已清空 Mac 路径和模型地址；目标实例通过 `instance init` 初始化重新生成配置。
 - 迁移状态包是另一种显式操作，绝不会随安装资源包自动分发。
 
 ## 2. 一键安装与安全续装
@@ -74,15 +74,15 @@ wecom-windows-package/
 - 启动时仍使用现有收件箱补跑、单实例锁、断线退出重连语义，不重写这些机制。
 - 安装完成只 `daemon-reload`，不 `enable/start`。模型、资源和独立测试机器人初始化完成后，控制台启动测试服务时才 `enable --now`。
 
-企微入口通过 `WECOM_BOT_INSTANCE_DIR` 复用 06 的 `instance.json`、本地标准副本、四模型、执行审批与 Guard；`src/index.js` 的 inbox、会话状态、图片、pi sessions 和日志均落在该实例目录，不再读取默认 Mac 知识路径。控制台所有 Node/WSL 操作、服务脚本的启动前 `runtime-check` 与生成的 systemd 单元都显式设置 `WECOM_BOT_PI_BINARY=/opt/wecom-support-bot/runtime/pi/bin/pi`，不会回退到旧账号 home 下的 pi。
+企微入口通过 `WECOM_BOT_INSTANCE_DIR` 复用本地实例的 `instance.json`、本地标准副本、四模型、执行审批与 Guard；`src/index.js` 的 inbox、会话状态、图片、pi sessions 和日志均落在该实例目录，不再读取默认 Mac 知识路径。控制台所有 Node/WSL 操作、服务脚本的启动前 `runtime-check` 与生成的 systemd 单元都显式设置 `WECOM_BOT_PI_BINARY=/opt/wecom-support-bot/runtime/pi/bin/pi`，不会回退到旧账号 home 下的 pi。
 
 ## 4. 本地控制台
 
 双击 `WecomSupportBot-Console.cmd` 打开菜单，也可用命令模式：
 
 ```powershell
-# 初始化；所有 06 init 参数原样支持，真实模型连接测试发生在 WSL 内
-.\windows\WecomSupportBot-Console.cmd init --template team --source C:\shared\docs --scope shared --base-url http://192.168.1.20:3425/v1 --api-key <key> --model <model>
+# 初始化；所有 `instance init` 参数原样支持，真实模型连接测试发生在 WSL 内
+.\windows\WecomSupportBot-Console.cmd init --template team --source C:\shared\docs --scope shared --base-url http://<Windows主机IP>:3425/v1 --api-key <key> --model <model>
 
 .\windows\WecomSupportBot-Console.cmd status
 .\windows\WecomSupportBot-Console.cmd sync --source C:\shared\docs --scope shared
@@ -96,7 +96,7 @@ wecom-windows-package/
 
 **模型地址**：`localhost`、`127.0.0.1`、`::1`、`0.0.0.0` 在 Windows 控制台中被拒绝，因为原机器回环地址在 WSL 中不是原模型服务。填写 Windows 主机可被 WSL 路由到的地址或实际 URL。`validate-model-url` 只报告地址检查，从不报告连接成功；真正的四模型连接、知识/Skills、执行审批和示例任务检查仍由 WSL 内的 `instance init` 完成。
 
-06 `sync` 在同一事务里提交 `context/`、资源 manifest（`instance.json` 的 `resources`）、`instance.json`、`data/source-registry.json` 与 `sync-status.json`，并在本次检测到本地改动时把改动前的 `context/` 原子替换到 `snapshots/previous/`（无本地改动不生成快照）；`workspace/`、`data/` 下的会话与收件箱状态、pi sessions 和企微配置保持不动。运行时只读初始化选择的本地副本，不回读原始 Windows 来源。企微进程在启动时构建资源目录；同步完成后，在没有在途任务时使用控制台“重启服务”加载新版本，控制台不会在同步中静默重启正式服务。
+`instance sync` 在同一事务里提交 `context/`、资源 manifest（`instance.json` 的 `resources`）、`instance.json`、`data/source-registry.json` 与 `sync-status.json`，并在本次检测到本地改动时把改动前的 `context/` 原子替换到 `snapshots/previous/`（无本地改动不生成快照）；`workspace/`、`data/` 下的会话与收件箱状态、pi sessions 和企微配置保持不动。运行时只读初始化选择的本地副本，不回读原始 Windows 来源。企微进程在启动时构建资源目录；同步完成后，在没有在途任务时使用控制台“重启服务”加载新版本，控制台不会在同步中静默重启正式服务。
 
 ## 5. 独立测试机器人验收
 
@@ -125,19 +125,21 @@ node scripts/windows-instance.js acceptance-compare --before <旧结果.json> --
 
 ### A. 旧 Mac 最终停用与导出
 
-将已通过的新端验收记录复制到旧 Mac。旧端已是 06 本地实例时：
+将已通过的新端验收记录复制到旧 Mac。旧端已是本地实例时：
 
 ```bash
 node scripts/windows-instance.js cutover-old \
   --instance-dir /path/old-instance \
   --acceptance /path/acceptance.json \
   --output /path/cutover-bundle \
-  --plist /path/com.kyle.wecom-support-bot.plist
+  --plist /path/com.wecom-support-bot.plist
 # 核对 dry-run 后才追加：
 # --execute --confirm STOP_OLD_PRODUCTION
 ```
 
 现有默认布局可用 `--legacy --instance-dir /path/wecom-support-bot --legacy-agent-dir /path/to/old-pi-agent`；正式 botId 从旧项目 `config/secrets.json` 读取，pi sessions 从显式选择的旧 agent 目录读取。正式执行顺序：`launchctl unload -w` → `launchctl list` 验证不存在 → pid 锁探活 → 最终状态导出 → 写 `old-stopped.json`。任何失败都不会启用新端。
+
+`--plist` 指向旧端实际加载的 plist（通常是 `~/Library/LaunchAgents/` 下那份）。launchctl 只认 plist 内的 `Label`、不认文件名，所以脚本每次都从传入 plist 读取真实标签，旧 Mac 历史上使用自定义 Label 的 plist 同样适用，不再假定固定标签。dry-run 结果里的 `launchd: { plist, label }` 会公开将要操作的服务，请先核对它与 `launchctl list` 中正在运行的旧端一致；plist 缺失、二进制格式或没有有效 `Label` 时 dry-run 直接失败，不会带着猜测的标签继续。`old-stopped.json` 会记录 `launchdLabel` 供审计。
 
 状态包只含 workspace、`data/inbox.jsonl`、`data/session-state.json` 和明确的 pi 会话文件：`agent/sessions/` 下的嵌套文件，以及 legacy agent 根下直接的 `.jsonl` 会话。根会话保留 `agent/<文件>.jsonl` 相对路径，不会把整棵 agent 目录重映射进 `sessions/`。`models.json`、credentials/auth/token/provider 密钥、`node_modules`、凭证、标准资源、`data/images` 消息接收缓存、日志、锁、Mac launchd 和平台依赖均不进入；导入还会拒绝未登记、路径穿越或禁止的追加文件。
 
@@ -174,12 +176,12 @@ node scripts/windows-instance.js rollback-old \
   --instance-dir /path/old-instance \
   --windows-stopped /path/windows-stopped.json \
   --snapshot /path/rollback/state \
-  --plist /path/com.kyle.wecom-support-bot.plist
+  --plist /path/com.wecom-support-bot.plist
 # legacy 旧布局另加 --legacy --legacy-agent-dir /path/to/old-pi-agent
 # --execute --confirm RESTORE_OLD_PRODUCTION
 ```
 
-旧端在合并前再次确认停用，验证 Windows 停用证明和状态包哈希后才恢复 launchd。恢复失败会重新停用旧端，不会形成双活。
+旧端在合并前再次确认停用（`launchctl list <Label>` → `unload -w` → `list`，`Label` 同样取自 `--plist`），验证 Windows 停用证明和状态包哈希后才恢复 launchd。恢复失败会按同一 plist 重新 `unload -w` 并经 `launchctl list <Label>` 确认：确认旧端已停才报告“已保持双端停止”；若旧端仍未能停止，会如实报错并给出手动 `launchctl unload -w <plist>` 与 `launchctl list <Label>` 命令：Windows 端此时已停用、不会形成双活，但旧端服务可能仍在运行，必须按提示手动处理并确认后再决定重试或保持停止。
 
 合并规则：inbox 按记录时间合并且保留状态更新，重复行去重，同 msgid 不同正文直接失败；会话代号取较大值、粘性 Guard 标记求并集、活动取最新；pi JSONL 会话按行去重追加；workspace 其他同名不同内容不覆盖，来源版本保存到 `migration-conflicts/<批次>/` 并公开冲突清单。任务、消息和会话不会因简单覆盖而静默丢失。
 

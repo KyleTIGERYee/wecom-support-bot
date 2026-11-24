@@ -18,7 +18,7 @@ npm run dashboard
 WECOM_DASHBOARD_PORT=4320 npm run dashboard
 ```
 
-虎老师本机已通过 `~/Library/LaunchAgents/com.kyle.wecom-support-dashboard.plist` 安装常驻服务，登录后自动启动，异常退出自动恢复。日常使用只需打开上述地址，不需要运行终端命令；服务日志在 `~/Library/Logs/wecom-support-dashboard.stdout.log` 和对应 stderr 文件。
+需要常驻时，可以自行登记一个 launchd 服务（例如 `~/Library/LaunchAgents/com.wecom-support-dashboard.plist`，登录后自动启动，异常退出自动恢复）；之后日常使用只需打开上述地址，不需要运行终端命令。服务日志可放在 `~/Library/Logs/wecom-support-dashboard.stdout.log` 和对应 stderr 文件。
 
 ## 手机访问（同一 WiFi）
 
@@ -32,7 +32,7 @@ WECOM_DASHBOARD_BIND=0.0.0.0 npm run dashboard
 
 ```text
 监听地址：0.0.0.0:4319（局域网可访问）
-手机访问：http://192.168.1.23:4319
+手机访问：http://<本机局域网IP>:4319
 ```
 
 手机和电脑连同一个 WiFi，在手机浏览器打开 `http://<本机局域网IP>:4319` 即可。也可以把 `WECOM_DASHBOARD_BIND` 设成某个本机网卡 IPv4，只绑定那块网卡。

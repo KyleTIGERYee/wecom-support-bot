@@ -662,7 +662,7 @@ test("S13 Node 只接受首个参数直接为受信任脚本路径", async (t) =
 
 test("S13 模型 ALLOW 不能覆盖 Node 入口选项绕过的硬拒绝", async (t) => {
   const { copyRoot } = await makeCopyRoot(t);
-  const trustedScript = "/Users/kyle/Desktop/VIBECODING/wecom-support-bot/scripts/read-evolution.js";
+  const trustedScript = join(projectDir, "scripts/read-evolution.js");
   const model = await startApprovalModel(t, () => "ALLOW\n理由：模型错误放行任意代码\n风险：低");
   const handler = await loadEnabledApprovalHook(t, {
     readRoots: [copyRoot],
@@ -683,8 +683,8 @@ test("S13 模型 ALLOW 不能覆盖 Node 入口选项绕过的硬拒绝", async 
 });
 
 test("S13 模型 ALLOW 不能覆盖 Python 选项绕过的硬拒绝", async (t) => {
-  const { copyRoot } = await makeCopyRoot(t);
-  const trustedScript = "/Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki/scripts/bi_query.py";
+  const { root, copyRoot } = await makeCopyRoot(t);
+  const trustedScript = join(root, "fixture/ajly-db-wiki/scripts/bi_query.py");
   const model = await startApprovalModel(t, () => "ALLOW\n理由：模型错误放行任意代码\n风险：低");
   const handler = await loadEnabledApprovalHook(t, {
     readRoots: [copyRoot],
