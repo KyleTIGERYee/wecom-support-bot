@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 
+import { parseDeliveryMarkers } from "./file-delivery.js";
 import { findCatalogResource } from "./resource-catalog.js";
 
 /** 判定本轮是否触碰生产数据的脚本名。 */
@@ -140,6 +141,9 @@ export async function runAgentTurn({
     const child = launch({ prompt, sessionId, thinkingLevel, config, projectDir, currentSkill });
 
     let text = "";
+    // 带交付标记的正文可能出现在带工具调用的 assistant 消息里；后续只回一句
+    // “已发给你”的收尾消息不能把它覆盖掉，否则文件交付标记会丢失。
+    let deliveryText = "";
     let biTouched = false;
     let inputTokens = 0;
     let contextInsufficient = false;
@@ -165,7 +169,7 @@ export async function runAgentTurn({
       clearTimeout(hardTimer);
       if (idleTimer) clearTimeout(idleTimer);
       resolvePromise({
-        text,
+        text: deliveryText && parseDeliveryMarkers(text).files.length === 0 ? deliveryText : text,
         biTouched,
         inputTokens,
         contextInsufficient,
@@ -217,6 +221,7 @@ export async function runAgentTurn({
             }
             if (parsed.text !== undefined) {
               text = parsed.text;
+              if (parsed.deliveryText !== undefined) deliveryText = parsed.deliveryText;
               contextInsufficient = Boolean(parsed.contextInsufficient);
             }
             if (parsed.inputTokens) inputTokens = parsed.inputTokens;
@@ -290,7 +295,7 @@ function relayExecutionApprovalLog(line) {
  * 解析单行 JSONL 事件，提取对该轮有意义的信息。
  *
  * @param {string} line
- * @returns {{text?: string, contextInsufficient?: boolean, inputTokens?: number, bashStarted?: boolean, bashCompleted?: boolean, bashSucceeded?: boolean, pendingBashId?: string, completedBashId?: string, bashCommand?: string, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean, readContent?: string} | null}
+ * @returns {{text?: string, deliveryText?: string, contextInsufficient?: boolean, inputTokens?: number, bashStarted?: boolean, bashCompleted?: boolean, bashSucceeded?: boolean, pendingBashId?: string, completedBashId?: string, bashCommand?: string, readPath?: string, readStarted?: boolean, readCompleted?: boolean, pendingReadId?: string, completedReadId?: string, readFailed?: boolean, readContent?: string} | null}
  */
 function parseEvent(line) {
   const trimmed = line.trim();
@@ -353,9 +358,12 @@ function parseEvent(line) {
       ? messageText.replace(/^CONTEXT_INSUFFICIENT\s*:?\s*/, "")
       : messageText;
     const inputTokens = Number(event.message.usage?.input ?? 0);
-    /** @type {{text?: string, contextInsufficient?: boolean, inputTokens?: number}} */
+    /** @type {{text?: string, deliveryText?: string, contextInsufficient?: boolean, inputTokens?: number}} */
     const parsed = {};
-    if (messageText) parsed.text = cleanText;
+    if (messageText) {
+      parsed.text = cleanText;
+      if (parseDeliveryMarkers(cleanText).files.length > 0) parsed.deliveryText = cleanText;
+    }
     if (contextInsufficient) parsed.contextInsufficient = true;
     if (inputTokens > 0) parsed.inputTokens = inputTokens;
     return Object.keys(parsed).length ? parsed : null;

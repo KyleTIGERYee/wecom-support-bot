@@ -88,6 +88,26 @@ test("多条 assistant 消息取最后一条非空文本", async () => {
   assert.equal(result.text, "最终答案");
 });
 
+test("带交付标记的正文不会被后续收尾消息覆盖", async () => {
+  const answer = "完整答复\n\n[交付文件： 报告.md]";
+  const toolUseMessage = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "toolUse",
+      content: [
+        { type: "text", text: answer },
+        { type: "toolCall", id: "c1", name: "write", arguments: { path: "/workspace/报告.md" } },
+      ],
+    },
+  });
+  const runner = fakeRunner([toolUseMessage, textMessage("已发给你")]);
+
+  const result = await runAgentTurn({ prompt: "问", sessionId: "wx-abc", runner });
+
+  assert.equal(result.text, answer);
+});
+
 test("忽略只含工具调用的 assistant 消息", async () => {
   const toolOnly = JSON.stringify({
     type: "message_end",
@@ -101,7 +121,7 @@ test("忽略只含工具调用的 assistant 消息", async () => {
 });
 
 test("bi_query.py 真实执行成功完成时 biTouched 才为真", async () => {
-  const command = "python3 /Users/kyle/Desktop/PM/信息技术部资产库/知识库/数据库/ajly-db-wiki/scripts/bi_query.py 'SELECT 1'";
+  const command = "python3 /tmp/fixture/ajly-db-wiki/scripts/bi_query.py 'SELECT 1'";
   const runner = fakeRunner([
     bashTool(command),
     JSON.stringify({
@@ -246,7 +266,7 @@ test("bi_query.py 只有开始事件或执行 DENY、异常、非零与错误结
 
 test("未调用 bi_query.py 时 biTouched 为假", async () => {
   const runner = fakeRunner([
-    bashTool("python3 /Users/kyle/Desktop/PM/.agents/skills/ajly-wiki/scripts/search_wiki.py 退租"),
+    bashTool("python3 /tmp/fixture/ajly-wiki/scripts/search_wiki.py 退租"),
     textMessage("退租的定义是…"),
   ]);
 
